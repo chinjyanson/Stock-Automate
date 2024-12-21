@@ -1,0 +1,11 @@
+bs4==0.0.2
+alpaca_trade_api
+vaderSentiment==3.3.2
+transformers==4.47.1 
+numpy==2.1.1
+pandas==2.2.3
+scikit-learn==1.5.2
+scipy==1.14.1
+torch==2.4.1
+matplotlib==3.9.2
+yfinance==0.2.51
