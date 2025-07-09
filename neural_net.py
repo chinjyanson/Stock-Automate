@@ -8,7 +8,6 @@ from sklearn.model_selection import train_test_split, KFold
 from torch.utils.data import DataLoader, TensorDataset
 import pickle
 import matplotlib.pyplot as plt
-from sklearn.linear_model import LinearRegression
 import math
 import csv
 
@@ -210,42 +209,6 @@ class StockPredictor:
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
         plt.title('Loss Function')
-        plt.legend()
-        plt.show()
-
-    def plot_predictions(self, x, y):
-        """
-        Plots X against Y with the line of best fit using the model's predictions.
-
-        Arguments:
-            x {pd.DataFrame or torch.Tensor} -- Input features for prediction.
-            y {pd.DataFrame or torch.Tensor} -- True target values.
-        """
-        # Ensure the input is preprocessed and predictions are made
-        X, Y = self._preprocessor(x, y=y, training=False)
-        self.model.eval()
-        with torch.no_grad():
-            predictions = self.model(X).numpy()
-        # Convert tensors to numpy arrays for plotting if necessary
-        if torch.is_tensor(X):
-            X = X.numpy()
-        if torch.is_tensor(Y):
-            Y = Y.numpy()
-
-        # Plot actual vs. predicted values
-        plt.figure(figsize=(10, 6))
-        plt.scatter(Y, predictions, alpha=0.6, s=10, label="Data Points")
-        # Compute the line of best fit using Linear Regression
-        lin_reg = LinearRegression()
-        lin_reg.fit(Y.reshape(-1, 1), predictions)
-        best_fit_line = lin_reg.predict(Y.reshape(-1, 1))
-
-        # Plot the line of best fit
-        plt.plot(Y, best_fit_line, color='red', label="Line of Best Fit")
-
-        plt.xlabel("True Values")
-        plt.ylabel("Predicted Values")
-        plt.title("True vs. Predicted Values with Line of Best Fit")
         plt.legend()
         plt.show()
 

@@ -3,12 +3,9 @@ import pandas as pd
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.by import By
-# from transformers import AutoTokenizer, AutoModel
 import numpy as np
 
 import tools.selenium_utils as su
-
-# do some sentient analysis shit here
 
 def get_sentiment(stock: str):
     driver = su.new_driver(f"https://stocktwits.com/symbol/{stock}/sentiment")

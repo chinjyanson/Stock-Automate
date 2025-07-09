@@ -9,3 +9,6 @@ scipy==1.14.1
 torch==2.4.1
 matplotlib==3.9.2
 yfinance==0.2.51
+asyncio==3.4.3
+asyncpg==0.30.0
+psycopg2==2.9.10

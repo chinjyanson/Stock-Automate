@@ -1,0 +1,17 @@
+need to get the check function done,
+
+multihead model with different input functions
+- price action and momentum and volume 
+- sentiment and embeddings 
+- time interval
+- 
+
+instead of storing csv file, we are storing in timescaleDB 
+
+
+
+
+Google Cloud Storage (GCS) + BigQuery
+Firebase Firestore
+gather information and save to database action
+how to simulate data and its labels
