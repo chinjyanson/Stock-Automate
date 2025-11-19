@@ -3,9 +3,196 @@ Main Analysis Module - Contains all analysis logic for stocks and markets
 Uses Stock and Market classes as pure data providers
 """
 
+import os
+from datetime import datetime
 from stock import Stock
 from market import Market
 from typing import Dict, List
+
+# Ensure logs directory exists
+LOGS_DIR = os.path.join(os.path.dirname(__file__), 'logs')
+os.makedirs(LOGS_DIR, exist_ok=True)
+
+
+# ======================= LOGGING HELPER FUNCTIONS =======================
+
+def write_to_log(ticker: str, content: str) -> str:
+    """
+    Write analysis content to a log file for a specific ticker.
+
+    Args:
+        ticker: Stock ticker symbol
+        content: Content to write to the log file
+
+    Returns:
+        str: Path to the log file
+    """
+    filename = f"{ticker}.txt"
+    filepath = os.path.join(LOGS_DIR, filename)
+
+    with open(filepath, 'w') as f:
+        f.write(content)
+
+    return filepath
+
+
+def generate_flowchart_analysis_text(stock: Stock) -> str:
+    """Generate flowchart analysis as text for logging."""
+    analysis = analyze_stock_flowchart(stock)
+
+    lines = []
+    lines.append("=" * 70)
+    lines.append(f"FLOWCHART ANALYSIS: {analysis['ticker']} - {analysis['company_name']}")
+    lines.append("=" * 70)
+    lines.append("")
+
+    lines.append("METRICS:")
+    lines.append("-" * 70)
+    for metric, value in analysis['metrics'].items():
+        metric_display = metric.replace('_', ' ').title()
+        if value is not None:
+            lines.append(f"  {metric_display:25s}: {value}")
+        else:
+            lines.append(f"  {metric_display:25s}: N/A")
+    lines.append("")
+
+    lines.append("DECISION TREE RESULTS:")
+    lines.append("-" * 70)
+    for decision, passed in analysis['decisions'].items():
+        decision_display = decision.replace('_', ' ').title()
+        status = "PASS" if passed else "FAIL"
+        lines.append(f"  {decision_display:30s}: {status}")
+    lines.append("")
+
+    lines.append("REASONING:")
+    lines.append("-" * 70)
+    for reason in analysis['reasoning']:
+        lines.append(f"  {reason}")
+    lines.append("")
+
+    lines.append("FINAL RECOMMENDATION:")
+    lines.append("-" * 70)
+    recommendation = analysis['recommendation']
+    if recommendation == 'INVEST':
+        lines.append(f"  {recommendation} - This stock meets all investment criteria")
+    elif recommendation == 'PASS':
+        lines.append(f"  {recommendation} - This stock does not meet investment criteria")
+    else:
+        lines.append(f"  {recommendation} - Unable to fully analyze this stock")
+    lines.append("=" * 70)
+
+    return "\n".join(lines)
+
+
+def generate_comprehensive_analysis_text(stock: Stock) -> str:
+    """Generate comprehensive analysis as text for logging."""
+    metrics = stock.get_comprehensive_metrics()
+
+    lines = []
+    lines.append("=" * 70)
+    lines.append(f"COMPREHENSIVE STOCK ANALYSIS: {stock.ticker}")
+    lines.append(f"Company: {stock.info.get('longName', 'Unknown')}")
+    lines.append("=" * 70)
+    lines.append("")
+
+    # Basic Metrics
+    lines.append("BASIC METRICS:")
+    lines.append("-" * 70)
+    basic = metrics['basic_metrics']
+    lines.append(f"  Current Price:            ${basic.get('current_price', 'N/A')}")
+    lines.append(f"  P/E Ratio:                {basic.get('pe_ratio', 'N/A')}")
+    lines.append(f"  PEG Ratio:                {basic.get('peg_ratio', 'N/A')}")
+    lines.append(f"  Revenue Growth:           {basic.get('revenue_growth', 'N/A')}%")
+    lines.append("")
+
+    # Profitability
+    lines.append("PROFITABILITY:")
+    lines.append("-" * 70)
+    prof = metrics['profitability']
+    lines.append(f"  ROE:                      {prof.get('roe', 'N/A')}%")
+    lines.append(f"  ROA:                      {prof.get('roa', 'N/A')}%")
+    margins = prof.get('profit_margins', {})
+    lines.append(f"  Gross Margin:             {margins.get('gross_margin', 'N/A')}%")
+    lines.append(f"  Operating Margin:         {margins.get('operating_margin', 'N/A')}%")
+    lines.append(f"  Net Margin:               {margins.get('net_margin', 'N/A')}%")
+    lines.append("")
+
+    # Liquidity & Leverage
+    lines.append("LIQUIDITY & LEVERAGE:")
+    lines.append("-" * 70)
+    liq = metrics['liquidity']
+    lev = metrics['leverage']
+    lines.append(f"  Current Ratio:            {liq.get('current_ratio', 'N/A')}")
+    lines.append(f"  Quick Ratio:              {liq.get('quick_ratio', 'N/A')}")
+    lines.append(f"  Debt-to-Equity:           {lev.get('debt_to_equity', 'N/A')}")
+    lines.append("")
+
+    # Valuation
+    lines.append("VALUATION:")
+    lines.append("-" * 70)
+    val = metrics['valuation']
+    if val.get('market_cap'):
+        lines.append(f"  Market Cap:               ${val['market_cap']:,.0f}")
+    if val.get('enterprise_value'):
+        lines.append(f"  Enterprise Value:         ${val['enterprise_value']:,.0f}")
+    lines.append(f"  Price-to-Sales:           {val.get('price_to_sales', 'N/A')}")
+    lines.append(f"  Price-to-Book:            {val.get('price_to_book', 'N/A')}")
+    lines.append(f"  EV/Revenue:               {val.get('ev_to_revenue', 'N/A')}")
+    lines.append(f"  EV/EBITDA:                {val.get('ev_to_ebitda', 'N/A')}")
+    lines.append("")
+
+    # Growth
+    lines.append("GROWTH:")
+    lines.append("-" * 70)
+    growth = metrics['growth']
+    lines.append(f"  Earnings Growth:          {growth.get('earnings_growth', 'N/A')}%")
+    lines.append(f"  Revenue Growth (TTM):     {growth.get('revenue_growth_ttm', 'N/A')}%")
+    lines.append(f"  Earnings Growth (QoQ):    {growth.get('earnings_quarterly_growth', 'N/A')}%")
+    lines.append("")
+
+    # Dividends
+    lines.append("DIVIDENDS:")
+    lines.append("-" * 70)
+    div = metrics['dividends']
+    lines.append(f"  Dividend Yield:           {div.get('dividend_yield', 'N/A')}%")
+    lines.append(f"  Dividend Rate:            ${div.get('dividend_rate', 'N/A')}")
+    lines.append(f"  Payout Ratio:             {div.get('payout_ratio', 'N/A')}%")
+    lines.append(f"  5Y Avg Yield:             {div.get('five_year_avg_yield', 'N/A')}%")
+    lines.append("")
+
+    # Cash Flow
+    lines.append("CASH FLOW:")
+    lines.append("-" * 70)
+    cf = metrics['cash_flow']
+    if cf.get('operating_cash_flow'):
+        lines.append(f"  Operating Cash Flow:      ${cf['operating_cash_flow']:,.0f}")
+    if cf.get('free_cash_flow'):
+        lines.append(f"  Free Cash Flow:           ${cf['free_cash_flow']:,.0f}")
+    lines.append("")
+
+    # Ownership
+    lines.append("OWNERSHIP:")
+    lines.append("-" * 70)
+    own = metrics['ownership']
+    lines.append(f"  Insider Ownership:        {own.get('insider_ownership', 'N/A')}%")
+    lines.append(f"  Institutional Ownership:  {own.get('institutional_ownership', 'N/A')}%")
+    lines.append("")
+
+    # Valuation Trap Check
+    trap_analysis = detect_valuation_trap(stock)
+    lines.append("VALUATION TRAP ANALYSIS:")
+    lines.append("-" * 70)
+    if trap_analysis['is_valuation_trap']:
+        lines.append("  POTENTIAL VALUATION TRAP DETECTED!")
+        for reason in trap_analysis['reasons']:
+            lines.append(f"    - {reason}")
+    else:
+        lines.append("  No obvious valuation traps detected")
+    lines.append("")
+
+    lines.append("=" * 70)
+
+    return "\n".join(lines)
 
 
 # ======================= MARKET ANALYSIS FUNCTIONS =======================
@@ -563,42 +750,84 @@ def print_comprehensive_stock_analysis(stock: Stock) -> None:
 def analyze_multiple_stocks(tickers: List[str]) -> None:
     """
     Analyze multiple stocks using the flowchart method.
+    Writes detailed analysis to log files and prints summary to terminal.
 
     Args:
         tickers: List of stock ticker symbols
     """
     results_summary = []
+    total = len(tickers)
 
-    for ticker in tickers:
-        print(f"\nAnalyzing {ticker}...\n")
+    print(f"\nAnalyzing {total} stocks (logs will be saved to {LOGS_DIR})...\n")
+
+    for i, ticker in enumerate(tickers, 1):
         try:
             stock = Stock(ticker)
-            print_stock_flowchart_analysis(stock)
-
             analysis = analyze_stock_flowchart(stock)
+
+            # Generate log content
+            log_content = []
+            log_content.append(f"Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            log_content.append("")
+            log_content.append(generate_flowchart_analysis_text(stock))
+            log_content.append("")
+            log_content.append(generate_comprehensive_analysis_text(stock))
+
+            # Write to log file
+            log_path = write_to_log(ticker, "\n".join(log_content))
+
             results_summary.append({
                 'ticker': ticker,
-                'recommendation': analysis['recommendation']
+                'recommendation': analysis['recommendation'],
+                'log_path': log_path
             })
+
+            # Print progress
+            status_icon = {
+                'INVEST': '🟢',
+                'PASS': '🔴',
+                'INSUFFICIENT_DATA': '🟡'
+            }.get(analysis['recommendation'], '❓')
+            print(f"  [{i}/{total}] {status_icon} {ticker:10s}: {analysis['recommendation']}")
+
         except Exception as e:
-            print(f"Error analyzing {ticker}: {e}\n")
+            print(f"  [{i}/{total}] ⚠️  {ticker:10s}: ERROR - {e}")
             results_summary.append({
                 'ticker': ticker,
-                'recommendation': 'ERROR'
+                'recommendation': 'ERROR',
+                'log_path': None
             })
 
     # Print summary
     print("\n" + "=" * 70)
     print("SUMMARY OF ALL ANALYZED STOCKS")
     print("=" * 70)
-    for result in results_summary:
-        emoji = {
-            'INVEST': '🟢',
-            'PASS': '🔴',
-            'INSUFFICIENT_DATA': '🟡',
-            'ERROR': '⚠️'
-        }.get(result['recommendation'], '❓')
-        print(f"  {emoji} {result['ticker']:10s}: {result['recommendation']}")
+
+    # Group by recommendation
+    invest = [r for r in results_summary if r['recommendation'] == 'INVEST']
+    pass_stocks = [r for r in results_summary if r['recommendation'] == 'PASS']
+    insufficient = [r for r in results_summary if r['recommendation'] == 'INSUFFICIENT_DATA']
+    errors = [r for r in results_summary if r['recommendation'] == 'ERROR']
+
+    print(f"\n  🟢 INVEST ({len(invest)}):")
+    for r in invest:
+        print(f"      {r['ticker']}")
+
+    print(f"\n  🔴 PASS ({len(pass_stocks)}):")
+    for r in pass_stocks:
+        print(f"      {r['ticker']}")
+
+    if insufficient:
+        print(f"\n  🟡 INSUFFICIENT DATA ({len(insufficient)}):")
+        for r in insufficient:
+            print(f"      {r['ticker']}")
+
+    if errors:
+        print(f"\n  ⚠️  ERRORS ({len(errors)}):")
+        for r in errors:
+            print(f"      {r['ticker']}")
+
+    print(f"\n  Logs saved to: {LOGS_DIR}")
     print("=" * 70)
 
 
@@ -645,34 +874,21 @@ def analyse():
     # Show fundamental analysis flowchart
     show_fundamental_analysis_flowchart()
 
-    print("\nLet's analyze a stock based on the above flowchart.\n")
-
-    # Example: Analyze a single stock with flowchart
-    ticker = "AAPL"
-    print(f"\n{'='*70}")
-    print(f"FLOWCHART ANALYSIS FOR {ticker}")
-    print(f"{'='*70}\n")
-    try:
-        stock = Stock(ticker)
-        print_stock_flowchart_analysis(stock)
-    except Exception as e:
-        print(f"Error: {e}")
-
-    # Example: Comprehensive analysis
-    print(f"\n{'='*70}")
-    print(f"COMPREHENSIVE ANALYSIS FOR {ticker}")
-    print(f"{'='*70}\n")
-    try:
-        stock = Stock(ticker)
-        print_comprehensive_stock_analysis(stock)
-    except Exception as e:
-        print(f"Error: {e}")
-
-    # Example: Analyze multiple stocks
-    print(f"\n{'='*70}")
-    print("ANALYZING MULTIPLE STOCKS")
-    print(f"{'='*70}\n")
-    tickers_to_analyze = ["AAPL", "MSFT", "GOOGL"]
+    # Analyze multiple stocks - detailed logs saved to files
+    tickers_to_analyze = [
+        "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "NVDA", "AVGO", "CRM", "AMD", "ORCL",
+        "TSM", "INTC", "ASML", "MU", "TXN",
+        "XOM", "CVX", "BP", "SHEL", "NEP", "ENPH", "FSLR",
+        "JPM", "BAC", "WFC", "V", "MA", "BLK",
+        "PG", "KO", "PEP", "COST", "WMT",
+        "TSLA", "HD", "MCD", "NKE", "SBUX",
+        "JNJ", "PFE", "MRK", "UNH", "ABBV",
+        "VZ", "T", "TMUS",
+        "CAT", "BA", "GE", "DE",
+        "NEE", "DUK", "SO",
+        "AMT", "PLD", "O",
+        "SPY", "VOO", "QQQ", "VTI", "VXUS"
+    ]
     analyze_multiple_stocks(tickers_to_analyze)
 
 
