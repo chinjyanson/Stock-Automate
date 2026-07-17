@@ -1,0 +1,10 @@
+{
+  "name": "Trading Platform",
+  "short_name": "Trading",
+  "description": "Stock scanner and autonomous trading platform. Defaults to paper trading.",
+  "start_url": "/dashboard",
+  "display": "standalone",
+  "background_color": "#0d1117",
+  "theme_color": "#0f766e",
+  "icons": []
+}

@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+@theme {
+  --color-surface: #ffffff;
+  --color-surface-muted: #f6f7f9;
+  --color-border-subtle: #e3e6ea;
+  --color-ink: #12151a;
+  --color-ink-muted: #5c6470;
+
+  /* Paper and live are the most important distinction in this application, so
+     they get dedicated, deliberately dissimilar colours rather than a shared
+     accent. A user must never have to read carefully to know which mode they
+     are in. */
+  --color-paper: #0f766e;
+  --color-paper-soft: #ccfbf1;
+  --color-live: #b91c1c;
+  --color-live-soft: #fee2e2;
+
+  --color-ok: #15803d;
+  --color-warn: #b45309;
+}
+
+@media (prefers-color-scheme: dark) {
+  @theme {
+    --color-surface: #0d1117;
+    --color-surface-muted: #161b22;
+    --color-border-subtle: #262c36;
+    --color-ink: #e6edf3;
+    --color-ink-muted: #8b949e;
+    --color-paper-soft: #042f2e;
+    --color-live-soft: #450a0a;
+  }
+}
+
+body {
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* Tabular figures everywhere money appears: proportional digits make columns
+   of prices jitter and genuinely harder to scan. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}

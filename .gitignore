@@ -1,5 +1,37 @@
+# Python
 venv/
+.venv/
 __pycache__/
-logs/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+*.egg-info/
+
+# Node
+node_modules/
+.next/
+out/
+.turbo/
+coverage/
+playwright-report/
+test-results/
+
+# Secrets — never commit real credentials
 .env
-database_credentials.json
+.env.local
+.env.*.local
+!.env.example
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Runtime artifacts
+logs/
+*.log

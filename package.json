@@ -1,0 +1,36 @@
+{
+  "name": "trading-platform",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.13.1",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "test": "turbo run test",
+    "test:e2e": "turbo run test:e2e",
+    "format": "prettier --write \"**/*.{ts,tsx,md,json,yaml,yml}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,md,json,yaml,yml}\"",
+    "api:dev": "uv --directory apps/api run uvicorn app.main:app --reload --port 8000",
+    "api:test": "uv --directory apps/api run pytest",
+    "api:lint": "uv --directory apps/api run ruff check .",
+    "api:format": "uv --directory apps/api run ruff format .",
+    "api:typecheck": "uv --directory apps/api run mypy app",
+    "worker:dev": "uv --directory apps/worker run celery -A worker.app worker --beat --loglevel=info",
+    "db:migrate": "uv --directory apps/api run alembic upgrade head",
+    "db:revision": "uv --directory apps/api run alembic revision --autogenerate -m",
+    "db:seed": "uv --directory apps/api run python -m app.seed",
+    "compose:up": "docker compose up -d",
+    "compose:down": "docker compose down",
+    "compose:logs": "docker compose logs -f"
+  },
+  "devDependencies": {
+    "prettier": "^3.4.2",
+    "turbo": "^2.3.3",
+    "typescript": "^5.7.2"
+  }
+}

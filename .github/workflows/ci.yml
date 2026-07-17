@@ -1,0 +1,180 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A new push supersedes an in-flight run on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # CI never has real credentials, and must never need them: the mock broker and
+  # mock provider cover the full workflow (§23). Live trading stays off.
+  LIVE_TRADING_ENABLED: "false"
+  SESSION_SECRET: ci-only-not-a-real-secret-value-here
+  SECRETS_ENCRYPTION_KEY: ci-only-not-a-real-encryption-key-x
+
+jobs:
+  api:
+    name: API (ruff, mypy, pytest)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: trading
+          POSTGRES_PASSWORD: trading_dev_password_change_me
+          POSTGRES_DB: trading_platform
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U trading -d trading_platform"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      # Services are published on default ports here, unlike local compose.
+      DATABASE_URL: postgresql+asyncpg://trading:trading_dev_password_change_me@localhost:5432/trading_platform
+      TEST_DATABASE_URL: postgresql+asyncpg://trading:trading_dev_password_change_me@localhost:5432/postgres
+      REDIS_URL: redis://localhost:6379/0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        working-directory: apps/api
+        run: uv sync --extra dev
+
+      - name: Lint
+        working-directory: apps/api
+        run: uv run ruff check .
+
+      - name: Format check
+        working-directory: apps/api
+        run: uv run ruff format --check .
+
+      - name: Type check
+        working-directory: apps/api
+        run: uv run mypy app
+
+      - name: Migrations apply cleanly
+        working-directory: apps/api
+        run: uv run alembic upgrade head
+
+      - name: Migrations are reversible
+        working-directory: apps/api
+        # A migration that cannot be rolled back is not a migration.
+        run: |
+          uv run alembic downgrade base
+          uv run alembic upgrade head
+
+      - name: No un-migrated model drift
+        working-directory: apps/api
+        # Fails if a model changed without a migration — the drift that bites in
+        # deployment, not in review.
+        run: uv run alembic check
+
+      - name: Tests
+        working-directory: apps/api
+        run: uv run pytest -q --cov=app --cov-report=term-missing
+
+  worker:
+    name: Worker (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        working-directory: apps/worker
+        run: uv sync --extra dev
+
+      - name: Lint
+        working-directory: apps/worker
+        run: uv run ruff check .
+
+      - name: Tasks register
+        working-directory: apps/worker
+        # Guards against a beat schedule pointing at a task that does not exist —
+        # which fails silently at runtime, at 06:00, unattended.
+        run: |
+          uv run python -c "
+          from worker.app import app
+          app.loader.import_default_modules()
+          for entry in app.conf.beat_schedule.values():
+              assert entry['task'] in app.tasks, f\"scheduled task missing: {entry['task']}\"
+          print('all scheduled tasks are registered')
+          "
+
+  web:
+    name: Web (tsc, lint, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        run: pnpm --filter web typecheck
+
+      - name: Build
+        run: pnpm --filter web build
+
+  secrets:
+    name: No committed secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure .env is not committed
+        run: |
+          if git ls-files --error-unmatch .env 2>/dev/null; then
+            echo "::error::.env is tracked by git. It must never be committed."
+            exit 1
+          fi
+          echo ".env is not tracked"
+
+      - name: Scan for Trading 212 key shapes
+        run: |
+          # Catches a real key pasted into source. .env.example is exempt: its
+          # keys are deliberately empty.
+          if grep -rInE 'TRADING212_(DEMO|LIVE)_API_KEY\s*=\s*[0-9]{4,}' \
+             --exclude=.env.example --exclude-dir=.git . ; then
+            echo "::error::A Trading 212 API key appears to be committed."
+            exit 1
+          fi
+          echo "no committed API keys found"
