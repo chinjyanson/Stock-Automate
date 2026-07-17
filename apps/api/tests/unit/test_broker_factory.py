@@ -11,7 +11,7 @@ import pytest
 from pydantic import SecretStr
 
 from app.broker import (
-    BrokerAuthError,
+    BrokerNotConfiguredError,
     LiveTradingDisabledError,
     MockBroker,
     Trading212DemoBroker,
@@ -28,9 +28,23 @@ def _settings(**overrides: object) -> Settings:
         "environment": "test",
         "live_trading_enabled": False,
         "trading212_demo_api_key": None,
+        "trading212_demo_api_secret": None,
         "trading212_live_api_key": None,
+        "trading212_live_api_secret": None,
     }
     base.update(overrides)
+
+    # Trading 212 uses key + secret. Most tests care only that a *credential* is
+    # present, so a key without an explicit secret gets a matching one here —
+    # keeping those tests about the behaviour they name. Tests that exercise a
+    # half-configured credential pass the secret (or its absence) explicitly.
+    for env in ("demo", "live"):
+        if (
+            base.get(f"trading212_{env}_api_key")
+            and f"trading212_{env}_api_secret" not in overrides
+        ):
+            base[f"trading212_{env}_api_secret"] = SecretStr(f"{env}-secret")
+
     return Settings(**base)  # type: ignore[arg-type]
 
 
@@ -54,12 +68,12 @@ class TestLiveTradingGate:
         traded. It must raise instead.
         """
         settings = _settings(live_trading_enabled=True, trading212_live_api_key=None)
-        with pytest.raises(BrokerAuthError):
+        with pytest.raises(BrokerNotConfiguredError):
             resolve_broker(BrokerKind.TRADING212_LIVE, settings)
 
     def test_live_with_empty_string_key_is_treated_as_absent(self) -> None:
         settings = _settings(live_trading_enabled=True, trading212_live_api_key=SecretStr(""))
-        with pytest.raises(BrokerAuthError):
+        with pytest.raises(BrokerNotConfiguredError):
             resolve_broker(BrokerKind.TRADING212_LIVE, settings)
 
     def test_live_is_constructed_only_when_flag_and_key_are_both_present(self) -> None:
@@ -85,28 +99,96 @@ class TestLiveTradingGate:
         assert MockBroker().is_live is False
 
 
-class TestDemoFallback:
-    def test_demo_without_credentials_degrades_to_mock(self) -> None:
-        """Safe direction: mock is strictly less privileged than demo."""
-        settings = _settings(trading212_demo_api_key=None)
-        broker = resolve_broker(BrokerKind.TRADING212_DEMO, settings)
-        assert isinstance(broker, MockBroker)
-        assert not broker.is_live
+class TestNoSubstitution:
+    """A requested venue is honoured or refused — never swapped."""
 
-    def test_demo_with_credentials_uses_the_real_demo_adapter(self) -> None:
-        settings = _settings(trading212_demo_api_key=SecretStr("demo-key"))
+    def test_demo_without_credentials_raises_rather_than_mocking(self) -> None:
+        """The old behaviour silently returned a mock here.
+
+        That was worse than an error: the caller would see filled orders and
+        moving cash against invented fixture prices, while believing it was
+        exercising Trading 212's real tickers, rate limits and order semantics.
+        """
+        settings = _settings(trading212_demo_api_key=None)
+        with pytest.raises(BrokerNotConfiguredError, match="TRADING212_DEMO_API_KEY"):
+            resolve_broker(BrokerKind.TRADING212_DEMO, settings)
+
+    def test_demo_with_empty_string_key_is_treated_as_absent(self) -> None:
+        settings = _settings(trading212_demo_api_key=SecretStr(""))
+        with pytest.raises(BrokerNotConfiguredError):
+            resolve_broker(BrokerKind.TRADING212_DEMO, settings)
+
+    def test_demo_with_key_but_no_secret_is_refused(self) -> None:
+        """Trading 212 needs both halves; a key alone cannot authenticate.
+
+        This is the exact shape of the real-world 401 that prompted the switch
+        to Basic auth — a saved key with the secret never recorded.
+        """
+        settings = _settings(
+            trading212_demo_api_key=SecretStr("demo-key"),
+            trading212_demo_api_secret=None,
+        )
+        with pytest.raises(BrokerNotConfiguredError, match="TRADING212_DEMO_API_SECRET"):
+            resolve_broker(BrokerKind.TRADING212_DEMO, settings)
+
+    def test_demo_with_secret_but_no_key_is_refused(self) -> None:
+        settings = _settings(
+            trading212_demo_api_key=None,
+            trading212_demo_api_secret=SecretStr("demo-secret"),
+        )
+        with pytest.raises(BrokerNotConfiguredError, match="TRADING212_DEMO_API_KEY"):
+            resolve_broker(BrokerKind.TRADING212_DEMO, settings)
+
+    def test_demo_with_both_halves_uses_the_real_demo_adapter(self) -> None:
+        settings = _settings(
+            trading212_demo_api_key=SecretStr("demo-key"),
+            trading212_demo_api_secret=SecretStr("demo-secret"),
+        )
         broker = resolve_broker(BrokerKind.TRADING212_DEMO, settings)
         assert isinstance(broker, Trading212DemoBroker)
         assert broker.kind is BrokerKind.TRADING212_DEMO
 
+    def test_mock_is_reachable_only_by_asking_for_it(self) -> None:
+        """The mock is not gone — it is opt-in.
+
+        Nothing falls back to it, but naming it explicitly still works, which is
+        what keeps offline tests and CI runnable without credentials.
+        """
+        broker = resolve_broker(BrokerKind.MOCK, _settings())
+        assert isinstance(broker, MockBroker)
+        assert not broker.is_live
+
+    def test_no_configuration_can_make_a_request_return_a_different_venue(self) -> None:
+        settings = _settings(
+            trading212_demo_api_key=SecretStr("demo-key"),
+            trading212_live_api_key=SecretStr("live-key"),
+            live_trading_enabled=True,
+        )
+        assert resolve_broker(BrokerKind.MOCK, settings).kind is BrokerKind.MOCK
+        assert (
+            resolve_broker(BrokerKind.TRADING212_DEMO, settings).kind is BrokerKind.TRADING212_DEMO
+        )
+        assert (
+            resolve_broker(BrokerKind.TRADING212_LIVE, settings).kind is BrokerKind.TRADING212_LIVE
+        )
+
 
 class TestDefaultBroker:
-    def test_default_is_mock_when_nothing_is_configured(self) -> None:
-        assert default_paper_broker_kind(_settings()) is BrokerKind.MOCK
-
-    def test_default_is_demo_when_demo_credentials_exist(self) -> None:
+    def test_default_is_demo(self) -> None:
         settings = _settings(trading212_demo_api_key=SecretStr("demo-key"))
         assert default_paper_broker_kind(settings) is BrokerKind.TRADING212_DEMO
+
+    def test_default_is_demo_even_with_no_credentials(self) -> None:
+        """The default does not change shape based on what is configured.
+
+        With no demo key this yields a kind that `resolve_broker` will refuse —
+        an error, not a mock. Choosing a different venue because a key is
+        missing is precisely the substitution we removed.
+        """
+        settings = _settings(trading212_demo_api_key=None)
+        assert default_paper_broker_kind(settings) is BrokerKind.TRADING212_DEMO
+        with pytest.raises(BrokerNotConfiguredError):
+            resolve_broker(default_paper_broker_kind(settings), settings)
 
     def test_default_is_never_live_even_when_live_is_fully_configured(self) -> None:
         """§7: the default mode must be demo or internal paper. Never live."""
@@ -125,4 +207,4 @@ class TestDefaultBroker:
             trading212_live_api_key=SecretStr("live-key"),
             trading212_demo_api_key=None,
         )
-        assert default_paper_broker_kind(settings) is BrokerKind.MOCK
+        assert default_paper_broker_kind(settings) is not BrokerKind.TRADING212_LIVE

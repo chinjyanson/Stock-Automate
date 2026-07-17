@@ -15,7 +15,6 @@ from app.api.schemas import (
 )
 from app.auth.dependencies import AuthContext, get_auth_context, require_csrf
 from app.broker.factory import default_paper_broker_kind, resolve_broker
-from app.broker.types import BrokerError
 from app.config import get_settings
 from app.db import get_db
 from app.models.enums import BrokerKind
@@ -51,10 +50,6 @@ async def get_account(
     client = resolve_broker(kind, get_settings())
     try:
         account = await client.get_account()
-    except BrokerError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Broker error: {exc}"
-        ) from exc
     finally:
         await client.close()
 
@@ -81,10 +76,6 @@ async def get_positions(
     client = resolve_broker(kind, get_settings())
     try:
         positions = await client.get_positions()
-    except BrokerError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Broker error: {exc}"
-        ) from exc
     finally:
         await client.close()
 
@@ -115,10 +106,6 @@ async def get_orders(
             if include_history
             else await client.get_pending_orders()
         )
-    except BrokerError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Broker error: {exc}"
-        ) from exc
     finally:
         await client.close()
 
@@ -154,10 +141,6 @@ async def reconcile(
     client = resolve_broker(kind, get_settings())
     try:
         result = await client.reconcile()
-    except BrokerError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Broker error: {exc}"
-        ) from exc
     finally:
         await client.close()
 

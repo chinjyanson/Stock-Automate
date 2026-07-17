@@ -42,16 +42,29 @@ class Settings(BaseSettings):
     redis_url: RedisDsn = RedisDsn("redis://localhost:6380/0")
 
     # -- Security -----------------------------------------------------------
-    session_secret: SecretStr = SecretStr("dev-only-insecure-session-secret")
+    #
+    # There is deliberately no SESSION_SECRET. Sessions are server-side records
+    # keyed by a 256-bit random token stored as a SHA-256 hash (see
+    # `app.auth.service`), so there is nothing to sign and no signing key to
+    # rotate. Declaring one would imply a dependency that does not exist — and
+    # imply that rotating it revokes sessions, which it would not. Revocation is
+    # `UserSession.revoked_at`.
     secrets_encryption_key: SecretStr = SecretStr("dev-only-insecure-encryption-key")
     session_ttl_seconds: int = 86_400
     session_cookie_name: str = "trading_session"
     session_cookie_secure: bool = False
 
     # -- Trading 212 --------------------------------------------------------
+    #
+    # Trading 212 authenticates with an API key AND an API secret, combined as
+    # HTTP Basic auth. Both halves are required; a key alone returns 401. The
+    # secret is shown only once at generation time — if it was not saved, the
+    # key must be regenerated.
     trading212_demo_api_key: SecretStr | None = None
+    trading212_demo_api_secret: SecretStr | None = None
     trading212_demo_base_url: str = "https://demo.trading212.com/api/v0"
     trading212_live_api_key: SecretStr | None = None
+    trading212_live_api_secret: SecretStr | None = None
     trading212_live_base_url: str = "https://live.trading212.com/api/v0"
     trading212_max_requests_per_minute: int = 30
     trading212_timeout_seconds: float = 20.0
@@ -150,27 +163,20 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_production_secrets(self) -> Settings:
-        """Refuse to boot production with development placeholder secrets.
+        """Refuse to boot production with a development placeholder secret.
 
-        Failing at startup is deliberate: a signing key that silently stays at
-        its default would let anyone forge a session against a live-capable
-        deployment.
+        Failing at startup is deliberate: an encryption key left at its default
+        would mean every stored broker credential on a live-capable deployment
+        is encrypted under a value published in this repository.
         """
         if not self.is_production:
             return self
-        placeholders = {
-            "session_secret": self.session_secret.get_secret_value(),
-            "secrets_encryption_key": self.secrets_encryption_key.get_secret_value(),
-        }
-        offenders = [
-            name
-            for name, value in placeholders.items()
-            if value.startswith("dev-only-") or value.startswith("CHANGE_ME")
-        ]
-        if offenders:
+
+        encryption_key = self.secrets_encryption_key.get_secret_value()
+        if encryption_key.startswith("dev-only-") or encryption_key.startswith("CHANGE_ME"):
             raise ValueError(
-                f"Refusing to start in production with placeholder secrets: {offenders}. "
-                "Generate real values with `openssl rand -base64 32`."
+                "Refusing to start in production with a placeholder "
+                "SECRETS_ENCRYPTION_KEY. Generate one with `openssl rand -base64 32`."
             )
         if not self.session_cookie_secure:
             raise ValueError("SESSION_COOKIE_SECURE must be true in production")

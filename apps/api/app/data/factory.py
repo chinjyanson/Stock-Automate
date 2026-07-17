@@ -1,4 +1,9 @@
-"""Market-data provider selection and the daily-data fallback chain (§4)."""
+"""Market-data provider selection and the daily-data priority chain (§4).
+
+As with brokers, a provider is never substituted. The mock provider is
+reachable only when explicitly named: serving invented prices to something that
+asked for real ones is the quietest way to produce confident, wrong answers.
+"""
 
 from __future__ import annotations
 
@@ -13,11 +18,16 @@ from app.models.enums import ProviderKind
 log = structlog.get_logger(__name__)
 
 
+class ProviderNotConfiguredError(Exception):
+    """A provider was requested or required whose configuration is absent."""
+
+
 def resolve_provider(kind: ProviderKind, settings: Settings | None = None) -> MarketDataProvider:
     settings = settings or get_settings()
 
     match kind:
         case ProviderKind.MOCK:
+            # Reachable only by explicitly asking for it. Nothing falls back here.
             return MockMarketDataProvider()
 
         case ProviderKind.YFINANCE:
@@ -49,10 +59,15 @@ def resolve_provider(kind: ProviderKind, settings: Settings | None = None) -> Ma
 def daily_provider_chain(settings: Settings | None = None) -> list[ProviderKind]:
     """Provider priority for broad daily data (§4).
 
-    The local database is checked first by the caller, not listed here — this
-    is the order in which we go *out* to the network once the store has missed.
-    A chain that runs out marks data unavailable rather than substituting
+    The local database is checked first by the caller, not listed here — this is
+    the order in which we go *out* to the network once the store has missed. A
+    chain that runs out marks data unavailable rather than substituting
     something unverified (§17).
+
+    Raises when no real provider is configured. Previously this appended the
+    mock provider, which meant a misconfigured deployment would scan, score and
+    rank instruments on a random walk while reporting nothing unusual. An empty
+    chain is a configuration error and says so.
     """
     settings = settings or get_settings()
     chain: list[ProviderKind] = []
@@ -63,11 +78,10 @@ def daily_provider_chain(settings: Settings | None = None) -> list[ProviderKind]
         chain.append(ProviderKind.EODHD)
 
     if not chain:
-        log.warning(
-            "data.no_daily_provider_configured",
-            detail="No daily provider is enabled; falling back to the mock provider. "
-            "Data is simulated and must not inform real decisions.",
+        raise ProviderNotConfiguredError(
+            "No daily market-data provider is configured. Set YFINANCE_ENABLED=true "
+            "(no API key required) or configure EODHD_API_KEY. To run offline "
+            "against deterministic fixtures, request ProviderKind.MOCK explicitly."
         )
-        chain.append(ProviderKind.MOCK)
 
     return chain

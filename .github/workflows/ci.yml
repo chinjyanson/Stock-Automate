@@ -15,7 +15,6 @@ env:
   # CI never has real credentials, and must never need them: the mock broker and
   # mock provider cover the full workflow (§23). Live trading stays off.
   LIVE_TRADING_ENABLED: "false"
-  SESSION_SECRET: ci-only-not-a-real-secret-value-here
   SECRETS_ENCRYPTION_KEY: ci-only-not-a-real-encryption-key-x
 
 jobs:

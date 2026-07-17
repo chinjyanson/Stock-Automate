@@ -4,17 +4,35 @@
 > orders. Nothing in this document should be followed on a live account until
 > you have run the full workflow on demo.
 
-## The platform works without any key
+## A demo key is required
 
-With `TRADING212_DEMO_API_KEY` unset, the platform uses a deterministic mock
-broker: a fixed catalogue (VUAG, VUSA, SGLN, CRUD, AAPL, MSFT, SPY), a cash
-balance that moves as orders fill, and no network calls. The entire Phase 1
-workflow runs offline.
+`TRADING212_DEMO_API_KEY` must be set for any broker call to work. Without it
+the API returns **503 `not_configured`** naming the variable. It does *not* fall
+back to mock data: seeing filled orders and moving cash against invented prices,
+while believing you are exercising Trading 212's real tickers and rate limits,
+is worse than a clear failure.
 
-Configure a demo key only when you want to exercise the real Trading 212
-integration — its ticker vocabulary, rate limits and order semantics.
+The mock broker still exists for offline work, but you must ask for it by name —
+`?broker=mock` on the API, or `BrokerKind.MOCK` in code. That is how the test
+suite and CI run without credentials.
 
-## Getting a demo key
+## Authentication: key *and* secret
+
+Trading 212 authenticates with **HTTP Basic auth over two credentials**, not a
+single token:
+
+```
+Authorization: Basic base64("<API_KEY>:<API_SECRET>")
+```
+
+Generating a key gives you both an **API key** and an **API secret**. The secret
+is displayed **once**, at generation. A key on its own returns `401` — which is
+the most common reason "my key doesn't work": only the key was saved.
+
+If you have lost the secret, you cannot recover it. Regenerate the key to get a
+fresh pair.
+
+## Getting a demo credential
 
 1. Open the Trading 212 app or web platform.
 2. Switch to a **Practice / Demo** account. Confirm the UI says Practice before
@@ -27,22 +45,23 @@ integration — its ticker vocabulary, rate limits and order semantics.
    - Orders (read)
 
    Do **not** grant order-placement scope until Phase 3.
-5. Copy the key into `.env`:
+5. Copy **both values** into `.env` immediately — the secret is shown only once:
 
 ```bash
 TRADING212_DEMO_API_KEY=your_demo_key_here
+TRADING212_DEMO_API_SECRET=your_demo_secret_here
 TRADING212_DEMO_BASE_URL=https://demo.trading212.com/api/v0
 ```
 
-Restart the API. The startup log states which broker is in use.
-
-Verify:
+Then confirm the credential actually works before starting the app:
 
 ```bash
-curl -s localhost:8000/health/dependencies | python3 -m json.tool
+pnpm check:keys
 ```
 
-`trading212_demo` should report `healthy: true`.
+This probes the account endpoint read-only and reports `PASS`/`FAIL` per
+provider, naming the exact fix on failure. It never places an order and never
+touches the live account unless you pass `--include-live`.
 
 ## Live keys
 
@@ -50,10 +69,12 @@ curl -s localhost:8000/health/dependencies | python3 -m json.tool
 engine, which does not exist. `/live/arm` will refuse with a 409 listing that as
 a blocker. This section documents the eventual process.
 
-Live and demo are **separate keys, separate accounts, separate config**:
+Live and demo are **separate credentials, separate accounts, separate config**,
+each a key + secret pair:
 
 ```bash
 TRADING212_LIVE_API_KEY=your_live_key_here
+TRADING212_LIVE_API_SECRET=your_live_secret_here
 TRADING212_LIVE_BASE_URL=https://live.trading212.com/api/v0
 LIVE_TRADING_ENABLED=false      # keep false until you mean it
 ```

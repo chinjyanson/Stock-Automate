@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   ApiError,
+  ApiUnreachableError,
   type Account,
   type AuditEvent,
   type Health,
@@ -29,40 +30,56 @@ export default function DashboardPage() {
   const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
 
   const load = useCallback(async () => {
+    // `finally` rather than a call at each exit: an early return or an
+    // unforeseen throw must still clear the spinner. A dashboard stuck on
+    // "Loading…" tells the user nothing and offers no way out.
     try {
-      await api.me();
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 401) {
-        router.push("/login");
+      try {
+        await api.me();
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 401) {
+          router.push("/login");
+          return;
+        }
+        setError(
+          err instanceof ApiUnreachableError
+            ? err.message
+            : "Could not reach the API. Is it running on port 8000?",
+        );
         return;
       }
-      setError("Could not reach the API. Is it running on port 8000?");
+
+      // Each panel resolves independently: a broker outage must not blank the
+      // whole dashboard, since the audit log and live status are exactly what a
+      // user needs during an outage.
+      const [healthR, accountR, positionsR, auditR, liveR] = await Promise.allSettled([
+        api.health(),
+        api.account(),
+        api.positions(),
+        api.audit(15),
+        api.liveStatus(),
+      ]);
+
+      if (healthR.status === "fulfilled") setHealth(healthR.value);
+      if (accountR.status === "fulfilled") setAccount(accountR.value);
+      if (positionsR.status === "fulfilled") setPositions(positionsR.value);
+      if (auditR.status === "fulfilled") setAudit(auditR.value.items);
+      if (liveR.status === "fulfilled") setLiveStatus(liveR.value);
+
+      // Surface the broker's own reason verbatim — "set TRADING212_DEMO_API_KEY"
+      // and "Trading 212 rejected the key" need different actions from the user,
+      // and a generic "unavailable" hides which one it is.
+      if (accountR.status === "rejected") {
+        const reason = accountR.reason;
+        setError(
+          reason instanceof ApiError || reason instanceof ApiUnreachableError
+            ? reason.message
+            : "Broker is unreachable. Account and positions are unavailable.",
+        );
+      }
+    } finally {
       setLoading(false);
-      return;
     }
-
-    // Each panel resolves independently: a broker outage must not blank the
-    // whole dashboard, since the audit log and live status are exactly what a
-    // user needs during an outage.
-    const [healthR, accountR, positionsR, auditR, liveR] = await Promise.allSettled([
-      api.health(),
-      api.account(),
-      api.positions(),
-      api.audit(15),
-      api.liveStatus(),
-    ]);
-
-    if (healthR.status === "fulfilled") setHealth(healthR.value);
-    if (accountR.status === "fulfilled") setAccount(accountR.value);
-    if (positionsR.status === "fulfilled") setPositions(positionsR.value);
-    if (auditR.status === "fulfilled") setAudit(auditR.value.items);
-    if (liveR.status === "fulfilled") setLiveStatus(liveR.value);
-
-    if (accountR.status === "rejected") {
-      setError("Broker is unreachable. Account and positions are unavailable.");
-    }
-
-    setLoading(false);
   }, [router]);
 
   useEffect(() => {
@@ -77,7 +94,11 @@ export default function DashboardPage() {
       setSyncResult(result);
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Instrument sync failed");
+      setError(
+        err instanceof ApiError || err instanceof ApiUnreachableError
+          ? err.message
+          : "Instrument sync failed",
+      );
     } finally {
       setSyncing(false);
     }

@@ -6,6 +6,7 @@ format. Consumers take `Broker` and the DTOs from `app.broker.types` (§3).
 
 from app.broker.base import Broker
 from app.broker.factory import (
+    BrokerNotConfiguredError,
     LiveTradingDisabledError,
     default_paper_broker_kind,
     resolve_broker,
@@ -35,6 +36,7 @@ __all__ = [
     "BrokerAuthError",
     "BrokerError",
     "BrokerInstrument",
+    "BrokerNotConfiguredError",
     "BrokerOrder",
     "BrokerOrderRejectedError",
     "BrokerOrderRequest",

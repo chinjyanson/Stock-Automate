@@ -20,8 +20,21 @@ to the Home Screen before it will accept web push at all.
 ## VAPID keys (Phase 2)
 
 ```bash
-pnpm --filter web exec web-push generate-vapid-keys
+pnpm vapid:keys
 ```
+
+This generates the keypair with the `cryptography` package the API already
+depends on, rather than the `web-push` npm package. The push *sender* here is
+Python (FastAPI/Celery), so an npm dependency used once for keygen would be
+carried forever to serve a subsystem that never imports it.
+
+VAPID keys are just an ECDSA P-256 keypair, base64url-encoded without padding.
+The encoding is the part worth care: the public key must be the **uncompressed
+point** (`0x04 || X || Y`, 65 bytes), not DER or PEM, and the private key is the
+raw 32-byte scalar. Get it wrong and nothing fails until a browser rejects
+`applicationServerKey` with an error that names none of this. A correctly
+encoded public key always starts with `B` — that is the `0x04` prefix showing
+through.
 
 ```bash
 VAPID_PUBLIC_KEY=...              # safe to expose

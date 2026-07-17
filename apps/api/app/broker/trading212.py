@@ -19,6 +19,7 @@ submission is an ambiguous outcome we would rather never provoke.
 from __future__ import annotations
 
 import asyncio
+import base64
 import time
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -121,21 +122,27 @@ class _Trading212Client:
     def __init__(
         self,
         api_key: str,
+        api_secret: str,
         base_url: str,
         *,
         timeout_seconds: float = 20.0,
         max_requests_per_minute: int = 30,
     ) -> None:
-        if not api_key:
-            raise BrokerAuthError("Trading 212 API key is empty")
+        if not api_key or not api_secret:
+            raise BrokerAuthError("Trading 212 API key and secret are both required")
         self._base_url = base_url.rstrip("/")
         self._limiter = _RateLimiter(max_requests_per_minute)
+        # Trading 212 authenticates with HTTP Basic: the API key is the
+        # username, the API secret the password. `base64(key:secret)` with no
+        # trailing newline (b64encode over bytes never adds one), sent in the
+        # Authorization header — never a query string, which ends up in proxy
+        # logs. The older scheme of sending the raw key alone is no longer
+        # accepted, which is why a single-value key returns 401.
+        token = base64.b64encode(f"{api_key}:{api_secret}".encode()).decode("ascii")
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             timeout=httpx.Timeout(timeout_seconds),
-            # The key goes in a header, never a query string: query strings end
-            # up in proxy logs and browser history.
-            headers={"Authorization": api_key, "Accept": "application/json"},
+            headers={"Authorization": f"Basic {token}", "Accept": "application/json"},
         )
 
     async def close(self) -> None:
@@ -239,6 +246,7 @@ class _Trading212Broker(Broker):
     def __init__(
         self,
         api_key: str,
+        api_secret: str,
         base_url: str,
         *,
         timeout_seconds: float = 20.0,
@@ -246,6 +254,7 @@ class _Trading212Broker(Broker):
     ) -> None:
         self._client = _Trading212Client(
             api_key,
+            api_secret,
             base_url,
             timeout_seconds=timeout_seconds,
             max_requests_per_minute=max_requests_per_minute,

@@ -33,11 +33,11 @@ silently substituting something that looks like it works.
 
 ### What Phase 1 actually does today
 
-Against a clean clone with **no credentials at all**:
+With a Trading 212 demo key configured (or by explicitly requesting the mock
+broker, which is how the tests run keyless):
 
 1. Signs you in (server-side sessions, Argon2id, CSRF-protected).
-2. Synchronises a Trading 212 instrument catalogue (falls back to a
-   deterministic mock broker when no key is configured).
+2. Synchronises the Trading 212 instrument catalogue.
 3. Resolves canonical instrument identity by ISIN → MIC+ticker → provider
    symbol → manual confirmation.
 4. Maps an instrument to a market-data symbol, keeping **signal** and
@@ -64,8 +64,7 @@ Against a clean clone with **no credentials at all**:
 git clone <this repo> && cd Stock-Automate
 
 cp .env.example .env
-# Generate real secrets (the development defaults are refused in production):
-#   openssl rand -base64 32   -> SESSION_SECRET
+# Generate a real secret (the development default is refused in production):
 #   openssl rand -base64 32   -> SECRETS_ENCRYPTION_KEY
 
 docker compose up -d postgres redis
@@ -82,9 +81,15 @@ Sign in with the credentials the seed script prints
 (`dev@example.com` / `development-password`). **Change them before exposing this
 to a network.**
 
-Then, on the dashboard, press **Sync from broker**. With no Trading 212 key
-configured this pulls a deterministic mock catalogue — the entire workflow runs
-offline.
+Then, on the dashboard, press **Sync from broker**. This needs
+`TRADING212_DEMO_API_KEY` set — see [docs/trading212-setup.md](docs/trading212-setup.md).
+Without it you get a **503** naming the variable, not mock data.
+
+To work offline, ask for the mock broker explicitly:
+
+```bash
+curl -X POST 'localhost:8000/instruments/sync?broker=mock' ...
+```
 
 Or bring the whole stack up in Docker:
 
@@ -169,9 +174,11 @@ The properties this codebase treats as non-negotiable:
 
 - **Paper by default.** `default_paper_broker_kind()` cannot return a live
   broker, whatever the configuration.
-- **Fallback is one-directional.** Missing demo credentials degrade to a mock.
-  Missing *live* credentials **raise** — a caller that asked for live and got a
-  simulator would believe it had traded.
+- **A venue is never substituted.** A missing or rejected credential raises;
+  nothing falls back to mock data. The mock broker and provider remain
+  available, but only when explicitly named — which is what the test suite and
+  CI do. Believing you are on Trading 212 while running invented prices is
+  worse than an outage.
 - **Live needs five independent conditions**, checked together so the UI can show
   every blocker at once: server flag, live credentials, recent clean
   reconciliation, no risk halt, and a re-authenticated user typing an exact

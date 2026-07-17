@@ -12,7 +12,12 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import ComponentHealth, HealthResponse
-from app.broker.factory import resolve_broker
+from app.broker.factory import (
+    BrokerNotConfiguredError,
+    LiveTradingDisabledError,
+    resolve_broker,
+)
+from app.broker.types import BrokerAuthError, BrokerRateLimitError, BrokerUnavailableError
 from app.config import get_settings
 from app.db import get_db
 from app.models.enums import BrokerKind
@@ -52,25 +57,65 @@ async def _check_redis() -> ComponentHealth:
 
 
 async def _check_broker(kind: BrokerKind, name: str) -> ComponentHealth:
+    """Probe one broker, classifying *why* it is unhealthy.
+
+    Deliberately calls `get_account()` rather than `Broker.health_check()`: the
+    latter swallows every failure into a bare False, so the probe could only
+    ever say "did not answer". Distinguishing a rejected credential from a
+    network outage from a rate limit is the whole point of a dependency check —
+    it is the difference between "fix your key" and "wait and retry".
+
+    Not-configured and live-disabled are reported as healthy=True: a demo-only
+    deployment is not broken because it has no live key, and a health check that
+    went red for that would be noise that trains operators to ignore it.
+    """
     settings = get_settings()
     started = time.perf_counter()
-    try:
-        broker = resolve_broker(kind, settings)
-    except Exception as exc:
-        # Not configured is a *state*, not a failure. A demo-only deployment
-        # reporting unhealthy for live would be noise.
-        return ComponentHealth(name=name, healthy=True, detail=f"Not configured: {exc}"[:200])
 
     try:
-        healthy = await broker.health_check()
-        return ComponentHealth(
-            name=name,
-            healthy=healthy,
-            detail=None if healthy else "Broker did not answer an account read",
-            latency_ms=int((time.perf_counter() - started) * 1000),
-        )
+        broker = resolve_broker(kind, settings)
+    except BrokerNotConfiguredError:
+        return ComponentHealth(name=name, healthy=True, detail="not configured")
+    except LiveTradingDisabledError:
+        return ComponentHealth(name=name, healthy=True, detail="live trading disabled")
     except Exception as exc:
         return ComponentHealth(name=name, healthy=False, detail=str(exc)[:200])
+
+    def _latency() -> int:
+        return int((time.perf_counter() - started) * 1000)
+
+    try:
+        account = await broker.get_account()
+        return ComponentHealth(
+            name=name,
+            healthy=True,
+            detail=f"authenticated — account {account.masked_account_id}",
+            latency_ms=_latency(),
+        )
+    except BrokerAuthError:
+        return ComponentHealth(
+            name=name,
+            healthy=False,
+            detail="credentials rejected (401) — check the API key and secret",
+            latency_ms=_latency(),
+        )
+    except BrokerRateLimitError:
+        # Reachable and almost certainly authenticated — Trading 212 rate-limits
+        # recognised keys. Not a failure state for a health check.
+        return ComponentHealth(
+            name=name,
+            healthy=True,
+            detail="rate limited, but reachable",
+            latency_ms=_latency(),
+        )
+    except BrokerUnavailableError as exc:
+        return ComponentHealth(
+            name=name, healthy=False, detail=f"unreachable: {exc}"[:200], latency_ms=_latency()
+        )
+    except Exception as exc:
+        return ComponentHealth(
+            name=name, healthy=False, detail=str(exc)[:200], latency_ms=_latency()
+        )
     finally:
         await broker.close()
 

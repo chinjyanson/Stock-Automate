@@ -24,9 +24,11 @@
     "db:migrate": "uv --directory apps/api run alembic upgrade head",
     "db:revision": "uv --directory apps/api run alembic revision --autogenerate -m",
     "db:seed": "uv --directory apps/api run python -m app.seed",
+    "vapid:keys": "uv --directory apps/api run python -m app.scripts.generate_vapid_keys",
     "compose:up": "docker compose up -d",
     "compose:down": "docker compose down",
-    "compose:logs": "docker compose logs -f"
+    "compose:logs": "docker compose logs -f",
+    "check:keys": "uv --directory apps/api run python -m app.scripts.check_credentials"
   },
   "devDependencies": {
     "prettier": "^3.4.2",

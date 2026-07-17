@@ -22,6 +22,20 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 const CSRF_COOKIE = "trading_csrf";
 const CSRF_HEADER = "X-CSRF-Token";
 
+/**
+ * Every request is bounded.
+ *
+ * `fetch` has no default timeout: a socket that is bound but never answers —
+ * a wedged `uvicorn --reload`, a container mid-restart, a dropped VPN — leaves
+ * the promise pending forever, and the UI sits on a spinner with no error and
+ * no recovery. A *refused* connection fails instantly, so this only shows up in
+ * the case that looks most like the app being broken.
+ *
+ * 15s is chosen to sit above a slow-but-real request (instrument sync walks the
+ * whole broker catalogue) and well below a user's patience.
+ */
+const REQUEST_TIMEOUT_MS = 15_000;
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -30,6 +44,17 @@ export class ApiError extends Error {
   ) {
     super(message);
     this.name = "ApiError";
+  }
+}
+
+/** The API did not respond in time, or was unreachable. */
+export class ApiUnreachableError extends Error {
+  constructor(
+    message: string,
+    readonly cause_?: unknown,
+  ) {
+    super(message);
+    this.name = "ApiUnreachableError";
   }
 }
 
@@ -61,12 +86,35 @@ async function request<T>(
     if (token) headers.set(CSRF_HEADER, token);
   }
 
-  const response = await fetch(`${API_URL}${path}`, {
-    ...init,
-    method,
-    headers,
-    credentials: "include",
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_URL}${path}`, {
+      ...init,
+      method,
+      headers,
+      credentials: "include",
+      // Bounds the wait. Without this a hung socket never settles the promise.
+      signal: init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (err) {
+    // A network-level failure, not an HTTP error: the API is unreachable,
+    // hung, or refused the connection. Distinguished from ApiError so callers
+    // can say "the API is down" rather than "the request failed".
+    if (err instanceof DOMException && err.name === "TimeoutError") {
+      throw new ApiUnreachableError(
+        `The API did not respond within ${REQUEST_TIMEOUT_MS / 1000}s (${path}). ` +
+          `It may be starting, restarting, or wedged.`,
+        err,
+      );
+    }
+    if (err instanceof DOMException && err.name === "AbortError") {
+      throw new ApiUnreachableError(`Request to ${path} was cancelled`, err);
+    }
+    throw new ApiUnreachableError(
+      `Could not reach the API at ${API_URL}. Is it running?`,
+      err,
+    );
+  }
 
   if (response.status === 204) {
     return schema.parse(undefined);

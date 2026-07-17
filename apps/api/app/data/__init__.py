@@ -6,7 +6,11 @@ escape this package (§3).
 
 from app.data.base import MarketDataProvider
 from app.data.budget import BudgetDecision, ProviderBudget, RequestPriority
-from app.data.factory import daily_provider_chain, resolve_provider
+from app.data.factory import (
+    ProviderNotConfiguredError,
+    daily_provider_chain,
+    resolve_provider,
+)
 from app.data.mock_provider import MockMarketDataProvider
 from app.data.normalization import (
     denominated_currency,
@@ -42,6 +46,7 @@ __all__ = [
     "ProviderDataQualityError",
     "ProviderError",
     "ProviderMapping",
+    "ProviderNotConfiguredError",
     "ProviderQuotaExceededError",
     "ProviderSymbolNotFoundError",
     "ProviderUnavailableError",
