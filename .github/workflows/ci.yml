@@ -136,9 +136,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # No `version:` here on purpose. package.json pins the pnpm version via its
+      # `packageManager` field ("pnpm@11.13.1"), and pnpm/action-setup treats
+      # that as authoritative — supplying `version` as well is a conflict it
+      # rejects with ERR_PNPM_BAD_PM_VERSION. One source of truth: package.json.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 11
 
       - uses: actions/setup-node@v4
         with:
