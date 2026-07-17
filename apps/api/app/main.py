@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.routes import account, audit, auth, health, instruments, live
 from app.broker.factory import BrokerNotConfiguredError, LiveTradingDisabledError
-from app.broker.types import BrokerAuthError, BrokerError
+from app.broker.types import BrokerAuthError, BrokerError, BrokerRateLimitError
 from app.config import get_settings
 from app.data.factory import ProviderNotConfiguredError
 from app.db import dispose_engine
@@ -172,14 +172,44 @@ async def broker_auth_handler(request: Request, exc: Exception) -> JSONResponse:
     )
 
 
+@app.exception_handler(BrokerRateLimitError)
+async def broker_rate_limit_handler(request: Request, exc: Exception) -> JSONResponse:
+    """The broker rate-limited us.
+
+    429, not 502: the broker was reached and answered — we simply asked too
+    often. Reporting this as "could not be reached" (the old behaviour) was
+    doubly wrong, because it hid both the real cause and the fact that waiting
+    fixes it. Trading 212's per-endpoint limits are tight, so this is a routine,
+    self-resolving condition, not a fault.
+
+    A Retry-After header is set when the broker gave one, so a client can back
+    off intelligently rather than spinning.
+    """
+    request_id = request.headers.get("X-Request-ID", "unknown")
+    retry_after = getattr(exc, "retry_after_seconds", None)
+    log.info("api.broker_rate_limited", path=request.url.path, request_id=request_id)
+    headers = {"Retry-After": str(int(retry_after))} if retry_after else {}
+    return JSONResponse(
+        status_code=429,
+        headers=headers,
+        content={
+            "detail": (
+                "The broker is rate-limiting requests. This is normal — Trading 212 "
+                "allows only a few calls per endpoint per minute. Wait a moment and retry."
+            ),
+            "code": "broker_rate_limited",
+            "request_id": request_id,
+        },
+    )
+
+
 @app.exception_handler(BrokerError)
 async def broker_error_handler(request: Request, exc: Exception) -> JSONResponse:
     """The broker failed in some way we did not classify more specifically.
 
-    Registered *after* the BrokerAuthError handler above. Starlette dispatches
-    on the exception's MRO, so the most specific registered handler wins and a
-    rejected credential still gets its own actionable message rather than this
-    generic one.
+    Starlette dispatches on the exception's MRO and picks the most specific
+    registered handler, so BrokerAuthError and BrokerRateLimitError get their
+    own messages and only genuinely unclassified failures reach this one.
 
     The exception text is not echoed: broker errors can reflect request context
     back at us, and this is not the place to gamble on that.

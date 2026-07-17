@@ -69,6 +69,15 @@ class Settings(BaseSettings):
     trading212_max_requests_per_minute: int = 30
     trading212_timeout_seconds: float = 20.0
 
+    #: How long a broker account/positions read is served from cache before the
+    #: broker is called again. Trading 212 rate-limits per endpoint very tightly
+    #: (the portfolio endpoint tolerates roughly one call every few seconds), so
+    #: calling it on every dashboard load trips a 429. A short cache makes normal
+    #: use — refreshing, several tabs — hit the broker at most once per window.
+    #: This is a Phase 1 in-process cache; Phase 3 replaces it with persisted
+    #: AccountSnapshot/PositionSnapshot reconciled on a schedule.
+    broker_read_cache_ttl_seconds: int = 15
+
     #: Server-side master switch for live trading. This alone does not permit a
     #: live order: the session must additionally be armed through the UI (§14).
     live_trading_enabled: bool = False

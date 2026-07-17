@@ -15,6 +15,8 @@ from app.api.schemas import (
 )
 from app.auth.dependencies import AuthContext, get_auth_context, require_csrf
 from app.broker.factory import default_paper_broker_kind, resolve_broker
+from app.broker.read_cache import broker_read_cache
+from app.broker.types import BrokerAccount, BrokerPosition
 from app.config import get_settings
 from app.db import get_db
 from app.models.enums import BrokerKind
@@ -43,15 +45,28 @@ async def get_account(
 ) -> AccountResponse:
     """Cash and account summary.
 
-    The account identifier is masked before it leaves the server (§17); the
-    browser has no use for the full value.
+    Served from a short-lived cache so repeated dashboard loads do not hammer
+    Trading 212's tight per-endpoint rate limits. On a rate limit the last known
+    value is served and flagged stale, rather than failing the request.
+
+    The account identifier is masked before it leaves the server (§17).
     """
     kind = _resolve_kind(broker)
-    client = resolve_broker(kind, get_settings())
-    try:
-        account = await client.get_account()
-    finally:
-        await client.close()
+    settings = get_settings()
+
+    async def _fetch() -> BrokerAccount:
+        # The client is built only on a cache miss, so a cache hit makes no
+        # broker call at all.
+        client = resolve_broker(kind, settings)
+        try:
+            return await client.get_account()
+        finally:
+            await client.close()
+
+    cached = await broker_read_cache.get_or_fetch(
+        f"account:{kind}", settings.broker_read_cache_ttl_seconds, _fetch
+    )
+    account = cached.value
 
     return AccountResponse(
         broker=str(kind),
@@ -64,6 +79,8 @@ async def get_account(
         invested=account.invested,
         result=account.result,
         retrieved_at=account.retrieved_at,
+        is_stale=cached.is_stale,
+        age_seconds=int(cached.age_seconds),
     )
 
 
@@ -73,11 +90,18 @@ async def get_positions(
     context: AuthContext = Depends(get_auth_context),
 ) -> list[PositionResponse]:
     kind = _resolve_kind(broker)
-    client = resolve_broker(kind, get_settings())
-    try:
-        positions = await client.get_positions()
-    finally:
-        await client.close()
+    settings = get_settings()
+
+    async def _fetch() -> list[BrokerPosition]:
+        client = resolve_broker(kind, settings)
+        try:
+            return await client.get_positions()
+        finally:
+            await client.close()
+
+    cached = await broker_read_cache.get_or_fetch(
+        f"positions:{kind}", settings.broker_read_cache_ttl_seconds, _fetch
+    )
 
     return [
         PositionResponse(
@@ -88,7 +112,7 @@ async def get_positions(
             unrealised_pnl=p.unrealised_pnl,
             currency=p.currency,
         )
-        for p in positions
+        for p in cached.value
     ]
 
 

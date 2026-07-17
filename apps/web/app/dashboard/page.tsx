@@ -138,6 +138,13 @@ export default function DashboardPage() {
 
       <ModeBanner account={account} liveStatus={liveStatus} />
 
+      {account?.is_stale && (
+        <div className="rounded-lg border border-[var(--color-border-subtle)] bg-[var(--color-surface-muted)] px-4 py-2 text-sm text-[var(--color-ink-muted)]">
+          Broker data is delayed (last updated {account.age_seconds}s ago). Trading 212 is
+          rate-limiting; this refreshes automatically.
+        </div>
+      )}
+
       {error && (
         <div className="rounded-lg border border-[var(--color-warn)] bg-[var(--color-surface-muted)] px-4 py-3 text-sm">
           {error}

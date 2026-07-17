@@ -90,6 +90,11 @@ class AccountResponse(BaseModel):
     invested: SerializedDecimal | None = None
     result: SerializedDecimal | None = None
     retrieved_at: datetime | None = None
+    #: True when the broker was rate-limited or unreachable and this is the last
+    #: known value rather than a fresh read. The UI should mark it as delayed.
+    is_stale: bool = False
+    #: Age of the served value in whole seconds (0 for a fresh read).
+    age_seconds: int = 0
 
 
 class PositionResponse(BaseModel):

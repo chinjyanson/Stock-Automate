@@ -195,6 +195,8 @@ export const accountSchema = z.object({
   invested: z.string().nullable().optional(),
   result: z.string().nullable().optional(),
   retrieved_at: z.string().nullable().optional(),
+  is_stale: z.boolean().default(false),
+  age_seconds: z.number().default(0),
 });
 
 export const positionSchema = z.object({
