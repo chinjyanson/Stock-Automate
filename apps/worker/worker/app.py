@@ -32,7 +32,11 @@ app = Celery(
     "trading_platform",
     broker=os.environ.get("CELERY_BROKER_URL", "redis://localhost:6380/1"),
     backend=os.environ.get("CELERY_RESULT_BACKEND", "redis://localhost:6380/2"),
-    include=["worker.jobs.instruments", "worker.jobs.market_data"],
+    include=[
+        "worker.jobs.instruments",
+        "worker.jobs.market_data",
+        "worker.jobs.scanner",
+    ],
 )
 
 app.conf.update(
@@ -72,6 +76,19 @@ app.conf.beat_schedule = {
         "task": "worker.jobs.market_data.refresh_daily_candles",
         "schedule": crontab(hour=21, minute=30),
         "options": {"expires": 7200},
+    },
+    # After the candle refresh, so the scan reads fresh data. The rotation caps
+    # itself per §6, so this covers the universe over successive days.
+    "scanner-rotation": {
+        "task": "worker.jobs.scanner.rotate_scan",
+        "schedule": crontab(hour=22, minute=0),
+        "options": {"expires": 7200},
+    },
+    # Frequent and cheap: a stale approval must not linger far past its expiry.
+    "expire-approvals": {
+        "task": "worker.jobs.scanner.expire_approvals",
+        "schedule": crontab(minute="*/5"),
+        "options": {"expires": 300},
     },
 }
 

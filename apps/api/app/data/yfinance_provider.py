@@ -350,7 +350,12 @@ class YFinanceProvider(MarketDataProvider):
         return candles
 
     async def get_batch_daily_candles(
-        self, symbols: list[str], start: datetime, end: datetime
+        self,
+        symbols: list[str],
+        start: datetime,
+        end: datetime,
+        *,
+        unit_by_symbol: dict[str, PriceUnit] | None = None,
     ) -> dict[str, list[Candle]]:
         """Fetch several symbols per request (§4).
 
@@ -358,6 +363,11 @@ class YFinanceProvider(MarketDataProvider):
         one that gets throttled. Symbols are chunked, and a failed chunk yields
         an empty list for its members rather than failing the whole sweep — a
         partial scan is useful, a dead one is not.
+
+        `unit_by_symbol` supplies each symbol's quoted price unit (from the
+        catalogue), which skips the per-symbol `.info` currency call — the slow
+        part of a large backfill. Omit it and the unit is inferred per symbol as
+        before.
         """
         results: dict[str, list[Candle]] = {}
 
@@ -402,8 +412,11 @@ class YFinanceProvider(MarketDataProvider):
                     results[symbol] = []
                     continue
 
-                info = await self._fetch_info(symbol)
-                quoted_unit = infer_price_unit(symbol, info.get("currency"))
+                if unit_by_symbol is not None and symbol in unit_by_symbol:
+                    quoted_unit = unit_by_symbol[symbol]
+                else:
+                    info = await self._fetch_info(symbol)
+                    quoted_unit = infer_price_unit(symbol, info.get("currency"))
                 results[symbol] = self._frame_to_candles(
                     sub.dropna(how="all"), symbol, Interval.D1, quoted_unit
                 )

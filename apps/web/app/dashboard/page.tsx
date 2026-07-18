@@ -128,12 +128,20 @@ export default function DashboardPage() {
             {health ? `${health.environment} · v${health.version}` : "—"}
           </p>
         </div>
-        <button
-          onClick={onLogout}
-          className="rounded-md border border-[var(--color-border-subtle)] px-3 py-1.5 text-sm"
-        >
-          Sign out
-        </button>
+        <div className="flex items-center gap-2">
+          <a
+            href="/scanner"
+            className="rounded-md border border-[var(--color-border-subtle)] px-3 py-1.5 text-sm"
+          >
+            Scanner
+          </a>
+          <button
+            onClick={onLogout}
+            className="rounded-md border border-[var(--color-border-subtle)] px-3 py-1.5 text-sm"
+          >
+            Sign out
+          </button>
+        </div>
       </header>
 
       <ModeBanner account={account} liveStatus={liveStatus} />

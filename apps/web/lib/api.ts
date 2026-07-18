@@ -253,6 +253,54 @@ export const syncResultSchema = z.object({
   errors: z.array(z.string()).default([]),
 });
 
+export const scannerResultSchema = z.object({
+  id: z.string(),
+  instrument_id: z.string(),
+  instrument_name: z.string().nullable(),
+  exchange_name: z.string().nullable(),
+  exchange_mic: z.string().nullable(),
+  primary_score: z.string(),
+  core_score: z.string(),
+  trend_score: z.string(),
+  momentum_score: z.string(),
+  risk_score: z.string(),
+  liquidity_score: z.string(),
+  positioning_score: z.string(),
+  fundamental_score: z.string().nullable(),
+  value_score: z.string().nullable(),
+  price_value_score: z.string().nullable(),
+  fundamental_value_score: z.string().nullable(),
+  classification: z.string(),
+  data_completeness: z.string(),
+  data_freshness_days: z.string().nullable(),
+  confidence: z.string(),
+  candles_used: z.number(),
+  is_trading212_tradable: z.boolean(),
+});
+
+export const scannerResultDetailSchema = scannerResultSchema.extend({
+  instrument_name: z.string().nullable(),
+  positive_signals: z.array(z.string()).default([]),
+  negative_signals: z.array(z.string()).default([]),
+  missing_information: z.array(z.string()).default([]),
+  value_positive_signals: z.array(z.string()).default([]),
+  value_negative_signals: z.array(z.string()).default([]),
+  metrics: z.record(z.string(), z.unknown()).default({}),
+});
+
+export const scannerRunSchema = z.object({
+  id: z.string(),
+  status: z.string(),
+  started_at: z.string(),
+  completed_at: z.string().nullable(),
+  instruments_considered: z.number(),
+  instruments_scored: z.number(),
+  instruments_skipped: z.number(),
+  screening_candidates: z.number(),
+  watchlist_candidates: z.number(),
+  selection_reason: z.string().nullable(),
+});
+
 export const auditEventSchema = z.object({
   id: z.string(),
   sequence: z.number(),
@@ -290,6 +338,9 @@ export type Instrument = z.infer<typeof instrumentSchema>;
 export type SyncResult = z.infer<typeof syncResultSchema>;
 export type AuditEvent = z.infer<typeof auditEventSchema>;
 export type LiveStatus = z.infer<typeof liveStatusSchema>;
+export type ScannerResult = z.infer<typeof scannerResultSchema>;
+export type ScannerResultDetail = z.infer<typeof scannerResultDetailSchema>;
+export type ScannerRun = z.infer<typeof scannerRunSchema>;
 
 /* -- Endpoints ------------------------------------------------------------ */
 
@@ -325,6 +376,23 @@ export const api = {
   liveStatus: () => request("/live/status", liveStatusSchema),
 
   disarmLive: () => request("/live/disarm", liveStatusSchema, { method: "POST" }),
+
+  scannerResults: (params: { minScore?: number; tradableOnly?: boolean; limit?: number } = {}) => {
+    const query = new URLSearchParams();
+    if (params.minScore != null) query.set("min_score", String(params.minScore));
+    if (params.tradableOnly) query.set("tradable_only", "true");
+    query.set("limit", String(params.limit ?? 50));
+    return request(`/scanner/results?${query}`, z.array(scannerResultSchema));
+  },
+
+  scannerResult: (id: string) =>
+    request(`/scanner/results/${id}`, scannerResultDetailSchema),
+
+  runScanner: (body: { instrument_ids?: string[]; limit?: number } = {}) =>
+    request("/scanner/run", scannerRunSchema, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 };
 
 /** Format a decimal string for display. Never used for arithmetic. */

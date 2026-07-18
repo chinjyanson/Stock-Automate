@@ -11,7 +11,16 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import account, audit, auth, health, instruments, live
+from app.api.routes import (
+    account,
+    approvals,
+    audit,
+    auth,
+    health,
+    instruments,
+    live,
+    scanner,
+)
 from app.broker.factory import BrokerNotConfiguredError, LiveTradingDisabledError
 from app.broker.types import BrokerAuthError, BrokerError, BrokerRateLimitError
 from app.config import get_settings
@@ -263,5 +272,7 @@ app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(account.router)
 app.include_router(instruments.router)
+app.include_router(scanner.router)
+app.include_router(approvals.router)
 app.include_router(audit.router)
 app.include_router(live.router)

@@ -18,7 +18,7 @@ from app.config import get_settings
 # Importing the package attaches every table to Base.metadata. Without this,
 # autogenerate produces an empty migration and silently drops the schema.
 from app.models import Base
-from app.models.base import JSONBOrJSON
+from app.models.base import JSONBOrJSON, StrEnumType
 
 config = context.config
 
@@ -56,6 +56,11 @@ def render_item(type_: str, obj: object, autogen_context: object) -> str | bool:
     if type_ == "type" and isinstance(obj, JSONBOrJSON):
         autogen_context.imports.add("import app.models.base")  # type: ignore[attr-defined]
         return "app.models.base.JSONBOrJSON()"
+    if type_ == "type" and isinstance(obj, StrEnumType):
+        # StrEnumType is a validating wrapper over VARCHAR; its DDL is exactly a
+        # String of the same length. Render it as such so migrations carry no
+        # dependency on the enum class and read as the plain columns they are.
+        return f"sa.String(length={obj.impl.length})"
     # False means "fall back to alembic's default rendering".
     return False
 

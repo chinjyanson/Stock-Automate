@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from decimal import Decimal
 
 import structlog
 from sqlalchemy import select
@@ -189,6 +190,44 @@ async def seed_settings() -> int:
     return created
 
 
+async def seed_scanner_configuration() -> int:
+    """Seed the default scanner configuration (§6) if none exists.
+
+    Weights, thresholds and universe filters match the §6 defaults. Idempotent:
+    an operator's tuned configuration is never overwritten.
+    """
+    from app.models.scanner import ScannerConfiguration
+    from app.scanner.scoring import DEFAULT_THRESHOLDS, DEFAULT_WEIGHTS
+
+    created = 0
+    async with session_scope() as session:
+        existing = await session.execute(
+            select(ScannerConfiguration).where(ScannerConfiguration.name == "default")
+        )
+        if existing.scalar_one_or_none() is None:
+            session.add(
+                ScannerConfiguration(
+                    name="default",
+                    is_active=True,
+                    include_stocks=True,
+                    include_etfs=True,
+                    trading212_only=True,
+                    max_instruments_per_scan=200,
+                    weights=dict(DEFAULT_WEIGHTS),
+                    thresholds=dict(DEFAULT_THRESHOLDS),
+                    benchmark_symbol="SPY",
+                    # Value-primary ("buy low"): the value lens leads and momentum
+                    # is a secondary signal. Flip to momentum_weight=1/value=0 for
+                    # a momentum-primary ("buy strength") screen.
+                    momentum_weight=Decimal("0.3"),
+                    value_weight=Decimal("0.7"),
+                )
+            )
+            created = 1
+    log.info("seed.scanner_configuration", created=created)
+    return created
+
+
 async def seed_dev_user() -> bool:
     """Create a development user if none exists.
 
@@ -237,6 +276,7 @@ async def main() -> int:
 
     await seed_exchanges()
     await seed_settings()
+    await seed_scanner_configuration()
     await seed_dev_user()
 
     log.info("seed.completed")

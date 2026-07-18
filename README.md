@@ -25,11 +25,27 @@ silently substituting something that looks like it works.
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Monorepo, auth, Postgres/Redis, Trading 212 demo, instrument sync, yfinance ingestion, mapping, dashboard, audit logging | **Done** |
-| 2 | Rotating scanner, heuristic scoring, candidates, push notifications, trade proposals, approvals | Not started |
+| 2 | Rotating scanner, heuristic scoring, candidates, trade proposals, approval workflow | **Done** (push-notification *delivery* deferred — VAPID keygen + preferences exist, service-worker send does not) |
 | 3 | Internal paper broker, risk engine, position sizing, stops, reconciliation, EOD summary | Not started |
-| 4 | S&P 15m mean reversion, gold/oil trend, pie strategy, correlation filter | Not started |
+| 4 | S&P 15m mean reversion, gold/oil trend, pie strategy, correlation filter | Not started (indicators foundation built in Phase 2) |
 | 5 | Backtest engine, walk-forward, Optuna, parameter promotion | Not started |
 | 6 | Live adapter, arming, approval-required live, risk halts | Partially scaffolded (arming + gating exist; **cannot** arm — the Phase 3 risk engine is a hard blocker) |
+
+### What Phase 2 adds
+
+The whole of product #1, the **scanner**, working on real market data:
+
+- Pure, tested technical indicators (`app/indicators`) — trend, momentum, risk,
+  liquidity, positioning, ATR, correlation. Reused by Phase 4 strategies.
+- A configurable 100-point score (Trend 25 / Momentum 20 / Risk 20 / Liquidity
+  20 / Positioning 15) with the §6 classification bands. **Missing optional data
+  never lowers the core score** (acceptance criterion 7), and no output asserts
+  an instrument is a good investment — both enforced by tests.
+- Rotating universe selection, so a budgeted catalogue is covered over days.
+- The candidate → proposal → approval workflow: volatility-sized proposals with
+  ATR stops, a duplicate-proposal guard, expiry, and explicit authenticated
+  approval. Verified against 275+ real yfinance candles per instrument.
+- A `/scanner` page ranking candidates with a per-signal breakdown.
 
 ### What Phase 1 actually does today
 
