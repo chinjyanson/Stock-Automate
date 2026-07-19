@@ -135,6 +135,12 @@ export default function DashboardPage() {
           >
             Scanner
           </a>
+          <a
+            href="/portfolio"
+            className="rounded-md border border-[var(--color-border-subtle)] px-3 py-1.5 text-sm"
+          >
+            Portfolio
+          </a>
           <button
             onClick={onLogout}
             className="rounded-md border border-[var(--color-border-subtle)] px-3 py-1.5 text-sm"

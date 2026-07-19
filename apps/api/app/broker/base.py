@@ -75,6 +75,15 @@ class Broker(ABC):
     async def reconcile(self) -> ReconciliationResult:
         """Compare broker truth against local records and report divergence."""
 
+    async def process_stops(self) -> int:
+        """Trigger resting stops the latest data has breached; return fills (§9).
+
+        A real venue triggers its own stops server-side, so there is nothing for
+        us to simulate — the default does nothing. The internal paper broker
+        overrides this to fill breached stops against the local candle store.
+        """
+        return 0
+
     async def health_check(self) -> bool:
         """Cheap liveness probe (§18). Default: can we read the account?"""
         try:

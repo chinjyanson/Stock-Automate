@@ -1,9 +1,16 @@
 # Risk model
 
-> **Status: design document.** The risk engine is Phase 3 and is **not
-> implemented**. `/live/arm` refuses with a 409 naming this as a blocker, and
-> that refusal is deliberate — live trading without a risk engine is exactly
-> what this document exists to prevent.
+> **Status: implemented for the internal paper venue (Phase 3).** `app.risk.engine`
+> sizes and gates every order, `app.risk.halts` records halts as state,
+> `app.risk.execution` wires approval → risk → paper fill → broker-side stop, and
+> `app.risk.stops` trails stops upward, applies time stops, and flattens on an
+> emergency exit. `app.services.reconciliation` halts on divergence and clears
+> when clean; `app.services.eod` persists the end-of-day account summary. What is
+> **not** built here is live execution — `/live/arm` still refuses without live
+> credentials and a clean reconciliation, and paper is the only executing venue
+> (live is Phase 6). The correlation filter uses a gross-exposure approximation
+> for portfolio S&P weight, noted in `app.risk.engine`, to refine when strategies
+> track per-position correlation (Phase 4).
 
 ## The central rule
 

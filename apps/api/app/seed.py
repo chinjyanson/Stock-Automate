@@ -228,6 +228,27 @@ async def seed_scanner_configuration() -> int:
     return created
 
 
+async def seed_risk_configuration() -> int:
+    """Seed the default risk configuration (§9) if none exists.
+
+    The engine fails closed without an active configuration, so a fresh install
+    needs one before any trade can be sized. Limits match the documented
+    defaults (docs/risk-model.md); idempotent, and never overwrites a tuned row.
+    """
+    from app.models.risk import RiskConfiguration
+
+    created = 0
+    async with session_scope() as session:
+        existing = await session.execute(
+            select(RiskConfiguration).where(RiskConfiguration.name == "default")
+        )
+        if existing.scalar_one_or_none() is None:
+            session.add(RiskConfiguration(name="default", is_active=True))
+            created = 1
+    log.info("seed.risk_configuration", created=created)
+    return created
+
+
 async def seed_dev_user() -> bool:
     """Create a development user if none exists.
 
@@ -277,6 +298,7 @@ async def main() -> int:
     await seed_exchanges()
     await seed_settings()
     await seed_scanner_configuration()
+    await seed_risk_configuration()
     await seed_dev_user()
 
     log.info("seed.completed")

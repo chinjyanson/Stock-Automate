@@ -12,6 +12,7 @@ from pydantic import SecretStr
 
 from app.broker import (
     BrokerNotConfiguredError,
+    InternalPaperBroker,
     LiveTradingDisabledError,
     MockBroker,
     Trading212DemoBroker,
@@ -171,6 +172,25 @@ class TestNoSubstitution:
         assert (
             resolve_broker(BrokerKind.TRADING212_LIVE, settings).kind is BrokerKind.TRADING212_LIVE
         )
+
+
+class TestInternalPaper:
+    """The internal paper venue is DB-backed, so it needs a session — and it is
+    never silently swapped for something that does not."""
+
+    def test_internal_paper_without_a_session_is_refused(self) -> None:
+        # Without a session there is no venue to back it. Raising keeps the gap
+        # visible instead of handing back an in-memory stand-in.
+        with pytest.raises(BrokerNotConfiguredError, match="session"):
+            resolve_broker(BrokerKind.INTERNAL_PAPER, _settings())
+
+    def test_internal_paper_with_a_session_constructs_that_venue(self) -> None:
+        # A sentinel stands in for the AsyncSession; construction stores it and
+        # touches no database, so this stays a pure unit test.
+        broker = resolve_broker(BrokerKind.INTERNAL_PAPER, _settings(), session=object())  # type: ignore[arg-type]
+        assert isinstance(broker, InternalPaperBroker)
+        assert broker.kind is BrokerKind.INTERNAL_PAPER
+        assert not broker.is_live
 
 
 class TestDefaultBroker:

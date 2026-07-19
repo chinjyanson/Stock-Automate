@@ -19,6 +19,8 @@ from app.api.routes import (
     health,
     instruments,
     live,
+    portfolio,
+    risk,
     scanner,
 )
 from app.broker.factory import BrokerNotConfiguredError, LiveTradingDisabledError
@@ -276,3 +278,5 @@ app.include_router(scanner.router)
 app.include_router(approvals.router)
 app.include_router(audit.router)
 app.include_router(live.router)
+app.include_router(portfolio.router)
+app.include_router(risk.router)

@@ -26,10 +26,10 @@ silently substituting something that looks like it works.
 |---|---|---|
 | 1 | Monorepo, auth, Postgres/Redis, Trading 212 demo, instrument sync, yfinance ingestion, mapping, dashboard, audit logging | **Done** |
 | 2 | Rotating scanner, heuristic scoring, candidates, trade proposals, approval workflow | **Done** (push-notification *delivery* deferred — VAPID keygen + preferences exist, service-worker send does not) |
-| 3 | Internal paper broker, risk engine, position sizing, stops, reconciliation, EOD summary | Not started |
+| 3 | Internal paper broker, risk engine, position sizing, stops, reconciliation, EOD summary | **Done** — DB-backed internal paper broker; risk engine (sizing + caps + correlation + halts, fail-closed); approve→execute wiring; broker-side ATR stops with trailing, time and emergency exits; scheduled reconciliation (halts on divergence, clears when clean); and a persisted EOD account summary. Live execution remains Phase 6 |
 | 4 | S&P 15m mean reversion, gold/oil trend, pie strategy, correlation filter | Not started (indicators foundation built in Phase 2) |
 | 5 | Backtest engine, walk-forward, Optuna, parameter promotion | Not started |
-| 6 | Live adapter, arming, approval-required live, risk halts | Partially scaffolded (arming + gating exist; **cannot** arm — the Phase 3 risk engine is a hard blocker) |
+| 6 | Live adapter, arming, approval-required live, risk halts | Partially scaffolded (arming + gating exist; risk halts are now real state and gate arming, but live still requires live credentials + a clean reconciliation, and paper is the only executing venue) |
 
 ### What Phase 2 adds
 

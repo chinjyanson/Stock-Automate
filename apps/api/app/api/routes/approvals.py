@@ -1,8 +1,11 @@
 """Approval workflow endpoints (§19).
 
-The human gate between a scanner candidate and any order. Nothing here executes
-a trade — approval records the decision and re-runs the checks §6 requires;
-actual submission is the Phase 3 risk engine's job.
+The human gate between a scanner candidate and any order. Approval records the
+decision and re-runs the §6 checks; it then hands the APPROVED proposal to the
+risk engine, which sizes and gates it and — for the paper venue — places the
+order. The risk engine can still refuse: an approved proposal that the engine
+rejects lands in REJECTED_BY_RISK (200, with that status) rather than silently,
+so "the user said yes but the system said no" is visible.
 """
 
 from __future__ import annotations
@@ -19,6 +22,7 @@ from app.api.routes.scanner import TradeProposalResponse
 from app.auth.dependencies import AuthContext, get_auth_context, require_csrf
 from app.db import get_db
 from app.models.scanner import ProposalStatus, TradeProposal
+from app.risk.execution import ExecutionError, ExecutionService
 from app.scanner.proposals import ProposalError, ProposalService
 
 router = APIRouter(prefix="/approvals", tags=["approvals"])
@@ -53,11 +57,12 @@ async def approve(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(require_csrf),
 ) -> TradeProposalResponse:
-    """Approve a proposal after re-validation (§6).
+    """Approve a proposal, then size, gate and (for paper) execute it (§6, §9).
 
     Requires an authenticated session (the dependency above) — a proposal must
     never be executable from an unauthenticated context such as a notification
-    action.
+    action. Execution runs against the internal paper venue; the risk engine can
+    still reduce or reject the order.
     """
     try:
         proposal = await ProposalService(db).approve(
@@ -66,6 +71,17 @@ async def approve(
     except ProposalError as exc:
         await db.commit()  # persist any audit event written during the failed attempt
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    try:
+        proposal = await ExecutionService(db).execute_approved(
+            proposal, actor_user_id=context.user.id
+        )
+    except ExecutionError as exc:
+        # The intent state + audit written during the failed attempt must persist.
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
 
     await db.commit()
     await db.refresh(proposal)

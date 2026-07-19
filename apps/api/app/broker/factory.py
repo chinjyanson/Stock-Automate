@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import structlog
 from pydantic import SecretStr
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.broker.base import Broker
+from app.broker.internal_paper import InternalPaperBroker
 from app.broker.mock import MockBroker
 from app.broker.trading212 import Trading212DemoBroker, Trading212LiveBroker
 from app.config import Settings, get_settings
@@ -63,10 +65,17 @@ class BrokerNotConfiguredError(Exception):
     """
 
 
-def resolve_broker(kind: BrokerKind, settings: Settings | None = None) -> Broker:
+def resolve_broker(
+    kind: BrokerKind,
+    settings: Settings | None = None,
+    *,
+    session: AsyncSession | None = None,
+) -> Broker:
     """Construct the adapter for `kind`, or raise.
 
-    Never returns a different venue than the one asked for.
+    Never returns a different venue than the one asked for. The internal paper
+    venue is DB-backed, so it requires an `AsyncSession`; requesting it without
+    one raises rather than substituting an in-memory stand-in.
     """
     settings = settings or get_settings()
 
@@ -76,12 +85,12 @@ def resolve_broker(kind: BrokerKind, settings: Settings | None = None) -> Broker
             return MockBroker()
 
         case BrokerKind.INTERNAL_PAPER:
-            # The internal simulator lands with the risk engine in Phase 3.
-            # Raising keeps the gap visible instead of handing back another venue.
-            raise NotImplementedError(
-                "InternalPaperBroker arrives in Phase 3. Use BrokerKind.TRADING212_DEMO "
-                "for paper trading, or BrokerKind.MOCK for offline tests."
-            )
+            if session is None:
+                raise BrokerNotConfiguredError(
+                    "The internal paper broker is DB-backed and needs a database session. "
+                    "Call resolve_broker(BrokerKind.INTERNAL_PAPER, session=db)."
+                )
+            return InternalPaperBroker(session)
 
         case BrokerKind.TRADING212_DEMO:
             key = _secret_value(settings.trading212_demo_api_key)

@@ -42,6 +42,7 @@ from app.config import get_settings
 from app.db import get_db
 from app.models.enums import ActorKind, AuditEventKind, BrokerKind
 from app.models.system import LiveArmingSession
+from app.risk.halts import HaltService
 
 router = APIRouter(prefix="/live", tags=["live"])
 log = structlog.get_logger(__name__)
@@ -82,12 +83,12 @@ async def _collect_blockers(db: AsyncSession, context: AuthContext) -> list[str]
     if not context.is_recently_reauthenticated:
         blockers.append("Password re-confirmation is required.")
 
-    # Risk halts arrive with the risk engine in Phase 3. Until then there is no
-    # halt state to consult, and saying so is more honest than reporting a
-    # green check for a system that does not exist yet.
-    blockers.append(
-        "Risk engine is not yet implemented (Phase 3); live trading remains unavailable."
-    )
+    # Any active global risk halt blocks arming. A halt is a state, so this is a
+    # real query now, not a placeholder — the kill switch, a drawdown halt, or a
+    # reconciliation halt all surface here.
+    active = await HaltService(db).active_halts()
+    for halt in active:
+        blockers.append(f"Active risk halt: {halt.kind.value} — {halt.reason}")
 
     return blockers
 

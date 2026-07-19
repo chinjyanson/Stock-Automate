@@ -122,6 +122,70 @@ async def db(engine: object) -> AsyncIterator[AsyncSession]:
         yield session
 
 
+@pytest_asyncio.fixture
+async def approver(db: AsyncSession) -> uuid.UUID:
+    """A real user row — halts and approvals FK to it, so a bare UUID won't do."""
+    from app.models.user import User
+
+    user = User(
+        id=uuid.uuid4(),
+        email=f"approver-{uuid.uuid4().hex[:8]}@example.com",
+        password_hash="x",
+        is_admin=True,
+        is_active=True,
+    )
+    db.add(user)
+    await db.commit()
+    return user.id
+
+
+@pytest_asyncio.fixture
+async def candled_instrument(db: AsyncSession) -> object:
+    """An instrument with ~400 days of deterministic daily candles.
+
+    The internal paper broker prices fills from these, and the risk engine sizes
+    stops from them, so both the venue and the engine have real history to read.
+    """
+    from app.data.mock_provider import MockMarketDataProvider
+    from app.models.enums import InstrumentKind, LifecycleState, PriceUnit, ProviderKind
+    from app.models.instrument import Exchange, Instrument, MarketDataMapping
+    from app.services.ingestion import IngestionService
+
+    exchange = Exchange(mic="XNAS", name="Nasdaq", country="US", timezone="America/New_York")
+    db.add(exchange)
+    await db.flush()
+
+    instrument = Instrument(
+        id=uuid.uuid4(),
+        isin="US0378331005",
+        exchange_id=exchange.id,
+        exchange_ticker="AAPL",
+        name="Apple Inc.",
+        kind=InstrumentKind.STOCK,
+        currency="USD",
+        price_unit=PriceUnit.USD,
+        lifecycle_state=LifecycleState.DISCOVERED,
+        is_scanner_eligible=True,
+    )
+    db.add(instrument)
+    await db.flush()
+    db.add(
+        MarketDataMapping(
+            instrument_id=instrument.id,
+            provider=ProviderKind.MOCK,
+            provider_symbol="AAPL",
+            is_signal_source=True,
+            confirmed_by_user=True,
+        )
+    )
+    await db.flush()
+    await IngestionService(db).ingest_daily(
+        instrument, MockMarketDataProvider(), backfill_days=400
+    )
+    await db.commit()
+    return instrument
+
+
 @pytest.fixture
 def test_settings(test_database: str) -> Settings:
     return Settings(

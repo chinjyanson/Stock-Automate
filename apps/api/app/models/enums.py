@@ -189,6 +189,40 @@ class TradeIntentStatus(StrEnum):
     ABANDONED = "abandoned"
 
 
+class HaltKind(StrEnum):
+    """Why trading is halted (§9).
+
+    A halt is a recorded *state*, not a raised exception — see `RiskHalt`. Each
+    member maps to one of the controls in `docs/risk-model.md`. The pre-trade
+    engine consults active halts before sizing; the fail-closed members
+    (`stale_data`, `provider_failure`, `reconciliation`) exist so uncertainty
+    becomes an explicit, visible refusal rather than a silent skip.
+    """
+
+    DAILY_LOSS = "daily_loss"
+    DRAWDOWN = "drawdown"
+    OPEN_POSITIONS = "open_positions"
+    TRADES_PER_DAY = "trades_per_day"
+    CONSECUTIVE_LOSSES = "consecutive_losses"
+    STALE_DATA = "stale_data"
+    PROVIDER_FAILURE = "provider_failure"
+    RECONCILIATION = "reconciliation"
+    KILL_SWITCH = "kill_switch"
+    INSTRUMENT_SUSPENDED = "instrument_suspended"
+
+
+class HaltScope(StrEnum):
+    """How wide a halt reaches (§9).
+
+    A `global` halt blocks every order; `instrument`/`strategy` halts are the
+    surgical overrides that suspend one thing without stopping the rest.
+    """
+
+    GLOBAL = "global"
+    INSTRUMENT = "instrument"
+    STRATEGY = "strategy"
+
+
 class AuditEventKind(StrEnum):
     """Audit events are immutable and append-only (§17)."""
 
@@ -218,6 +252,9 @@ class AuditEventKind(StrEnum):
     LIVE_ARMED = "live_armed"
     LIVE_DISARMED = "live_disarmed"
     KILL_SWITCH_ACTIVATED = "kill_switch_activated"
+    STOP_ADJUSTED = "stop_adjusted"
+    POSITION_CLOSED = "position_closed"
+    EOD_SUMMARY_GENERATED = "eod_summary_generated"
 
 
 class ActorKind(StrEnum):

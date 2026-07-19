@@ -36,6 +36,7 @@ app = Celery(
         "worker.jobs.instruments",
         "worker.jobs.market_data",
         "worker.jobs.scanner",
+        "worker.jobs.risk",
     ],
 )
 
@@ -89,6 +90,28 @@ app.conf.beat_schedule = {
         "task": "worker.jobs.scanner.expire_approvals",
         "schedule": crontab(minute="*/5"),
         "options": {"expires": 300},
+    },
+    # After the daily candle refresh: with fresh closes, trail stops, trigger any
+    # the day breached, and apply time stops. This is the paper venue's stop
+    # monitor — a secondary safeguard to the broker-side resting stops (§9).
+    "monitor-stops": {
+        "task": "worker.jobs.risk.monitor_stops",
+        "schedule": crontab(hour=21, minute=45),
+        "options": {"expires": 3600},
+    },
+    # Reconcile the paper venue against local intents. Cheap and local, so it can
+    # run often; a divergence halts trading until understood (§10).
+    "reconcile-broker": {
+        "task": "worker.jobs.risk.reconcile_broker",
+        "schedule": crontab(minute="*/30"),
+        "options": {"expires": 1800},
+    },
+    # After the stop monitor, so closes for the day are booked before the summary
+    # totals realised P/L (§16).
+    "eod-summary": {
+        "task": "worker.jobs.risk.generate_eod_summary",
+        "schedule": crontab(hour=22, minute=15),
+        "options": {"expires": 7200},
     },
 }
 

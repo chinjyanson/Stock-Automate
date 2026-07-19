@@ -211,7 +211,10 @@ class ProposalService:
         if instrument.suspended_at is not None:
             raise ProposalError(f"{instrument.name} is now suspended; cannot approve")
 
-        # The order does not go out yet — the Phase 3 risk engine owns that.
+        # APPROVED is now a handoff, not a dead end: the caller passes the
+        # proposal to the risk engine (app.risk.execution), which sizes, gates,
+        # and — for the paper venue — submits the order. Approval records the
+        # human decision; the engine still owns whether an order actually goes.
         proposal.status = ProposalStatus.APPROVED
         proposal.approved_by_user_id = actor_user_id
         proposal.decided_at = now

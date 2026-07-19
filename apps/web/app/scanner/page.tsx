@@ -121,6 +121,12 @@ export default function ScannerPage() {
           >
             Dashboard
           </a>
+          <a
+            href="/portfolio"
+            className="rounded-md border border-[var(--color-border-subtle)] px-3 py-1.5 text-sm"
+          >
+            Portfolio
+          </a>
           <button
             onClick={onRun}
             disabled={running}

@@ -319,6 +319,71 @@ export const auditListSchema = z.object({
   total: z.number(),
 });
 
+export const orderSchema = z.object({
+  broker_order_id: z.string(),
+  broker_ticker: z.string(),
+  side: z.string(),
+  order_type: z.string(),
+  quantity: z.string(),
+  filled_quantity: z.string(),
+  status: z.string(),
+  average_fill_price: z.string().nullable().optional(),
+  created_at: z.string().nullable().optional(),
+});
+
+export const riskConfigSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  is_active: z.boolean(),
+  risk_per_trade_pct: z.string(),
+  atr_stop_multiplier: z.string(),
+  max_position_pct: z.string(),
+  max_instrument_pct: z.string(),
+  max_total_open_risk_pct: z.string(),
+  max_portfolio_exposure_pct: z.string(),
+  monetary_position_cap: z.string().nullable(),
+  max_open_positions: z.number(),
+  max_trades_per_day: z.number(),
+  consecutive_loss_cooldown: z.number(),
+  max_daily_realised_loss_pct: z.string(),
+  max_portfolio_drawdown_pct: z.string(),
+  correlation_benchmark_symbol: z.string(),
+  correlation_window_short: z.number(),
+  correlation_window_long: z.number(),
+  correlation_threshold: z.string(),
+  max_portfolio_sp500_pct: z.string(),
+  trailing_stop_enabled: z.boolean(),
+  max_holding_days: z.number(),
+});
+
+export const dailySummarySchema = z.object({
+  id: z.string(),
+  broker: z.string(),
+  summary_date: z.string(),
+  currency: z.string(),
+  cash: z.string(),
+  equity: z.string(),
+  invested: z.string(),
+  unrealised_pnl: z.string(),
+  realised_pnl: z.string(),
+  equity_change: z.string().nullable(),
+  open_positions: z.number(),
+  trades_today: z.number(),
+  active_halts: z.number(),
+  created_at: z.string(),
+});
+
+export const haltSchema = z.object({
+  id: z.string(),
+  kind: z.string(),
+  scope: z.string(),
+  instrument_id: z.string().nullable(),
+  reason: z.string(),
+  is_active: z.boolean(),
+  activated_at: z.string(),
+  cleared_at: z.string().nullable(),
+});
+
 export const liveStatusSchema = z.object({
   live_trading_enabled_on_server: z.boolean(),
   is_armed: z.boolean(),
@@ -338,6 +403,13 @@ export type Instrument = z.infer<typeof instrumentSchema>;
 export type SyncResult = z.infer<typeof syncResultSchema>;
 export type AuditEvent = z.infer<typeof auditEventSchema>;
 export type LiveStatus = z.infer<typeof liveStatusSchema>;
+export type Order = z.infer<typeof orderSchema>;
+export type RiskConfig = z.infer<typeof riskConfigSchema>;
+export type RiskConfigUpdate = Partial<
+  Omit<RiskConfig, "id" | "name" | "is_active">
+>;
+export type Halt = z.infer<typeof haltSchema>;
+export type DailySummary = z.infer<typeof dailySummarySchema>;
 export type ScannerResult = z.infer<typeof scannerResultSchema>;
 export type ScannerResultDetail = z.infer<typeof scannerResultDetailSchema>;
 export type ScannerRun = z.infer<typeof scannerRunSchema>;
@@ -393,6 +465,63 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+
+  // -- Internal paper portfolio (Phase 3) --
+  paperAccount: () => request("/portfolio/account", accountSchema),
+
+  paperPositions: () => request("/portfolio/positions", z.array(positionSchema)),
+
+  paperOrders: (includeHistory = false) =>
+    request(
+      `/portfolio/orders?include_history=${includeHistory ? "true" : "false"}`,
+      z.array(orderSchema),
+    ),
+
+  // -- Risk configuration and halts (Phase 3) --
+  riskConfig: () => request("/risk/config", riskConfigSchema),
+
+  updateRiskConfig: (body: RiskConfigUpdate) =>
+    request("/risk/config", riskConfigSchema, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+
+  halts: (activeOnly = true) =>
+    request(`/risk/halts?active_only=${activeOnly ? "true" : "false"}`, z.array(haltSchema)),
+
+  clearHalt: (id: string) =>
+    request(`/risk/halts/${id}/clear`, haltSchema, { method: "POST" }),
+
+  killSwitch: (reason: string) =>
+    request("/risk/kill-switch", haltSchema, {
+      method: "POST",
+      body: JSON.stringify({ reason }),
+    }),
+
+  // -- Stops, reconciliation, EOD (Phase 3) --
+  runStops: () =>
+    request(
+      "/risk/stops/run",
+      z.object({
+        triggered: z.number(),
+        closed: z.number(),
+        trailed: z.number(),
+        time_exits: z.number(),
+      }),
+      { method: "POST" },
+    ),
+
+  flatten: (reason: string) =>
+    request("/risk/flatten", z.object({ positions_closed: z.number() }), {
+      method: "POST",
+      body: JSON.stringify({ reason }),
+    }),
+
+  paperSummaries: (limit = 30) =>
+    request(`/portfolio/summaries?limit=${limit}`, z.array(dailySummarySchema)),
+
+  runEodSummary: () =>
+    request("/portfolio/summaries/run", dailySummarySchema, { method: "POST" }),
 };
 
 /** Format a decimal string for display. Never used for arithmetic. */

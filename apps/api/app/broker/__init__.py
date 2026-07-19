@@ -11,6 +11,7 @@ from app.broker.factory import (
     default_paper_broker_kind,
     resolve_broker,
 )
+from app.broker.internal_paper import InternalPaperBroker
 from app.broker.mock import MockBroker
 from app.broker.trading212 import Trading212DemoBroker, Trading212LiveBroker
 from app.broker.types import (
@@ -43,6 +44,7 @@ __all__ = [
     "BrokerPosition",
     "BrokerRateLimitError",
     "BrokerUnavailableError",
+    "InternalPaperBroker",
     "LiveTradingDisabledError",
     "MockBroker",
     "ReconciliationDiscrepancy",
