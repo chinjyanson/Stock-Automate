@@ -11,7 +11,6 @@ import {
   type Instrument,
   type Order,
   type Position,
-  type RiskConfig,
   api,
   formatMoney,
 } from "@/lib/api";
@@ -22,7 +21,6 @@ export default function PortfolioPage() {
   const [account, setAccount] = useState<Account | null>(null);
   const [positions, setPositions] = useState<Position[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
-  const [config, setConfig] = useState<RiskConfig | null>(null);
   const [halts, setHalts] = useState<Halt[]>([]);
   const [summaries, setSummaries] = useState<DailySummary[]>([]);
   const [instruments, setInstruments] = useState<Instrument[]>([]);
@@ -40,23 +38,21 @@ export default function PortfolioPage() {
           return;
         }
       }
-      // Each panel resolves independently: a missing risk config (fresh install)
-      // must not blank the positions, and vice versa.
-      const [accountR, positionsR, ordersR, configR, haltsR, summariesR, instrumentsR] =
+      // Each panel resolves independently: one panel failing must not blank
+      // the others.
+      const [accountR, positionsR, ordersR, haltsR, summariesR, instrumentsR] =
         await Promise.allSettled([
-          api.paperAccount(),
-          api.paperPositions(),
-          api.paperOrders(false),
-          api.riskConfig(),
+          api.activeAccount(),
+          api.activePositions(),
+          api.activeOrders(false),
           api.halts(true),
-          api.paperSummaries(14),
+          api.activeSummaries(14),
           api.instruments({ limit: 200 }),
         ]);
 
       if (accountR.status === "fulfilled") setAccount(accountR.value);
       if (positionsR.status === "fulfilled") setPositions(positionsR.value);
       if (ordersR.status === "fulfilled") setOrders(ordersR.value);
-      if (configR.status === "fulfilled") setConfig(configR.value);
       if (haltsR.status === "fulfilled") setHalts(haltsR.value);
       if (summariesR.status === "fulfilled") setSummaries(summariesR.value);
       if (instrumentsR.status === "fulfilled") setInstruments(instrumentsR.value.items);
@@ -66,7 +62,7 @@ export default function PortfolioPage() {
         setError(
           reason instanceof ApiError || reason instanceof ApiUnreachableError
             ? reason.message
-            : "Could not load the paper portfolio.",
+            : "Could not load the portfolio.",
         );
       }
     } finally {
@@ -162,28 +158,20 @@ export default function PortfolioPage() {
 
   return (
     <main className="mx-auto max-w-5xl space-y-6 px-6 py-10">
-      <header className="flex items-baseline justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold">Paper portfolio</h1>
-          <p className="text-sm text-[var(--color-ink-muted)]">
-            The internal paper venue — positions, protective stops, and the risk limits every
-            order passes through. Nothing here trades real money.
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <a
-            href="/scanner"
-            className="rounded-md border border-[var(--color-border-subtle)] px-3 py-1.5 text-sm"
+      <header>
+        <h1 className="text-2xl font-semibold">Portfolio</h1>
+        <p className="text-sm text-[var(--color-ink-muted)]">
+          <span
+            className="font-medium"
+            style={{
+              color: account?.is_live ? "var(--color-live)" : "var(--color-paper)",
+            }}
           >
-            Scanner
-          </a>
-          <a
-            href="/dashboard"
-            className="rounded-md border border-[var(--color-border-subtle)] px-3 py-1.5 text-sm"
-          >
-            Dashboard
-          </a>
-        </div>
+            {account?.is_live ? "LIVE — real money" : "Paper — Trading 212 demo"}
+          </span>{" "}
+          · positions, protective stops and recent activity. Switch venue and set risk
+          limits in Settings.
+        </p>
       </header>
 
       {error && (
@@ -351,8 +339,6 @@ export default function PortfolioPage() {
         )}
       </section>
 
-      <RiskConfigCard config={config} onSaved={load} onError={setError} />
-
       <section className="rounded-lg border border-[var(--color-warn)] px-4 py-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -395,176 +381,11 @@ export default function PortfolioPage() {
   );
 }
 
-function RiskConfigCard({
-  config,
-  onSaved,
-  onError,
-}: {
-  config: RiskConfig | null;
-  onSaved: () => Promise<void>;
-  onError: (message: string) => void;
-}) {
-  const [saving, setSaving] = useState(false);
-  // Editable copies of the primary sizing limits; the rest are shown read-only.
-  const [riskPct, setRiskPct] = useState("");
-  const [atrMult, setAtrMult] = useState("");
-  const [maxPositionPct, setMaxPositionPct] = useState("");
-  const [maxOpen, setMaxOpen] = useState("");
-  const [maxTrades, setMaxTrades] = useState("");
-  const [trailingEnabled, setTrailingEnabled] = useState(true);
-  const [maxHoldingDays, setMaxHoldingDays] = useState("");
-
-  useEffect(() => {
-    if (!config) return;
-    setRiskPct(config.risk_per_trade_pct);
-    setAtrMult(config.atr_stop_multiplier);
-    setMaxPositionPct(config.max_position_pct);
-    setMaxOpen(String(config.max_open_positions));
-    setMaxTrades(String(config.max_trades_per_day));
-    setTrailingEnabled(config.trailing_stop_enabled);
-    setMaxHoldingDays(String(config.max_holding_days));
-  }, [config]);
-
-  if (!config) {
-    return (
-      <section className="rounded-lg border border-[var(--color-border-subtle)] px-4 py-6 text-sm text-[var(--color-ink-muted)]">
-        No active risk configuration. Seed one (<span className="font-mono">python -m app.seed</span>)
-        before trading — the engine fails closed without it.
-      </section>
-    );
-  }
-
-  async function onSave() {
-    setSaving(true);
-    try {
-      await api.updateRiskConfig({
-        risk_per_trade_pct: riskPct,
-        atr_stop_multiplier: atrMult,
-        max_position_pct: maxPositionPct,
-        max_open_positions: Number(maxOpen),
-        max_trades_per_day: Number(maxTrades),
-        trailing_stop_enabled: trailingEnabled,
-        max_holding_days: Number(maxHoldingDays),
-      });
-      await onSaved();
-    } catch (err) {
-      onError(err instanceof ApiError ? err.message : "Could not update the risk configuration");
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <section className="rounded-lg border border-[var(--color-border-subtle)]">
-      <div className="flex items-center justify-between border-b border-[var(--color-border-subtle)] px-4 py-3">
-        <h2 className="font-medium">Risk configuration — {config.name}</h2>
-        <button
-          onClick={onSave}
-          disabled={saving}
-          className="rounded-md bg-[var(--color-paper)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
-        >
-          {saving ? "Saving…" : "Save changes"}
-        </button>
-      </div>
-      <div className="grid gap-4 px-4 py-4 sm:grid-cols-2 lg:grid-cols-3">
-        <Field label="Risk per trade" hint="Fraction of equity risked to the stop">
-          <input
-            value={riskPct}
-            onChange={(e) => setRiskPct(e.target.value)}
-            className="w-full rounded-md border border-[var(--color-border-subtle)] px-2 py-1 text-sm"
-          />
-        </Field>
-        <Field label="ATR stop multiplier" hint="Stop distance = ATR × this">
-          <input
-            value={atrMult}
-            onChange={(e) => setAtrMult(e.target.value)}
-            className="w-full rounded-md border border-[var(--color-border-subtle)] px-2 py-1 text-sm"
-          />
-        </Field>
-        <Field label="Max position %" hint="Cap on a single position's value">
-          <input
-            value={maxPositionPct}
-            onChange={(e) => setMaxPositionPct(e.target.value)}
-            className="w-full rounded-md border border-[var(--color-border-subtle)] px-2 py-1 text-sm"
-          />
-        </Field>
-        <Field label="Max open positions" hint="Bounds concentration">
-          <input
-            value={maxOpen}
-            onChange={(e) => setMaxOpen(e.target.value)}
-            className="w-full rounded-md border border-[var(--color-border-subtle)] px-2 py-1 text-sm"
-          />
-        </Field>
-        <Field label="Max trades / day" hint="Bounds runaway logic">
-          <input
-            value={maxTrades}
-            onChange={(e) => setMaxTrades(e.target.value)}
-            className="w-full rounded-md border border-[var(--color-border-subtle)] px-2 py-1 text-sm"
-          />
-        </Field>
-        <Field label="Max holding days" hint="Time stop; 0 disables it">
-          <input
-            value={maxHoldingDays}
-            onChange={(e) => setMaxHoldingDays(e.target.value)}
-            className="w-full rounded-md border border-[var(--color-border-subtle)] px-2 py-1 text-sm"
-          />
-        </Field>
-        <label className="flex items-center gap-2 self-end pb-1">
-          <input
-            type="checkbox"
-            checked={trailingEnabled}
-            onChange={(e) => setTrailingEnabled(e.target.checked)}
-          />
-          <span className="text-xs font-medium">Trailing stop enabled</span>
-        </label>
-      </div>
-      <div className="grid gap-3 border-t border-[var(--color-border-subtle)] px-4 py-4 text-sm sm:grid-cols-2 lg:grid-cols-3">
-        <ReadOnly label="Max total open risk" value={config.max_total_open_risk_pct} />
-        <ReadOnly label="Max instrument %" value={config.max_instrument_pct} />
-        <ReadOnly label="Max daily realised loss" value={config.max_daily_realised_loss_pct} />
-        <ReadOnly label="Max portfolio drawdown" value={config.max_portfolio_drawdown_pct} />
-        <ReadOnly
-          label="Correlation benchmark"
-          value={`${config.correlation_benchmark_symbol} (>${config.correlation_threshold})`}
-        />
-        <ReadOnly label="Max S&P exposure" value={config.max_portfolio_sp500_pct} />
-      </div>
-    </section>
-  );
-}
-
 function Stat({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg border border-[var(--color-border-subtle)] bg-[var(--color-surface-muted)] px-4 py-3">
       <p className="text-xs text-[var(--color-ink-muted)]">{label}</p>
       <p className="tabular mt-1 text-lg font-semibold">{value}</p>
-    </div>
-  );
-}
-
-function Field({
-  label,
-  hint,
-  children,
-}: {
-  label: string;
-  hint: string;
-  children: React.ReactNode;
-}) {
-  return (
-    <label className="block">
-      <span className="text-xs font-medium">{label}</span>
-      <span className="mb-1 block text-xs text-[var(--color-ink-muted)]">{hint}</span>
-      {children}
-    </label>
-  );
-}
-
-function ReadOnly({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <span className="text-xs text-[var(--color-ink-muted)]">{label}</span>
-      <p className="tabular font-medium">{value}</p>
     </div>
   );
 }

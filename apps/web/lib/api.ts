@@ -354,6 +354,8 @@ export const riskConfigSchema = z.object({
   max_portfolio_sp500_pct: z.string(),
   trailing_stop_enabled: z.boolean(),
   max_holding_days: z.number(),
+  max_live_capital: z.string().nullable(),
+  max_daily_loss: z.string().nullable(),
 });
 
 export const dailySummarySchema = z.object({
@@ -384,11 +386,47 @@ export const haltSchema = z.object({
   cleared_at: z.string().nullable(),
 });
 
+export const strategyConfigSchema = z.object({
+  id: z.string(),
+  kind: z.string(),
+  name: z.string(),
+  is_active: z.boolean(),
+  interval: z.string(),
+  operating_mode: z.string(),
+  auto_execute: z.boolean(),
+  params: z.record(z.string(), z.unknown()).nullable(),
+  universe: z.record(z.string(), z.unknown()).nullable(),
+  account_equity: z.string().nullable(),
+});
+
+export const strategyDecisionSchema = z.object({
+  id: z.string(),
+  run_id: z.string(),
+  instrument_id: z.string(),
+  kind: z.string(),
+  side: z.string(),
+  conviction: z.string(),
+  outcome: z.string(),
+  reason: z.string(),
+  metrics: z.record(z.string(), z.unknown()).nullable(),
+  proposal_id: z.string().nullable(),
+  created_at: z.string(),
+});
+
+export const strategyRunSchema = z.object({
+  run_id: z.string(),
+  considered: z.number(),
+  signals: z.number(),
+  proposals: z.number(),
+  executed: z.number(),
+  rejected: z.number(),
+});
+
 export const liveStatusSchema = z.object({
   live_trading_enabled_on_server: z.boolean(),
-  is_armed: z.boolean(),
-  armed_at: z.string().nullable().optional(),
-  expires_at: z.string().nullable().optional(),
+  autonomous_enabled_on_server: z.boolean().default(false),
+  /** True when the active venue is live (real money); false means paper. */
+  live_mode: z.boolean().default(false),
   max_live_capital: z.string().nullable().optional(),
   max_daily_loss: z.string().nullable().optional(),
   blockers: z.array(z.string()).default([]),
@@ -410,6 +448,17 @@ export type RiskConfigUpdate = Partial<
 >;
 export type Halt = z.infer<typeof haltSchema>;
 export type DailySummary = z.infer<typeof dailySummarySchema>;
+export type StrategyConfig = z.infer<typeof strategyConfigSchema>;
+export type StrategyDecision = z.infer<typeof strategyDecisionSchema>;
+export type StrategyRun = z.infer<typeof strategyRunSchema>;
+export type StrategyConfigUpdate = Partial<{
+  is_active: boolean;
+  auto_execute: boolean;
+  interval: string;
+  params: Record<string, unknown>;
+  universe: Record<string, unknown>;
+  account_equity: string | null;
+}>;
 export type ScannerResult = z.infer<typeof scannerResultSchema>;
 export type ScannerResultDetail = z.infer<typeof scannerResultDetailSchema>;
 export type ScannerRun = z.infer<typeof scannerRunSchema>;
@@ -426,6 +475,12 @@ export const api = {
     }),
 
   logout: () => request("/auth/logout", z.undefined(), { method: "POST" }),
+
+  reauthenticate: (password: string) =>
+    request("/auth/reauthenticate", sessionSchema, {
+      method: "POST",
+      body: JSON.stringify({ password }),
+    }),
 
   me: () => request("/auth/me", sessionSchema),
 
@@ -447,7 +502,18 @@ export const api = {
 
   liveStatus: () => request("/live/status", liveStatusSchema),
 
-  disarmLive: () => request("/live/disarm", liveStatusSchema, { method: "POST" }),
+  /** Point the product at paper (false) or live (true). One toggle, no phrase. */
+  setLiveMode: (live: boolean) =>
+    request("/live/mode", liveStatusSchema, {
+      method: "POST",
+      body: JSON.stringify({ live }),
+    }),
+
+  setAutonomousEnabled: (enabled: boolean) =>
+    request("/live/autonomous", liveStatusSchema, {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    }),
 
   scannerResults: (params: { minScore?: number; tradableOnly?: boolean; limit?: number } = {}) => {
     const query = new URLSearchParams();
@@ -466,12 +532,21 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  scannerSettings: () =>
+    request("/scanner/settings", z.object({ auto_run_enabled: z.boolean() })),
+
+  setScannerAutoRun: (enabled: boolean) =>
+    request("/scanner/settings", z.object({ auto_run_enabled: z.boolean() }), {
+      method: "PUT",
+      body: JSON.stringify({ auto_run_enabled: enabled }),
+    }),
+
   // -- Internal paper portfolio (Phase 3) --
-  paperAccount: () => request("/portfolio/account", accountSchema),
+  activeAccount: () => request("/portfolio/account", accountSchema),
 
-  paperPositions: () => request("/portfolio/positions", z.array(positionSchema)),
+  activePositions: () => request("/portfolio/positions", z.array(positionSchema)),
 
-  paperOrders: (includeHistory = false) =>
+  activeOrders: (includeHistory = false) =>
     request(
       `/portfolio/orders?include_history=${includeHistory ? "true" : "false"}`,
       z.array(orderSchema),
@@ -517,11 +592,30 @@ export const api = {
       body: JSON.stringify({ reason }),
     }),
 
-  paperSummaries: (limit = 30) =>
+  activeSummaries: (limit = 30) =>
     request(`/portfolio/summaries?limit=${limit}`, z.array(dailySummarySchema)),
 
   runEodSummary: () =>
     request("/portfolio/summaries/run", dailySummarySchema, { method: "POST" }),
+
+  // -- Strategies (Phase 4) --
+  strategies: () => request("/strategies", z.array(strategyConfigSchema)),
+
+  strategyDecisions: (params: { strategyId?: string; limit?: number } = {}) => {
+    const query = new URLSearchParams();
+    if (params.strategyId) query.set("strategy_id", params.strategyId);
+    query.set("limit", String(params.limit ?? 50));
+    return request(`/strategies/decisions?${query}`, z.array(strategyDecisionSchema));
+  },
+
+  updateStrategy: (id: string, body: StrategyConfigUpdate) =>
+    request(`/strategies/${id}/config`, strategyConfigSchema, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+
+  runStrategy: (id: string) =>
+    request(`/strategies/${id}/run`, strategyRunSchema, { method: "POST" }),
 };
 
 /** Format a decimal string for display. Never used for arithmetic. */

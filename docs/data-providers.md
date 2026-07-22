@@ -9,7 +9,7 @@ source of truth.
 | Provider | Role | Key | Status |
 |---|---|---|---|
 | **yfinance** | Broad daily candles, long history, LSE ETFs, dividends/splits | None | Implemented |
-| **Twelve Data** | US 15-minute signal candles only (SPY + a few) | Free Basic | Phase 4 |
+| **Twelve Data** | US 15-minute signal candles only (SPY + a few) | Free Basic | Implemented (Phase 4; live use needs `TWELVE_DATA_API_KEY`) |
 | **EODHD** | Verification and gap-fill only | Free | Phase 2 |
 | **Mock** | Deterministic fixtures for tests and offline use | None | Implemented |
 

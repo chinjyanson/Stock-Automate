@@ -114,27 +114,13 @@ export default function ScannerPage() {
             configured screen — nothing here is investment advice.
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <a
-            href="/dashboard"
-            className="rounded-md border border-[var(--color-border-subtle)] px-3 py-1.5 text-sm"
-          >
-            Dashboard
-          </a>
-          <a
-            href="/portfolio"
-            className="rounded-md border border-[var(--color-border-subtle)] px-3 py-1.5 text-sm"
-          >
-            Portfolio
-          </a>
-          <button
-            onClick={onRun}
-            disabled={running}
-            className="rounded-md bg-[var(--color-paper)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
-          >
-            {running ? "Scanning…" : "Run scan"}
-          </button>
-        </div>
+        <button
+          onClick={onRun}
+          disabled={running}
+          className="rounded-md bg-[var(--color-paper)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+        >
+          {running ? "Scanning…" : "Run scan"}
+        </button>
       </header>
 
       {error && (

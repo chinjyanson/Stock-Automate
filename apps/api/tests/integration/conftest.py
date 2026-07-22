@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 
 import httpx
 import pytest
@@ -120,6 +120,35 @@ async def db(engine: object) -> AsyncIterator[AsyncSession]:
     factory = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)  # type: ignore[arg-type]
     async with factory() as session:
         yield session
+
+
+@pytest.fixture(autouse=True)
+def _no_broker_credentials(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Make every broker unreachable for the whole suite.
+
+    The product now trades a *real* venue by default (paper = Trading 212 demo),
+    and a developer's `.env` usually has demo keys. Without this, a test that
+    forgets to inject a broker would quietly make network calls to Trading 212 —
+    which is exactly what `docs/architecture.md` promises can never happen.
+
+    Environment variables take precedence over the `.env` file in
+    pydantic-settings, so blanking them here neutralises real credentials.
+    `resolve_broker` then raises rather than reaching the network, and tests must
+    inject the venue they want (`ExecutionService(db, broker=…)`).
+    """
+    for var in (
+        "TRADING212_DEMO_API_KEY",
+        "TRADING212_DEMO_API_SECRET",
+        "TRADING212_LIVE_API_KEY",
+        "TRADING212_LIVE_API_SECRET",
+        "TWELVE_DATA_API_KEY",
+    ):
+        monkeypatch.setenv(var, "")
+    monkeypatch.setenv("LIVE_TRADING_ENABLED", "false")
+    monkeypatch.setenv("TRADING_LIVE_MODE", "false")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest_asyncio.fixture

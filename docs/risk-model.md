@@ -5,10 +5,12 @@
 > `app.risk.execution` wires approval → risk → paper fill → broker-side stop, and
 > `app.risk.stops` trails stops upward, applies time stops, and flattens on an
 > emergency exit. `app.services.reconciliation` halts on divergence and clears
-> when clean; `app.services.eod` persists the end-of-day account summary. What is
-> **not** built here is live execution — `/live/arm` still refuses without live
-> credentials and a clean reconciliation, and paper is the only executing venue
-> (live is Phase 6). The correlation filter uses a gross-exposure approximation
+> when clean; `app.services.eod` persists the end-of-day account summary. Live
+> execution exists too: a single Paper/Live toggle selects the venue, and live is
+> gated by `LIVE_TRADING_ENABLED` plus live credentials, bounded by the
+> persistent `max_live_capital` / `max_daily_loss` on `RiskConfiguration`, and
+> reverted to paper on a daily-loss breach. The correlation filter uses a
+> gross-exposure approximation
 > for portfolio S&P weight, noted in `app.risk.engine`, to refine when strategies
 > track per-position correlation (Phase 4).
 

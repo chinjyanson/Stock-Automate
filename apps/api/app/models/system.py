@@ -10,7 +10,7 @@ from sqlalchemy import Boolean, DateTime, ForeignKey, LargeBinary, String, Text,
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, StrEnumType, TimestampMixin, UUIDPrimaryKeyMixin
-from app.models.enums import BrokerKind, ProviderKind
+from app.models.enums import BrokerKind, OperatingMode, ProviderKind
 
 
 class SystemSetting(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -113,6 +113,15 @@ class LiveArmingSession(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     disarmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     disarm_reason: Mapped[str | None] = mapped_column(String(200))
+
+    #: Whether live orders under this session need a human approval each
+    #: (LIVE_APPROVAL_REQUIRED) or a strategy may place them autonomously
+    #: (LIVE_AUTONOMOUS). Autonomous also requires the server-side opt-in.
+    mode: Mapped[OperatingMode] = mapped_column(
+        StrEnumType(OperatingMode, 24),
+        nullable=False,
+        default=OperatingMode.LIVE_APPROVAL_REQUIRED,
+    )
 
     #: Ceilings the user affirmed at arming time. The risk engine treats these
     #: as hard caps for the duration of the session.

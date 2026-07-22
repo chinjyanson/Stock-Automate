@@ -249,6 +249,60 @@ async def seed_risk_configuration() -> int:
     return created
 
 
+async def seed_strategy_configurations() -> int:
+    """Seed the three strategies (§8), inactive, if they do not exist.
+
+    Inactive and with an empty universe by default: a fresh install must never
+    auto-trade before a human has mapped instruments into a strategy and turned
+    it on. Parameters are the documented defaults; idempotent per name.
+    """
+    from app.models.enums import Interval, StrategyKind
+    from app.models.strategy import StrategyConfiguration
+
+    defaults: list[dict[str, object]] = [
+        {
+            "kind": StrategyKind.SP500_MEAN_REVERSION,
+            "name": "S&P 500 mean reversion",
+            "interval": Interval.M15,
+            "params": {
+                "sma_period": 20,
+                "zscore_entry": -2.0,
+                "rsi_period": 14,
+                "rsi_oversold": 30.0,
+                "zscore_exit": 0.0,
+            },
+            "universe": {"instrument_ids": []},
+        },
+        {
+            "kind": StrategyKind.TREND_FOLLOWING,
+            "name": "Gold & oil trend",
+            "interval": Interval.D1,
+            "params": {"sma_period": 100, "slope_window": 21, "return_lookback": 60},
+            "universe": {"instrument_ids": []},
+        },
+        {
+            "kind": StrategyKind.PIE_REBALANCE,
+            "name": "Balanced pie",
+            "interval": Interval.D1,
+            "params": {"drift_band": 0.05},
+            "universe": {"weights": {}},
+        },
+    ]
+
+    created = 0
+    async with session_scope() as session:
+        for row in defaults:
+            existing = await session.execute(
+                select(StrategyConfiguration).where(StrategyConfiguration.name == row["name"])
+            )
+            if existing.scalar_one_or_none() is not None:
+                continue
+            session.add(StrategyConfiguration(is_active=False, auto_execute=True, **row))
+            created += 1
+    log.info("seed.strategy_configurations", created=created)
+    return created
+
+
 async def seed_dev_user() -> bool:
     """Create a development user if none exists.
 
@@ -299,6 +353,7 @@ async def main() -> int:
     await seed_settings()
     await seed_scanner_configuration()
     await seed_risk_configuration()
+    await seed_strategy_configurations()
     await seed_dev_user()
 
     log.info("seed.completed")

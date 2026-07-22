@@ -15,7 +15,7 @@ export function ModeBanner({
   account: Account | null;
   liveStatus: LiveStatus | null;
 }) {
-  const isLive = account?.is_live === true || liveStatus?.is_armed === true;
+  const isLive = account?.is_live === true || liveStatus?.live_mode === true;
 
   if (isLive) {
     return (
@@ -25,13 +25,14 @@ export function ModeBanner({
         className="rounded-lg border-2 border-[var(--color-live)] bg-[var(--color-live-soft)] px-4 py-3"
       >
         <p className="font-semibold text-[var(--color-live)]">
-          LIVE TRADING ARMED — orders place real money
+          LIVE — orders place real money
+          {liveStatus?.autonomous_enabled_on_server
+            ? " (autonomous enabled: strategies can trade with no per-order approval)"
+            : ""}
         </p>
-        {liveStatus?.expires_at && (
-          <p className="mt-1 text-sm text-[var(--color-ink)]">
-            Automatically disarms at {new Date(liveStatus.expires_at).toLocaleTimeString()}.
-          </p>
-        )}
+        <p className="mt-1 text-sm text-[var(--color-ink)]">
+          Switch back to paper any time in Settings.
+        </p>
       </div>
     );
   }
@@ -43,9 +44,9 @@ export function ModeBanner({
       </p>
       <p className="mt-1 text-sm text-[var(--color-ink)]">
         {account
-          ? `Connected to ${account.broker.replace(/_/g, " ")}.`
+          ? `Trading the ${account.broker.replace(/_/g, " ")} account.`
           : "No broker connected."}{" "}
-        Live trading is disabled by default.
+        Live is off by default.
       </p>
     </div>
   );

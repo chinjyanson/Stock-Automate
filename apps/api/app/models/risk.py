@@ -93,6 +93,16 @@ class RiskConfiguration(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     max_daily_realised_loss_pct: Mapped[Any] = mapped_column(Ratio, nullable=False, default=0.03)
     max_portfolio_drawdown_pct: Mapped[Any] = mapped_column(Ratio, nullable=False, default=0.15)
 
+    # -- Live ceilings ------------------------------------------------------
+    #: Absolute capital the live venue may deploy. Bounds the equity all live
+    #: sizing scales against, so you cannot risk more than you decided to — the
+    #: persistent replacement for the old per-session arming ceiling. Null = the
+    #: broker's own equity is the only bound.
+    max_live_capital: Mapped[Any | None] = mapped_column(Money)
+    #: Realised live loss in one day that halts trading and drops back to paper.
+    #: Null = no automatic daily stop.
+    max_daily_loss: Mapped[Any | None] = mapped_column(Money)
+
     # -- Correlation --------------------------------------------------------
     correlation_benchmark_symbol: Mapped[str] = mapped_column(
         String(32), nullable=False, default="SPY"

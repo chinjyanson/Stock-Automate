@@ -15,11 +15,16 @@ from typing import Any
 import redis
 import structlog
 from app.config import get_settings
-from app.data.factory import resolve_provider
+from app.data.factory import (
+    ProviderNotConfiguredError,
+    intraday_provider_chain,
+    resolve_provider,
+)
 from app.data.types import ProviderQuotaExceededError
 from app.db import session_scope
-from app.models.enums import ProviderKind
+from app.models.enums import Interval, ProviderKind
 from app.models.instrument import Instrument, MarketDataMapping
+from app.models.strategy import StrategyConfiguration
 from app.services.ingestion import IngestionService
 from sqlalchemy import or_, select
 
@@ -114,3 +119,77 @@ def refresh_daily_candles(  # type: ignore[no-untyped-def]
     except Exception as exc:
         log.exception("job.refresh_daily_candles.failed", error=str(exc))
         raise self.retry(exc=exc, countdown=300 * (2**self.request.retries)) from exc
+
+
+async def _intraday_universe(session: Any) -> list[Instrument]:
+    """Instruments watched by an active intraday strategy (§8)."""
+    configs = (
+        (
+            await session.execute(
+                select(StrategyConfiguration).where(StrategyConfiguration.is_active.is_(True))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    ids: set[str] = set()
+    for config in configs:
+        if not config.interval.is_intraday:
+            continue
+        universe = config.universe or {}
+        ids.update(str(i) for i in universe.get("instrument_ids", []))
+        ids.update(str(i) for i in (universe.get("weights") or {}))
+    if not ids:
+        return []
+    rows = await session.execute(select(Instrument).where(Instrument.id.in_(ids)))
+    return list(rows.scalars().all())
+
+
+async def _refresh_intraday(interval: Interval) -> dict[str, Any]:
+    settings = get_settings()
+    provider = resolve_provider(intraday_provider_chain(settings)[0], settings)
+    try:
+        async with session_scope() as session:
+            instruments = await _intraday_universe(session)
+            if not instruments:
+                return {"instruments": 0, "note": "no active intraday strategy universe"}
+            service = IngestionService(session)
+            written = 0
+            for instrument in instruments:
+                result = await service.ingest_intraday(instrument, provider, interval=interval)
+                written += result.candles_written
+            return {"instruments": len(instruments), "candles_written": written}
+    finally:
+        await provider.close()
+
+
+@app.task(bind=True, name="worker.jobs.market_data.refresh_intraday_candles", max_retries=2)
+def refresh_intraday_candles(self, interval: str = "15m") -> dict[str, Any]:  # type: ignore[no-untyped-def]
+    """Refresh intraday candles for the active strategy universe (§8).
+
+    Feeds the 15-minute mean-reversion strategy. Requires an intraday provider
+    (Twelve Data); with none configured it skips rather than failing — the
+    offline mock path is reachable only via an explicit request.
+    """
+    try:
+        parsed = Interval(interval)
+    except ValueError:
+        log.error("job.refresh_intraday_candles.unknown_interval", interval=interval)
+        raise
+
+    try:
+        with distributed_lock(_redis(), "refresh_intraday_candles", ttl_seconds=600):
+            result = asyncio.run(_refresh_intraday(parsed))
+            log.info("job.refresh_intraday_candles.completed", **result)
+            return result
+    except LockNotAcquiredError:
+        return {"skipped": True, "reason": "another worker holds the lock"}
+    except ProviderNotConfiguredError as exc:
+        log.info("job.refresh_intraday_candles.skipped", reason=str(exc))
+        return {"skipped": True, "reason": "no intraday provider configured"}
+    except ProviderQuotaExceededError as exc:
+        log.warning("job.refresh_intraday_candles.quota_exhausted", error=str(exc))
+        return {"skipped": True, "reason": "provider budget exhausted"}
+    except Exception as exc:
+        log.exception("job.refresh_intraday_candles.failed", error=str(exc))
+        raise self.retry(exc=exc, countdown=120 * (2**self.request.retries)) from exc

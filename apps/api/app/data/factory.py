@@ -12,6 +12,7 @@ import structlog
 from app.config import Settings, get_settings
 from app.data.base import MarketDataProvider
 from app.data.mock_provider import MockMarketDataProvider
+from app.data.twelve_data_provider import TwelveDataProvider
 from app.data.yfinance_provider import YFinanceProvider
 from app.models.enums import ProviderKind
 
@@ -39,13 +40,19 @@ def resolve_provider(kind: ProviderKind, settings: Settings | None = None) -> Ma
             )
 
         case ProviderKind.TWELVE_DATA:
-            # Arrives in Phase 4 with the 15-minute S&P strategy, which is the
-            # only consumer that needs US intraday. Raising keeps the gap
-            # explicit rather than silently serving daily bars to a 15m
-            # strategy — a substitution that would look like it worked.
-            raise NotImplementedError(
-                "TwelveDataProvider arrives in Phase 4 (S&P 500 15-minute strategy). "
-                "Daily data comes from yfinance today."
+            # The intraday source for the S&P 15-minute strategy (§8). A missing
+            # key is a configuration gap, not a cue to serve daily bars to a 15m
+            # strategy — that substitution would look like it worked.
+            key = settings.twelve_data_api_key
+            if key is None or not key.get_secret_value():
+                raise ProviderNotConfiguredError(
+                    "Twelve Data was requested but TWELVE_DATA_API_KEY is not configured. "
+                    "Set it in .env, or request ProviderKind.MOCK explicitly to run offline "
+                    "against deterministic intraday fixtures."
+                )
+            return TwelveDataProvider(
+                api_key=key.get_secret_value(),
+                base_url=settings.twelve_data_base_url,
             )
 
         case ProviderKind.EODHD:
@@ -85,3 +92,19 @@ def daily_provider_chain(settings: Settings | None = None) -> list[ProviderKind]
         )
 
     return chain
+
+
+def intraday_provider_chain(settings: Settings | None = None) -> list[ProviderKind]:
+    """Provider priority for intraday (15m) data (§4, §8).
+
+    Twelve Data is the only real intraday source. As with the daily chain, an
+    empty chain is a configuration error rather than a silent fall back to the
+    mock — a 15m strategy on invented bars is a confident, wrong answer.
+    """
+    settings = settings or get_settings()
+    if settings.twelve_data_api_key and settings.twelve_data_api_key.get_secret_value():
+        return [ProviderKind.TWELVE_DATA]
+    raise ProviderNotConfiguredError(
+        "No intraday market-data provider is configured. Set TWELVE_DATA_API_KEY, or "
+        "request ProviderKind.MOCK explicitly to run offline against intraday fixtures."
+    )

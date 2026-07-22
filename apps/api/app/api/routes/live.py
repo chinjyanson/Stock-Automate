@@ -1,75 +1,52 @@
-"""Live-trading arming and disarming (§7, §14, §19).
+"""The trading-venue toggle: paper or live (§7, §14, §19).
 
-Arming is the moment this system becomes capable of losing real money, so it is
-gated by five independent conditions that must *all* hold (§7):
+The product points at exactly one venue at a time — **paper** (the Trading 212
+demo account) or **live** (real money) — and this module owns that switch.
 
-  1. LIVE_TRADING_ENABLED on the server
-  2. Live credentials configured
-  3. A recent broker reconciliation
-  4. No active risk halt
-  5. A re-authenticated user typing an exact confirmation phrase, and affirming
-     capital and loss ceilings
+Selecting live is one click, deliberately: no typed phrase. What it is *not* is
+unguarded. Live can only be selected when the server itself permits it —
+`LIVE_TRADING_ENABLED` plus live credentials — and those are deployment-level
+facts a browser session cannot change. That is the backstop that makes accidental
+real-money trading impossible from the UI, and it is checked again by the
+execution preflight before any order is built (§7 depth-in-defence).
 
-They are checked as a *list of blockers* rather than short-circuiting on the
-first failure, because the UI should tell the user everything standing in the
-way at once, not make them fix five things one refresh at a time.
-
-Arming is time-boxed and expires on its own. A live session that stays armed
-because someone forgot to turn it off is the failure mode this design refuses.
+Going back to paper is always allowed and never blocked: stopping must never be
+harder than starting.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.schemas import ArmLiveRequest, LiveStatusResponse
+from app.api.schemas import LiveStatusResponse, SetLiveModeRequest
 from app.audit.service import AuditService
-from app.auth.dependencies import (
-    AuthContext,
-    get_auth_context,
-    require_csrf,
-    require_recent_reauth,
-)
-from app.broker.factory import resolve_broker
-from app.broker.types import BrokerError
+from app.auth.dependencies import AuthContext, get_auth_context, require_csrf
 from app.config import get_settings
 from app.db import get_db
-from app.models.enums import ActorKind, AuditEventKind, BrokerKind
-from app.models.system import LiveArmingSession
+from app.models.enums import ActorKind, AuditEventKind
+from app.risk.config import load_active_risk_config
 from app.risk.halts import HaltService
+from app.services.system_settings import (
+    TRADING_LIVE_MODE_KEY,
+    autonomous_live_enabled,
+    live_mode_enabled,
+    set_bool_setting,
+)
 
 router = APIRouter(prefix="/live", tags=["live"])
 log = structlog.get_logger(__name__)
 
-#: Must be typed exactly. Deliberately awkward — muscle memory should not be
-#: able to produce it.
-CONFIRMATION_PHRASE = "I UNDERSTAND THIS TRADES REAL MONEY"
 
-#: How recently the broker must have been reconciled for arming to proceed.
-RECONCILIATION_MAX_AGE = timedelta(minutes=15)
+async def _live_blockers(db: AsyncSession, context: AuthContext) -> list[str]:
+    """Everything standing between here and real-money trading.
 
-
-async def _active_arming(db: AsyncSession, user_id: object) -> LiveArmingSession | None:
-    result = await db.execute(
-        select(LiveArmingSession)
-        .where(
-            LiveArmingSession.user_id == user_id,
-            LiveArmingSession.disarmed_at.is_(None),
-            LiveArmingSession.expires_at > datetime.now(UTC),
-        )
-        .order_by(LiveArmingSession.armed_at.desc())
-    )
-    return result.scalars().first()
-
-
-async def _collect_blockers(db: AsyncSession, context: AuthContext) -> list[str]:
-    """Everything currently preventing live trading."""
+    Reported as a list rather than short-circuiting, so the UI can show
+    everything that needs fixing at once.
+    """
     settings = get_settings()
     blockers: list[str] = []
 
@@ -80,17 +57,31 @@ async def _collect_blockers(db: AsyncSession, context: AuthContext) -> list[str]
     if key is None or not key.get_secret_value():
         blockers.append("No live Trading 212 credentials are configured.")
 
-    if not context.is_recently_reauthenticated:
-        blockers.append("Password re-confirmation is required.")
-
-    # Any active global risk halt blocks arming. A halt is a state, so this is a
-    # real query now, not a placeholder — the kill switch, a drawdown halt, or a
-    # reconciliation halt all surface here.
-    active = await HaltService(db).active_halts()
-    for halt in active:
+    for halt in await HaltService(db).active_halts():
         blockers.append(f"Active risk halt: {halt.kind.value} — {halt.reason}")
 
     return blockers
+
+
+async def _status(db: AsyncSession, context: AuthContext) -> LiveStatusResponse:
+    settings = get_settings()
+    config = await load_active_risk_config(db)
+    return LiveStatusResponse(
+        live_trading_enabled_on_server=settings.live_trading_enabled,
+        autonomous_enabled_on_server=await autonomous_live_enabled(db),
+        live_mode=await live_mode_enabled(db),
+        max_live_capital=(
+            Decimal(config.max_live_capital)
+            if config is not None and config.max_live_capital is not None
+            else None
+        ),
+        max_daily_loss=(
+            Decimal(config.max_daily_loss)
+            if config is not None and config.max_daily_loss is not None
+            else None
+        ),
+        blockers=await _live_blockers(db, context),
+    )
 
 
 @router.get("/status", response_model=LiveStatusResponse)
@@ -98,158 +89,53 @@ async def live_status(
     context: AuthContext = Depends(get_auth_context),
     db: AsyncSession = Depends(get_db),
 ) -> LiveStatusResponse:
-    """Current live-trading state and everything blocking it."""
-    settings = get_settings()
-    arming = await _active_arming(db, context.user.id)
-    blockers = await _collect_blockers(db, context)
-
-    return LiveStatusResponse(
-        live_trading_enabled_on_server=settings.live_trading_enabled,
-        is_armed=arming is not None,
-        armed_at=arming.armed_at if arming else None,
-        expires_at=arming.expires_at if arming else None,
-        max_live_capital=Decimal(arming.max_live_capital) if arming else None,
-        max_daily_loss=Decimal(arming.max_daily_loss) if arming else None,
-        blockers=blockers,
-    )
+    """Which venue is active, and everything blocking live."""
+    return await _status(db, context)
 
 
-@router.post("/arm", response_model=LiveStatusResponse)
-async def arm_live(
-    payload: ArmLiveRequest,
-    context: AuthContext = Depends(require_recent_reauth),
-    db: AsyncSession = Depends(get_db),
-    _: None = Depends(require_csrf),
-) -> LiveStatusResponse:
-    """Arm live trading for a bounded window.
-
-    Every precondition is re-checked here rather than trusted from the status
-    endpoint: the client may have read status minutes ago, and the answer can
-    change.
-    """
-    settings = get_settings()
-
-    if payload.confirmation_phrase.strip() != CONFIRMATION_PHRASE:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Confirmation phrase must be exactly: {CONFIRMATION_PHRASE}",
-        )
-
-    blockers = await _collect_blockers(db, context)
-    if blockers:
-        # 409: the request is well-formed, the system state forbids it.
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "live_trading_blocked", "blockers": blockers},
-        )
-
-    # Reconciliation must be recent *and* clean. Arming against an unreconciled
-    # broker means arming without knowing what is already open (§7).
-    broker = resolve_broker(BrokerKind.TRADING212_LIVE, settings)
-    try:
-        reconciliation = await broker.reconcile()
-    except BrokerError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Cannot arm: broker reconciliation failed: {exc}",
-        ) from exc
-    finally:
-        await broker.close()
-
-    if not reconciliation.is_clean:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "code": "reconciliation_required",
-                "message": "Broker state diverges from local records. Resolve before arming.",
-                "discrepancies": [d.detail for d in reconciliation.discrepancies],
-            },
-        )
-
-    now = datetime.now(UTC)
-    arming = LiveArmingSession(
-        user_id=context.user.id,
-        armed_at=now,
-        expires_at=now + timedelta(minutes=payload.duration_minutes),
-        max_live_capital=str(payload.max_live_capital),
-        max_daily_loss=str(payload.max_daily_loss),
-    )
-    db.add(arming)
-
-    await AuditService(db).record(
-        kind=AuditEventKind.LIVE_ARMED,
-        summary=(
-            f"Live trading armed for {payload.duration_minutes} minutes "
-            f"(max capital {payload.max_live_capital}, max daily loss {payload.max_daily_loss})"
-        ),
-        actor_kind=ActorKind.USER,
-        actor_user_id=context.user.id,
-        subject_type="live_arming_session",
-        subject_id=str(arming.id),
-        payload={
-            "max_live_capital": str(payload.max_live_capital),
-            "max_daily_loss": str(payload.max_daily_loss),
-            "duration_minutes": payload.duration_minutes,
-            "expires_at": arming.expires_at.isoformat(),
-            "reconciliation_clean": True,
-        },
-    )
-    await db.commit()
-    await db.refresh(arming)
-
-    log.warning(
-        "live.armed",
-        user_id=str(context.user.id),
-        expires_at=arming.expires_at.isoformat(),
-        max_live_capital=str(payload.max_live_capital),
-    )
-
-    return LiveStatusResponse(
-        live_trading_enabled_on_server=settings.live_trading_enabled,
-        is_armed=True,
-        armed_at=arming.armed_at,
-        expires_at=arming.expires_at,
-        max_live_capital=payload.max_live_capital,
-        max_daily_loss=payload.max_daily_loss,
-        blockers=[],
-    )
-
-
-@router.post("/disarm", response_model=LiveStatusResponse)
-async def disarm_live(
-    reason: str = "user requested",
+@router.post("/mode", response_model=LiveStatusResponse)
+async def set_live_mode(
+    payload: SetLiveModeRequest,
     context: AuthContext = Depends(get_auth_context),
     db: AsyncSession = Depends(get_db),
     _: None = Depends(require_csrf),
 ) -> LiveStatusResponse:
-    """Disarm live trading immediately.
+    """Point the product at paper or live.
 
-    Deliberately the easiest action in this module: no re-authentication, no
-    confirmation phrase. Stopping must never be harder than starting.
-    Disarming when not armed succeeds quietly — in an emergency, an error
-    response is not a useful answer to "make it stop".
+    Turning live *on* re-checks the server gate here rather than trusting the
+    status the client read a moment ago — the answer can change. Turning it
+    *off* is unconditional.
     """
-    settings = get_settings()
-    arming = await _active_arming(db, context.user.id)
+    if payload.live:
+        blockers = await _live_blockers(db, context)
+        if blockers:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "live_trading_blocked", "blockers": blockers},
+            )
 
-    if arming is not None:
-        arming.disarmed_at = datetime.now(UTC)
-        arming.disarm_reason = reason[:200]
-
-        await AuditService(db).record(
-            kind=AuditEventKind.LIVE_DISARMED,
-            summary=f"Live trading disarmed: {reason}",
-            actor_kind=ActorKind.USER,
-            actor_user_id=context.user.id,
-            subject_type="live_arming_session",
-            subject_id=str(arming.id),
-            payload={"reason": reason},
-        )
-        await db.commit()
-        log.warning("live.disarmed", user_id=str(context.user.id), reason=reason)
-
-    return LiveStatusResponse(
-        live_trading_enabled_on_server=settings.live_trading_enabled,
-        is_armed=False,
-        blockers=await _collect_blockers(db, context),
+    await set_bool_setting(
+        db,
+        TRADING_LIVE_MODE_KEY,
+        payload.live,
+        description="Whether the product trades the live venue rather than paper.",
+        is_sensitive=True,
+        user_id=context.user.id,
     )
+    await AuditService(db).record(
+        kind=AuditEventKind.LIVE_ARMED if payload.live else AuditEventKind.LIVE_DISARMED,
+        summary=f"Trading venue switched to {'LIVE (real money)' if payload.live else 'paper'}",
+        actor_kind=ActorKind.USER,
+        actor_user_id=context.user.id,
+        subject_type="system_setting",
+        subject_id=TRADING_LIVE_MODE_KEY,
+        payload={"live_mode": payload.live},
+    )
+    await db.commit()
+
+    if payload.live:
+        log.warning("live.mode_enabled", user_id=str(context.user.id))
+    else:
+        log.info("live.mode_disabled", user_id=str(context.user.id))
+
+    return await _status(db, context)

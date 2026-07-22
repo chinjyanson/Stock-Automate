@@ -22,11 +22,12 @@ from app.audit.service import AuditService
 from app.auth.dependencies import AuthContext, get_auth_context, require_csrf
 from app.broker.factory import resolve_broker
 from app.db import get_db
-from app.models.enums import ActorKind, AuditEventKind, BrokerKind
+from app.models.enums import ActorKind, AuditEventKind
 from app.models.risk import RiskHalt
 from app.risk.config import load_active_risk_config
 from app.risk.halts import HaltService
 from app.risk.stops import StopService
+from app.services.system_settings import active_broker_kind
 
 router = APIRouter(prefix="/risk", tags=["risk"])
 log = structlog.get_logger(__name__)
@@ -58,6 +59,9 @@ class RiskConfigResponse(ORMModel):
     max_portfolio_sp500_pct: SerializedDecimal
     trailing_stop_enabled: bool
     max_holding_days: int
+    #: Persistent live ceilings (replacing the old per-session arming values).
+    max_live_capital: SerializedDecimal | None
+    max_daily_loss: SerializedDecimal | None
 
 
 class RiskConfigUpdate(BaseModel):
@@ -82,6 +86,8 @@ class RiskConfigUpdate(BaseModel):
     max_portfolio_sp500_pct: SerializedDecimal | None = None
     trailing_stop_enabled: bool | None = None
     max_holding_days: int | None = None
+    max_live_capital: SerializedDecimal | None = None
+    max_daily_loss: SerializedDecimal | None = None
 
 
 class HaltResponse(ORMModel):
@@ -228,7 +234,7 @@ async def run_stops(
     _: None = Depends(require_csrf),
 ) -> StopRunResponse:
     """Run a stop-management pass now (trigger, trail, time-stop) without the job."""
-    broker = resolve_broker(BrokerKind.INTERNAL_PAPER, session=db)
+    broker = resolve_broker(await active_broker_kind(db), session=db)
     config = await load_active_risk_config(db)
     result = await StopService(db).manage(broker, config)
     await db.commit()
@@ -243,7 +249,7 @@ async def flatten(
     _: None = Depends(require_csrf),
 ) -> FlattenResponse:
     """Emergency exit: close every open paper position at market (§9)."""
-    broker = resolve_broker(BrokerKind.INTERNAL_PAPER, session=db)
+    broker = resolve_broker(await active_broker_kind(db), session=db)
     closed = await StopService(db).emergency_exit_all(
         broker, payload.reason, actor_user_id=context.user.id
     )

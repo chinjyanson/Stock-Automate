@@ -19,6 +19,7 @@ from app.models.scanner import ScannerConfiguration
 from app.scanner.engine import ScannerEngine
 from app.scanner.proposals import ProposalService
 from app.scanner.rotation import select_instruments
+from app.services.system_settings import scanner_auto_run_enabled
 from sqlalchemy import select
 
 from worker.app import app
@@ -33,6 +34,11 @@ def _redis() -> redis.Redis:
 
 async def _run_rotation(limit: int | None) -> dict[str, Any]:
     async with session_scope() as session:
+        # A runtime toggle can pause the scheduled scan without stopping the
+        # worker. Manual scans (the API's /scanner/run) are unaffected.
+        if not await scanner_auto_run_enabled(session):
+            return {"skipped": True, "reason": "scheduled scanning is turned off"}
+
         config = (
             await session.execute(
                 select(ScannerConfiguration).where(ScannerConfiguration.is_active.is_(True))

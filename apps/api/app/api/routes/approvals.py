@@ -57,12 +57,14 @@ async def approve(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(require_csrf),
 ) -> TradeProposalResponse:
-    """Approve a proposal, then size, gate and (for paper) execute it (§6, §9).
+    """Approve a proposal, then size, gate and execute it (§6, §9, §14).
 
     Requires an authenticated session (the dependency above) — a proposal must
     never be executable from an unauthenticated context such as a notification
-    action. Execution runs against the internal paper venue; the risk engine can
-    still reduce or reject the order.
+    action. Where the approver holds an active live arming session, this human
+    approval *is* the per-order live gate and the order routes to Trading 212;
+    otherwise it fills on the internal paper venue. Either way the risk engine
+    can still reduce or reject it.
     """
     try:
         proposal = await ProposalService(db).approve(
@@ -72,6 +74,9 @@ async def approve(
         await db.commit()  # persist any audit event written during the failed attempt
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
+    # The order goes to whichever venue the paper/live toggle currently selects;
+    # ExecutionService resolves it and re-checks the live gate before building
+    # anything.
     try:
         proposal = await ExecutionService(db).execute_approved(
             proposal, actor_user_id=context.user.id

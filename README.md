@@ -7,10 +7,10 @@ transparent heuristics, explicit data provenance and fail-closed safety.
 > asserts that an instrument is a good investment, and no strategy is claimed to
 > be profitable. Results describe configured criteria and nothing more.
 
-> **This system defaults to paper trading.** Live trading is disabled at the
-> server, requires separate credentials, and additionally requires an explicit,
-> expiring, re-authenticated arming step before a single real order can be
-> placed.
+> **This system defaults to paper trading.** One toggle in Settings selects the
+> venue: **paper** (the Trading 212 demo account) or **live**. Live can only be
+> selected when the server itself permits it — `LIVE_TRADING_ENABLED` plus live
+> credentials — a deployment-level gate a browser session cannot change.
 
 ---
 
@@ -26,10 +26,9 @@ silently substituting something that looks like it works.
 |---|---|---|
 | 1 | Monorepo, auth, Postgres/Redis, Trading 212 demo, instrument sync, yfinance ingestion, mapping, dashboard, audit logging | **Done** |
 | 2 | Rotating scanner, heuristic scoring, candidates, trade proposals, approval workflow | **Done** (push-notification *delivery* deferred — VAPID keygen + preferences exist, service-worker send does not) |
-| 3 | Internal paper broker, risk engine, position sizing, stops, reconciliation, EOD summary | **Done** — DB-backed internal paper broker; risk engine (sizing + caps + correlation + halts, fail-closed); approve→execute wiring; broker-side ATR stops with trailing, time and emergency exits; scheduled reconciliation (halts on divergence, clears when clean); and a persisted EOD account summary. Live execution remains Phase 6 |
-| 4 | S&P 15m mean reversion, gold/oil trend, pie strategy, correlation filter | Not started (indicators foundation built in Phase 2) |
-| 5 | Backtest engine, walk-forward, Optuna, parameter promotion | Not started |
-| 6 | Live adapter, arming, approval-required live, risk halts | Partially scaffolded (arming + gating exist; risk halts are now real state and gate arming, but live still requires live credentials + a clean reconciliation, and paper is the only executing venue) |
+| 3 | Internal paper broker, risk engine, position sizing, stops, reconciliation, EOD summary | **Done** — DB-backed internal paper broker; risk engine (sizing + caps + correlation + halts, fail-closed); approve→execute wiring; broker-side ATR stops with trailing, time and emergency exits; scheduled reconciliation (halts on divergence, clears when clean); and a persisted EOD account summary. Live execution is Phase 5 |
+| 4 | S&P 15m mean reversion, gold/oil trend, pie strategy, correlation filter | **Done** — strategy framework (config / run / decision) with signals routed through the risk engine; S&P 500 15-minute mean reversion, gold/oil trend, and a target-allocation pie rebalancer; the intraday (15m) data pipeline and a real Twelve Data provider (keyed; offline via mock); and the correlation filter refined to per-position benchmark exposure. Strategies are seeded inactive and paper-only |
+| 5 | Live adapter, venue toggle, autonomous live, risk halts | **Done** — a single Paper/Live toggle picks the venue for the whole product (paper = Trading 212 demo, live = real money), so there is exactly one balance in the UI. Live is gated by the server flag + credentials and re-checked by a depth-in-defence preflight; sizing is bounded by persistent `max_live_capital` / `max_daily_loss`, and a daily-loss breach halts and reverts to paper. Autonomous strategy filling stays behind its own server toggle (default off). No test places a real order — the suite blanks broker credentials and injects venues. Backtesting/optimisation (a former separate phase) was dropped by decision |
 
 ### What Phase 2 adds
 
@@ -93,13 +92,23 @@ pnpm api:dev         # http://localhost:8000  (API docs at /docs)
 pnpm dev             # http://localhost:3000
 ```
 
+> **Do not run `pnpm build` / `next build` while `pnpm dev` is running.** Both
+> write to `apps/web/.next`. A production build overwrites the dev server's
+> webpack chunks, and the still-running dev server then dies with
+> `Cannot find module './<n>.js'` (a stale-cache error, not a code error). If it
+> happens: stop the dev server, `rm -rf apps/web/.next`, and restart `pnpm dev`.
+> To validate web changes *without* disturbing a running dev server, type-check
+> only — `cd apps/web && pnpm typecheck` (`tsc --noEmit`) — which touches nothing
+> on disk. Only run a real build when no dev server is up.
+
 Sign in with the credentials the seed script prints
 (`dev@example.com` / `development-password`). **Change them before exposing this
 to a network.**
 
-Then, on the dashboard, press **Sync from broker**. This needs
-`TRADING212_DEMO_API_KEY` set — see [docs/trading212-setup.md](docs/trading212-setup.md).
-Without it you get a **503** naming the variable, not mock data.
+The broker catalogue syncs automatically every day; to force it now, press
+**Re-sync now** on the dashboard. This needs `TRADING212_DEMO_API_KEY` set — see
+[docs/trading212-setup.md](docs/trading212-setup.md). Without it you get a **503**
+naming the variable, not mock data.
 
 To work offline, ask for the mock broker explicitly:
 
@@ -195,12 +204,17 @@ The properties this codebase treats as non-negotiable:
   available, but only when explicitly named — which is what the test suite and
   CI do. Believing you are on Trading 212 while running invented prices is
   worse than an outage.
-- **Live needs five independent conditions**, checked together so the UI can show
-  every blocker at once: server flag, live credentials, recent clean
-  reconciliation, no risk halt, and a re-authenticated user typing an exact
-  phrase with capital/loss ceilings. Arming expires on its own.
-- **Disarming is easier than arming** — no re-auth, no phrase, and disarming when
-  not armed succeeds quietly. Stopping must never be harder than starting.
+- **One venue at a time, and live is server-gated.** A single Paper/Live toggle
+  decides where every order goes and which balance the UI shows. Selecting live
+  needs the server flag, live credentials and no active risk halt — reported
+  together so the UI can show every blocker at once. The execution preflight
+  re-checks them before an order is built, so the gate holds even if the toggle
+  is stale.
+- **Going back to paper is always allowed** and never blocked. Stopping must
+  never be harder than starting.
+- **Live sizing is bounded by persistent ceilings** — `max_live_capital` caps the
+  equity all live sizing scales against, and breaching `max_daily_loss` halts
+  trading and drops the venue back to paper.
 - **Order submission is never retried.** A timeout raises
   `BrokerAmbiguousResponseError`: the order may exist, so it is reconciled, not
   resent.

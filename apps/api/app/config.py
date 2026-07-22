@@ -82,6 +82,25 @@ class Settings(BaseSettings):
     #: live order: the session must additionally be armed through the UI (§14).
     live_trading_enabled: bool = False
 
+    #: Server-side switch for *autonomous* live trading (a strategy placing live
+    #: orders with no per-trade human approval). Defaults off: with this false the
+    #: system can only ever be armed approval-required, however the UI is driven.
+    #: The most dangerous capability in the system, so it is a deliberate,
+    #: separate opt-in from live trading itself.
+    live_autonomous_enabled: bool = False
+
+    #: Whether the scheduled rotating scan runs. On by default — scanning is
+    #: read-only and safe. A runtime toggle (Settings) overlays this. Note the
+    #: scan only fires when the Celery worker+beat is actually running.
+    scanner_auto_run_enabled: bool = True
+
+    #: The trading venue the whole product points at: false = paper (Trading 212
+    #: demo), true = live (real money). Defaults to paper. A runtime toggle in
+    #: Settings overlays this, but selecting live additionally requires
+    #: `live_trading_enabled` and live credentials — this flag alone cannot put
+    #: real money at risk.
+    trading_live_mode: bool = False
+
     # -- Market data: yfinance ---------------------------------------------
     yfinance_enabled: bool = True
     yfinance_max_concurrency: int = 4

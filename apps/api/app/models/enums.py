@@ -223,6 +223,35 @@ class HaltScope(StrEnum):
     STRATEGY = "strategy"
 
 
+class StrategyKind(StrEnum):
+    """The trading strategies (§8). Long-only in this phase."""
+
+    SP500_MEAN_REVERSION = "sp500_mean_reversion"
+    TREND_FOLLOWING = "trend_following"
+    PIE_REBALANCE = "pie_rebalance"
+
+
+class StrategyRunStatus(StrEnum):
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class StrategyDecisionOutcome(StrEnum):
+    """What became of one strategy signal.
+
+    A signal is not a trade: it becomes a proposal, which the risk engine can
+    still refuse. Recording the outcome makes "the strategy wanted to, but the
+    risk engine said no" visible rather than silent.
+    """
+
+    SIGNALLED = "signalled"  # produced, no proposal yet
+    PROPOSED = "proposed"  # a proposal was created, awaiting approval
+    EXECUTED = "executed"  # proposal was executed on the paper venue
+    REJECTED_BY_RISK = "rejected_by_risk"  # the risk engine refused it
+    SKIPPED = "skipped"  # duplicate / already held / no action needed
+
+
 class AuditEventKind(StrEnum):
     """Audit events are immutable and append-only (§17)."""
 
@@ -255,6 +284,9 @@ class AuditEventKind(StrEnum):
     STOP_ADJUSTED = "stop_adjusted"
     POSITION_CLOSED = "position_closed"
     EOD_SUMMARY_GENERATED = "eod_summary_generated"
+    STRATEGY_RUN_STARTED = "strategy_run_started"
+    STRATEGY_RUN_COMPLETED = "strategy_run_completed"
+    STRATEGY_SIGNAL = "strategy_signal"
 
 
 class ActorKind(StrEnum):

@@ -14,11 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.schemas import ORMModel, SerializedDecimal
+from app.audit.service import AuditService
 from app.auth.dependencies import AuthContext, get_auth_context, require_csrf
 from app.broker.factory import default_paper_broker_kind, resolve_broker
 from app.broker.read_cache import broker_read_cache
 from app.config import get_settings
 from app.db import get_db
+from app.models.enums import ActorKind, AuditEventKind
 from app.models.instrument import Instrument
 from app.models.scanner import (
     ScannerConfiguration,
@@ -28,6 +30,11 @@ from app.models.scanner import (
 from app.scanner.engine import ScannerEngine
 from app.scanner.proposals import ProposalError, ProposalInputs, ProposalService
 from app.scanner.rotation import select_instruments
+from app.services.system_settings import (
+    SCANNER_AUTORUN_KEY,
+    scanner_auto_run_enabled,
+    set_bool_setting,
+)
 
 router = APIRouter(prefix="/scanner", tags=["scanner"])
 log = structlog.get_logger(__name__)
@@ -344,6 +351,52 @@ async def propose_trade(
     await db.commit()
     await db.refresh(proposal)
     return TradeProposalResponse.model_validate(proposal)
+
+
+class ScannerSettingsResponse(BaseModel):
+    #: Whether the scheduled rotating scan runs (when the worker is up).
+    auto_run_enabled: bool
+
+
+class ScannerSettingsUpdate(BaseModel):
+    auto_run_enabled: bool
+
+
+@router.get("/settings", response_model=ScannerSettingsResponse)
+async def get_scanner_settings(
+    context: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+) -> ScannerSettingsResponse:
+    return ScannerSettingsResponse(auto_run_enabled=await scanner_auto_run_enabled(db))
+
+
+@router.put("/settings", response_model=ScannerSettingsResponse)
+async def update_scanner_settings(
+    payload: ScannerSettingsUpdate,
+    context: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_csrf),
+) -> ScannerSettingsResponse:
+    """Turn the scheduled rotating scan on or off. Audited; manual scans are unaffected."""
+    await set_bool_setting(
+        db,
+        SCANNER_AUTORUN_KEY,
+        payload.auto_run_enabled,
+        description="Whether the scheduled rotating scan runs.",
+        is_sensitive=False,
+        user_id=context.user.id,
+    )
+    await AuditService(db).record(
+        kind=AuditEventKind.SETTING_CHANGED,
+        summary=f"Scheduled scanning {'enabled' if payload.auto_run_enabled else 'disabled'}",
+        actor_kind=ActorKind.USER,
+        actor_user_id=context.user.id,
+        subject_type="system_setting",
+        subject_id=SCANNER_AUTORUN_KEY,
+        payload={"auto_run_enabled": payload.auto_run_enabled},
+    )
+    await db.commit()
+    return ScannerSettingsResponse(auto_run_enabled=await scanner_auto_run_enabled(db))
 
 
 # Re-exported so the approvals router can reuse the schema.

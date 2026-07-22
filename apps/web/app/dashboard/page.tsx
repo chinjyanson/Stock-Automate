@@ -54,8 +54,8 @@ export default function DashboardPage() {
       // user needs during an outage.
       const [healthR, accountR, positionsR, auditR, liveR] = await Promise.allSettled([
         api.health(),
-        api.account(),
-        api.positions(),
+        api.activeAccount(),
+        api.activePositions(),
         api.audit(15),
         api.liveStatus(),
       ]);
@@ -104,11 +104,6 @@ export default function DashboardPage() {
     }
   }
 
-  async function onLogout() {
-    await api.logout();
-    router.push("/login");
-  }
-
   if (loading) {
     return (
       <main className="mx-auto max-w-5xl px-6 py-10">
@@ -121,33 +116,11 @@ export default function DashboardPage() {
 
   return (
     <main className="mx-auto max-w-5xl space-y-6 px-6 py-10">
-      <header className="flex items-baseline justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold">Dashboard</h1>
-          <p className="text-sm text-[var(--color-ink-muted)]">
-            {health ? `${health.environment} · v${health.version}` : "—"}
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <a
-            href="/scanner"
-            className="rounded-md border border-[var(--color-border-subtle)] px-3 py-1.5 text-sm"
-          >
-            Scanner
-          </a>
-          <a
-            href="/portfolio"
-            className="rounded-md border border-[var(--color-border-subtle)] px-3 py-1.5 text-sm"
-          >
-            Portfolio
-          </a>
-          <button
-            onClick={onLogout}
-            className="rounded-md border border-[var(--color-border-subtle)] px-3 py-1.5 text-sm"
-          >
-            Sign out
-          </button>
-        </div>
+      <header>
+        <h1 className="text-2xl font-semibold">Dashboard</h1>
+        <p className="text-sm text-[var(--color-ink-muted)]">
+          {health ? `${health.environment} · v${health.version}` : "—"}
+        </p>
       </header>
 
       <ModeBanner account={account} liveStatus={liveStatus} />
@@ -178,9 +151,10 @@ export default function DashboardPage() {
           <button
             onClick={onSync}
             disabled={syncing}
-            className="rounded-md bg-[var(--color-paper)] px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+            title="The broker catalogue is re-synced automatically every day; this forces it now."
+            className="rounded-md border border-[var(--color-border-subtle)] px-3 py-1.5 text-sm disabled:opacity-50"
           >
-            {syncing ? "Syncing…" : "Sync from broker"}
+            {syncing ? "Syncing…" : "Re-sync now"}
           </button>
         </div>
         <div className="px-4 py-3 text-sm">
@@ -201,8 +175,10 @@ export default function DashboardPage() {
             </p>
           ) : (
             <p className="text-[var(--color-ink-muted)]">
-              Synchronising the catalogue does not make anything tradable — instruments
-              must be added to the Bot Universe explicitly.
+              The broker catalogue re-syncs automatically every day — you don&apos;t need to
+              do this by hand. It keeps up with delistings, availability and trade-size
+              changes; it never makes anything tradable on its own (instruments join the Bot
+              Universe explicitly).
             </p>
           )}
         </div>

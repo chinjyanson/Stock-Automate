@@ -10,6 +10,7 @@ silent skip.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
@@ -84,6 +85,7 @@ class RiskEngine:
         candles: list[Candle],
         benchmark_candles: list[Candle] | None = None,
         broker: BrokerKind = BrokerKind.INTERNAL_PAPER,
+        equity_ceiling: Decimal | None = None,
     ) -> RiskDecision:
         # 1. Fail-closed gates, before any sizing. -------------------------
         if config is None:
@@ -128,7 +130,12 @@ class RiskEngine:
         if stop_price <= 0:
             return RiskDecision.reject("Computed stop is at or below zero.")
 
+        # For live, the arming session's affirmed capital ceiling bounds the
+        # equity the whole sizing scales against — you cannot deploy more than
+        # you said you would, even if the account holds more.
         equity = account.total
+        if equity_ceiling is not None:
+            equity = min(equity, equity_ceiling)
         if equity <= 0:
             return RiskDecision.reject("Account equity is not positive.")
         risk_budget = equity * Decimal(str(config.risk_per_trade_pct))
@@ -152,7 +159,8 @@ class RiskEngine:
         instrument_room = equity * Decimal(str(config.max_instrument_pct)) - held_value
         caps["max_instrument_pct"] = max(instrument_room, Decimal(0)) / entry_price
 
-        caps["available_cash"] = account.free_for_trading / entry_price
+        # Cash available, but never more than the (possibly ceiling-bounded) equity.
+        caps["available_cash"] = min(account.free_for_trading, equity) / entry_price
 
         open_risk = await self._open_risk(broker)
         open_risk_room = equity * Decimal(str(config.max_total_open_risk_pct)) - open_risk
@@ -166,13 +174,20 @@ class RiskEngine:
         quantity = caps[binding_cap]
 
         # 5. Correlation — reduce (never merely warn). ---------------------
+        # Six "diversified" positions that are all really one S&P bet is the
+        # failure this prevents. If the candidate is benchmark-correlated *and*
+        # the book already carries too much benchmark-correlated exposure, cut
+        # the size. Exposure is measured position-by-position (each holding's own
+        # correlation to the benchmark), not by gross invested — that is the
+        # Phase 4 refinement over the earlier approximation.
         correlation: float | None = None
         applied_caps = [binding_cap]
         if benchmark_candles:
             correlation = self._correlation(series.close, benchmark_candles, config)
             if correlation is not None and correlation > float(config.correlation_threshold):
-                invested = account.invested or Decimal(0)
-                exposure = invested / equity if equity else Decimal(0)
+                exposure = await self._benchmark_correlated_exposure(
+                    positions, benchmark_candles, config, equity
+                )
                 if exposure > Decimal(str(config.max_portfolio_sp500_pct)):
                     quantity = quantity * CORRELATION_REDUCTION
                     applied_caps.append("correlation_reduction")
@@ -209,6 +224,51 @@ class RiskEngine:
         own_returns = ind.daily_returns(closes)  # type: ignore[arg-type]
         bench_returns = ind.daily_returns(bench.close)
         return ind.rolling_correlation(own_returns, bench_returns, window)
+
+    async def _benchmark_correlated_exposure(
+        self,
+        positions: list[BrokerPosition],
+        benchmark_candles: list[Candle],
+        config: RiskConfiguration,
+        equity: Decimal,
+    ) -> Decimal:
+        """Fraction of equity held in positions that track the benchmark.
+
+        For each open position, correlate its own daily returns against the
+        benchmark; sum the value of those above the threshold. This is the real
+        "how much of the book is one S&P bet" measure the sizing reduction acts
+        on, replacing the earlier gross-invested approximation.
+        """
+        if not benchmark_candles or equity <= 0:
+            return Decimal(0)
+        bench = candles_to_series(benchmark_candles)
+        window = int(config.correlation_window_short)
+        if bench.length < window + 1:
+            return Decimal(0)
+        bench_returns = ind.daily_returns(bench.close)
+        threshold = float(config.correlation_threshold)
+
+        correlated_value = Decimal(0)
+        for position in positions:
+            if position.quantity <= 0:
+                continue
+            try:
+                instrument_id = uuid.UUID(position.broker_ticker)
+            except ValueError:
+                continue  # non-paper venues key by ticker, not instrument id
+            candles = await self._store.get_candles(
+                instrument_id, Interval.D1, limit=window + 5, closed_only=True
+            )
+            if len(candles) < window + 1:
+                continue
+            series = candles_to_series(candles)
+            corr = ind.rolling_correlation(
+                ind.daily_returns(series.close), bench_returns, window
+            )
+            if corr is not None and corr > threshold:
+                price = position.current_price or position.average_price
+                correlated_value += position.quantity * price
+        return correlated_value / equity
 
     async def _open_risk(self, broker: BrokerKind) -> Decimal:
         """Sum of (entry - stop) * filled_qty across open, stopped intents."""

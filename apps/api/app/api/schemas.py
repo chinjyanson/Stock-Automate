@@ -323,26 +323,26 @@ class ProviderHealthResponse(BaseModel):
 # -- Live arming --------------------------------------------------------------
 
 
-class ArmLiveRequest(BaseModel):
-    """Arming live trading (§14).
+class SetLiveModeRequest(BaseModel):
+    """Point the product at paper (false) or live (true)."""
 
-    `confirmation_phrase` must be typed exactly. A checkbox is too easy to click
-    through for an action that begins risking real money.
-    """
+    live: bool
 
-    confirmation_phrase: str
-    max_live_capital: SerializedDecimal = Field(gt=0)
-    max_daily_loss: SerializedDecimal = Field(gt=0)
-    duration_minutes: int = Field(default=60, ge=1, le=1440)
+
+class SetAutonomousRequest(BaseModel):
+    """Toggle whether autonomous live trading is permitted (admin + re-auth)."""
+
+    enabled: bool
 
 
 class LiveStatusResponse(BaseModel):
     #: Server-side master switch (LIVE_TRADING_ENABLED).
     live_trading_enabled_on_server: bool
-    #: Whether an unexpired arming session exists right now.
-    is_armed: bool
-    armed_at: datetime | None = None
-    expires_at: datetime | None = None
+    #: Whether autonomous live is permitted on this server (LIVE_AUTONOMOUS_ENABLED).
+    autonomous_enabled_on_server: bool = False
+    #: True when the active venue is live (real money); false means paper.
+    live_mode: bool = False
+    #: Persistent live ceilings from the active risk configuration.
     max_live_capital: SerializedDecimal | None = None
     max_daily_loss: SerializedDecimal | None = None
     #: Everything currently preventing live trading, for display.

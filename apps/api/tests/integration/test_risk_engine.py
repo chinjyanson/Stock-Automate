@@ -8,19 +8,74 @@ active halt, or stale data.
 
 from __future__ import annotations
 
+import uuid
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import select
 
-from app.broker.types import BrokerAccount
+from app.broker.types import BrokerAccount, BrokerPosition
 from app.data.store import CandleStore
-from app.models.enums import HaltKind, HaltScope, Interval
-from app.models.instrument import Instrument
+from app.data.types import Candle as CandleDTO
+from app.models.enums import (
+    HaltKind,
+    HaltScope,
+    InstrumentKind,
+    Interval,
+    PriceUnit,
+    ProviderKind,
+)
+from app.models.instrument import Exchange, Instrument
 from app.models.risk import RiskConfiguration
 from app.risk.engine import QUANTITY_STEP, RiskEngine
 from app.risk.halts import HaltService
 
 pytestmark = pytest.mark.asyncio
+
+
+async def _rising_instrument(db: object, ticker: str) -> Instrument:
+    """An instrument with a 130-bar rising daily series (correlated to any other)."""
+    exchange = (
+        await db.execute(select(Exchange).where(Exchange.mic == "XNAS"))  # type: ignore[attr-defined]
+    ).scalar_one_or_none()
+    if exchange is None:
+        exchange = Exchange(mic="XNAS", name="Nasdaq", country="US", timezone="America/New_York")
+        db.add(exchange)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+    instrument = Instrument(
+        id=uuid.uuid4(),
+        exchange_id=exchange.id,
+        exchange_ticker=ticker,
+        name=f"{ticker} Inc.",
+        kind=InstrumentKind.STOCK,
+        currency="USD",
+        price_unit=PriceUnit.USD,
+    )
+    db.add(instrument)  # type: ignore[attr-defined]
+    await db.flush()  # type: ignore[attr-defined]
+
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    closes = [80 + i * 0.5 for i in range(130)]
+    candles = [
+        CandleDTO(
+            symbol=ticker,
+            interval=Interval.D1,
+            timestamp=now - timedelta(days=len(closes) - 1 - i),
+            open=Decimal(str(c)),
+            high=Decimal(str(c)) * Decimal("1.01"),
+            low=Decimal(str(c)) * Decimal("0.99"),
+            close=Decimal(str(c)),
+            volume=Decimal("100000"),
+            currency="USD",
+            price_unit=PriceUnit.USD,
+            provider=ProviderKind.MOCK,
+            is_closed=True,
+        )
+        for i, c in enumerate(closes)
+    ]
+    await CandleStore(db).upsert_candles(instrument.id, candles)  # type: ignore[arg-type]
+    return instrument
 
 
 def _account(cash: Decimal = Decimal("100000")) -> BrokerAccount:
@@ -145,3 +200,34 @@ class TestFailClosed:
         )
         assert decision.rejected
         assert "open-position cap" in (decision.reason or "")
+
+
+class TestCorrelation:
+    async def test_a_benchmark_correlated_book_cuts_the_size(self, db: object) -> None:
+        # A benchmark, an already-held position and a candidate that all move
+        # together — with the S&P-exposure limit set low, the candidate's size is
+        # reduced (not merely flagged).
+        benchmark = await _rising_instrument(db, "SPY")
+        held = await _rising_instrument(db, "HELD")
+        candidate = await _rising_instrument(db, "CAND")
+        config = await _seed_config(db, max_portfolio_sp500_pct=Decimal("0.10"))
+
+        # The held position is ~14.5k of a 100k book — above the 10% limit.
+        position = BrokerPosition(
+            broker_ticker=str(held.id),
+            quantity=Decimal("100"),
+            average_price=Decimal("145"),
+            current_price=Decimal("145"),
+        )
+        benchmark_candles = await _candles(db, benchmark)
+        decision = await RiskEngine(db).evaluate(  # type: ignore[arg-type]
+            instrument=candidate,
+            config=config,
+            account=_account(),
+            positions=[position],
+            candles=await _candles(db, candidate),
+            benchmark_candles=benchmark_candles,
+        )
+        assert not decision.rejected
+        assert decision.correlation is not None and decision.correlation > 0.8
+        assert "correlation_reduction" in decision.applied_caps

@@ -37,6 +37,7 @@ app = Celery(
         "worker.jobs.market_data",
         "worker.jobs.scanner",
         "worker.jobs.risk",
+        "worker.jobs.strategy",
     ],
 )
 
@@ -112,6 +113,40 @@ app.conf.beat_schedule = {
         "task": "worker.jobs.risk.generate_eod_summary",
         "schedule": crontab(hour=22, minute=15),
         "options": {"expires": 7200},
+    },
+    # Intraday data for the 15-minute strategy, refreshed through the US session.
+    # A no-op when no intraday provider is configured.
+    "refresh-intraday-candles": {
+        "task": "worker.jobs.market_data.refresh_intraday_candles",
+        "schedule": crontab(minute="*/15", hour="14-21"),
+        "options": {"expires": 900},
+    },
+    # Intraday strategies evaluate right after their data refreshes.
+    "evaluate-intraday-strategies": {
+        "task": "worker.jobs.strategy.evaluate_strategies",
+        "schedule": crontab(minute="2-59/15", hour="14-21"),
+        "kwargs": {"interval": "15m"},
+        "options": {"expires": 900},
+    },
+    # Daily strategies evaluate once, after the daily candle refresh and scan.
+    "evaluate-daily-strategies": {
+        "task": "worker.jobs.strategy.evaluate_strategies",
+        "schedule": crontab(hour=22, minute=30),
+        "kwargs": {"interval": "1d"},
+        "options": {"expires": 7200},
+    },
+    # Live loss guard: frequent, local, and cheap — auto-disarms and halts if the
+    # day's realised live loss breaches the affirmed ceiling. No-op when unarmed.
+    "live-guard": {
+        "task": "worker.jobs.risk.live_guard",
+        "schedule": crontab(minute="*/2"),
+        "options": {"expires": 120},
+    },
+    # Reconcile the live broker while the market is open. No-op without live creds.
+    "reconcile-live": {
+        "task": "worker.jobs.risk.reconcile_live",
+        "schedule": crontab(minute="*/20", hour="14-21"),
+        "options": {"expires": 1200},
     },
 }
 

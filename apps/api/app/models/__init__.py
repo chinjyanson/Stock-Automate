@@ -25,6 +25,9 @@ from app.models.enums import (
     PriceUnit,
     ProviderKind,
     QualityStatus,
+    StrategyDecisionOutcome,
+    StrategyKind,
+    StrategyRunStatus,
     TradeIntentStatus,
 )
 from app.models.instrument import (
@@ -63,6 +66,11 @@ from app.models.scanner import (
     ScannerRun,
     ScannerRunStatus,
     TradeProposal,
+)
+from app.models.strategy import (
+    StrategyConfiguration,
+    StrategyDecision,
+    StrategyRun,
 )
 from app.models.system import (
     BrokerCredential,
@@ -122,6 +130,12 @@ __all__ = [
     "ScannerResult",
     "ScannerRun",
     "ScannerRunStatus",
+    "StrategyConfiguration",
+    "StrategyDecision",
+    "StrategyDecisionOutcome",
+    "StrategyKind",
+    "StrategyRun",
+    "StrategyRunStatus",
     "SystemSetting",
     "TradeIntent",
     "TradeIntentStatus",

@@ -52,6 +52,10 @@ DEFAULT_BACKFILL_DAYS = 730
 #: Sessions re-requested on each incremental refresh (§4: "five to ten").
 DEFAULT_OVERLAP_BARS = 10
 
+#: Intraday history is short-lived and provider-budgeted, so a fresh intraday
+#: series gets days, not the years a daily series gets.
+DEFAULT_INTRADAY_BACKFILL_DAYS = 30
+
 
 @dataclass
 class IngestionResult:
@@ -168,6 +172,97 @@ class IngestionService:
             symbol=mapping.provider_symbol,
             written=result.candles_written,
             backfill=result.was_backfill,
+        )
+        return result
+
+    async def ingest_intraday(
+        self,
+        instrument: Instrument,
+        provider: MarketDataProvider,
+        *,
+        interval: Interval = Interval.M15,
+        backfill_days: int = DEFAULT_INTRADAY_BACKFILL_DAYS,
+        overlap_bars: int = DEFAULT_OVERLAP_BARS,
+        force_full_backfill: bool = False,
+    ) -> IngestionResult:
+        """Bring one instrument's intraday series up to date (§4, §8).
+
+        Same shape as `ingest_daily` — the same mapping, validation and upsert
+        path — but at an intraday interval and over a short window. The strategy
+        that reads it (§8) reads the store, never the provider.
+        """
+        result = IngestionResult(
+            instrument_id=instrument.id, interval=interval, provider=provider.kind
+        )
+        if not interval.is_intraday:
+            result.skipped_reason = f"{interval} is not an intraday interval"
+            return result
+        if not provider.supports_intraday:
+            result.skipped_reason = f"{provider.kind} does not provide intraday data"
+            return result
+
+        mapping = await self._signal_mapping(instrument.id, provider.kind)
+        if mapping is None:
+            result.skipped_reason = (
+                f"No active {provider.kind} mapping; resolve the symbol before ingesting"
+            )
+            return result
+
+        if force_full_backfill:
+            start, end = datetime.now(UTC) - timedelta(days=backfill_days), datetime.now(UTC)
+            result.was_backfill = True
+        else:
+            start, end = await self._store.incremental_refresh_window(
+                instrument.id, interval, overlap_bars=overlap_bars, full_backfill_days=backfill_days
+            )
+            result.was_backfill = (await self._store.count_candles(instrument.id, interval)) == 0
+
+        result.window_start, result.window_end = start, end
+
+        try:
+            candles = await provider.get_intraday_candles(
+                mapping.provider_symbol, interval.value, start, end
+            )
+        except ProviderQuotaExceededError as exc:
+            result.skipped_reason = f"Provider budget exhausted: {exc}"
+            log.warning(
+                "ingestion.quota_exhausted",
+                instrument_id=str(instrument.id),
+                provider=str(provider.kind),
+                interval=interval.value,
+            )
+            return result
+        except ProviderError as exc:
+            result.errors.append(str(exc))
+            mapping.last_error = str(exc)
+            await self._store.record_quality_event(
+                instrument_id=instrument.id,
+                kind=DataQualityEventKind.BACKFILL_GAP,
+                severity="error",
+                interval=interval,
+                detail=f"{provider.kind} intraday failed for {mapping.provider_symbol}: {exc}",
+            )
+            return result
+
+        if not candles:
+            result.skipped_reason = "Provider returned no candles for the requested window"
+            return result
+
+        validated = await self._validate(instrument, candles, result)
+        if not validated:
+            return result
+
+        result.candles_written = await self._store.upsert_candles(
+            instrument.id, validated, series_type=DataSeriesType.RAW
+        )
+        mapping.last_verified_at = datetime.now(UTC)
+        mapping.last_error = None
+        log.info(
+            "ingestion.intraday_completed",
+            instrument_id=str(instrument.id),
+            symbol=mapping.provider_symbol,
+            interval=interval.value,
+            written=result.candles_written,
         )
         return result
 

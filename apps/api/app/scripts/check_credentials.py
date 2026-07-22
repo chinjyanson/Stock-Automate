@@ -365,7 +365,7 @@ def _render(results: list[CheckResult], settings: Settings) -> None:
     if _unwrap(settings.trading212_live_api_key) and not settings.live_trading_enabled:
         print(
             "  Note: a live credential is present but LIVE_TRADING_ENABLED=false, so it\n"
-            "  is inert. Nothing before Phase 6 can use it.\n"
+            "  is inert until live trading is enabled and armed (Phase 5).\n"
         )
 
 

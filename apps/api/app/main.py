@@ -22,6 +22,7 @@ from app.api.routes import (
     portfolio,
     risk,
     scanner,
+    strategies,
 )
 from app.broker.factory import BrokerNotConfiguredError, LiveTradingDisabledError
 from app.broker.types import BrokerAuthError, BrokerError, BrokerRateLimitError
@@ -280,3 +281,4 @@ app.include_router(audit.router)
 app.include_router(live.router)
 app.include_router(portfolio.router)
 app.include_router(risk.router)
+app.include_router(strategies.router)

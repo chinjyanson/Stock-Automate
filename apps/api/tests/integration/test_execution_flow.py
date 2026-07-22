@@ -56,7 +56,10 @@ class TestHappyPath:
         await _seed_config(db)
         proposal = await _proposal_id(db, candled_instrument, approver)
 
-        executed = await ExecutionService(db).execute_approved(  # type: ignore[arg-type]
+        executed = await ExecutionService(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).execute_approved(
             proposal, actor_user_id=approver
         )
         await db.commit()  # type: ignore[attr-defined]
@@ -85,7 +88,7 @@ class TestHappyPath:
     ) -> None:
         await _seed_config(db)
         proposal = await _proposal_id(db, candled_instrument, approver)
-        service = ExecutionService(db)  # type: ignore[arg-type]
+        service = ExecutionService(db, broker=InternalPaperBroker(db))  # type: ignore[arg-type]
 
         await service.execute_approved(proposal, actor_user_id=approver)
         await db.commit()  # type: ignore[attr-defined]
@@ -116,7 +119,10 @@ class TestRiskRefusal:
         )
         await db.commit()  # type: ignore[attr-defined]
 
-        executed = await ExecutionService(db).execute_approved(  # type: ignore[arg-type]
+        executed = await ExecutionService(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).execute_approved(
             proposal, actor_user_id=approver
         )
         await db.commit()  # type: ignore[attr-defined]
@@ -131,7 +137,10 @@ class TestRiskRefusal:
     ) -> None:
         # No RiskConfiguration seeded — the engine fails closed.
         proposal = await _proposal_id(db, candled_instrument, approver)
-        executed = await ExecutionService(db).execute_approved(  # type: ignore[arg-type]
+        executed = await ExecutionService(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).execute_approved(
             proposal, actor_user_id=approver
         )
         await db.commit()  # type: ignore[attr-defined]
@@ -155,4 +164,7 @@ class TestRiskRefusal:
 
         # Pending, not approved — execution must refuse.
         with pytest.raises(ExecutionError, match="APPROVED"):
-            await ExecutionService(db).execute_approved(proposal, actor_user_id=approver)  # type: ignore[arg-type]
+            await ExecutionService(
+                db,  # type: ignore[arg-type]
+                broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+            ).execute_approved(proposal, actor_user_id=approver)

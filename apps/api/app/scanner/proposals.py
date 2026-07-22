@@ -83,6 +83,56 @@ class ProposalService:
         instrument = await self._session.get(Instrument, result.instrument_id)
         if instrument is None:
             raise ProposalError("Instrument no longer exists")
+
+        top_signals = (result.positive_signals or {}).get("items", [])[:3]
+        reason = (
+            f"Screening score {result.core_score} "
+            f"({', '.join(top_signals) if top_signals else 'passes the configured screen'})"
+        )
+        return await self._propose_long(
+            instrument,
+            inputs,
+            reason=reason,
+            scanner_result_id=result.id,
+            actor_user_id=actor_user_id,
+        )
+
+    async def propose_from_signal(
+        self,
+        instrument: Instrument,
+        inputs: ProposalInputs,
+        *,
+        reason: str,
+        actor_user_id: uuid.UUID | None = None,
+    ) -> TradeProposal:
+        """Generate a long proposal from a strategy signal (§8).
+
+        Same volatility-adjusted sizing as a scanner-sourced proposal, but the
+        reason is the strategy's and there is no scanner result behind it. The
+        risk engine still gates the resulting order downstream.
+        """
+        return await self._propose_long(
+            instrument,
+            inputs,
+            reason=reason,
+            scanner_result_id=None,
+            actor_user_id=actor_user_id,
+        )
+
+    async def _propose_long(
+        self,
+        instrument: Instrument,
+        inputs: ProposalInputs,
+        *,
+        reason: str,
+        scanner_result_id: uuid.UUID | None,
+        actor_user_id: uuid.UUID | None,
+    ) -> TradeProposal:
+        """Shared long-proposal builder: size, stop, duplicate-guard, audit.
+
+        The single place that turns "buy this instrument" into a sized, stopped
+        `TradeProposal`, whatever produced the intent (scanner or strategy).
+        """
         if instrument.suspended_at is not None:
             raise ProposalError(f"{instrument.name} is suspended")
 
@@ -124,12 +174,6 @@ class ProposalService:
         risk_amount = (quantity * stop_distance).quantize(Decimal("0.0001"))
         risk_pct = (risk_amount / inputs.account_equity).quantize(Decimal("0.000001"))
 
-        top_signals = (result.positive_signals or {}).get("items", [])[:3]
-        reason = (
-            f"Screening score {result.core_score} "
-            f"({', '.join(top_signals) if top_signals else 'passes the configured screen'})"
-        )
-
         # Guard: refuse a duplicate pending proposal for the same instrument.
         existing = await self._pending_proposal_for(instrument.id)
         if existing is not None:
@@ -139,7 +183,7 @@ class ProposalService:
             )
 
         proposal = TradeProposal(
-            scanner_result_id=result.id,
+            scanner_result_id=scanner_result_id,
             instrument_id=instrument.id,
             status=ProposalStatus.PENDING_APPROVAL,
             side=OrderSide.BUY,
@@ -173,7 +217,7 @@ class ProposalService:
                 "stop_price": str(stop_price),
                 "risk_amount": str(risk_amount),
                 "risk_pct": str(risk_pct),
-                "scanner_result_id": str(result.id),
+                "scanner_result_id": str(scanner_result_id) if scanner_result_id else None,
             },
         )
         log.info("proposal.created", proposal_id=str(proposal.id), instrument=instrument.name)
