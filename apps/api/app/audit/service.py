@@ -45,7 +45,6 @@ _REDACTED_KEYS = frozenset(
         "session_token",
         "private_key",
         "encrypted_api_key",
-        "vapid_private_key",
     }
 )
 

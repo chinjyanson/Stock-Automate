@@ -18,6 +18,9 @@ import asyncio
 from typing import Any
 
 import structlog
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.broker.factory import (
     BrokerNotConfiguredError,
     LiveTradingDisabledError,
@@ -25,12 +28,15 @@ from app.broker.factory import (
 )
 from app.db import session_scope
 from app.models.enums import BrokerKind
+from app.models.reporting import DailyAccountSummary
+from app.models.user import User
 from app.risk.config import load_active_risk_config
 from app.risk.live_guard import LiveGuardService
 from app.risk.stops import StopService
 from app.services.eod import EODSummaryService
+from app.services.email import BrevoEmailService
 from app.services.reconciliation import ReconciliationService
-from app.services.system_settings import active_broker_kind
+from app.services.system_settings import active_broker_kind, eod_digest_enabled
 
 from worker.app import app
 
@@ -95,6 +101,68 @@ def reconcile_broker(self) -> dict[str, Any]:  # type: ignore[no-untyped-def]
         raise self.retry(exc=exc, countdown=120 * (2**self.request.retries)) from exc
 
 
+def _money(value: Any, currency: str) -> str:
+    """Plain money formatting for the email body (no locale dependency)."""
+    if value is None:
+        return "—"
+    return f"{currency} {value:,.2f}"
+
+
+def _render_digest_html(summary: DailyAccountSummary) -> str:
+    ccy = summary.currency
+    rows = [
+        ("Equity", _money(summary.equity, ccy)),
+        ("Change vs. prior day", _money(summary.equity_change, ccy)),
+        ("Realised P/L", _money(summary.realised_pnl, ccy)),
+        ("Unrealised P/L", _money(summary.unrealised_pnl, ccy)),
+        ("Cash", _money(summary.cash, ccy)),
+        ("Invested", _money(summary.invested, ccy)),
+        ("Open positions", str(summary.open_positions)),
+        ("Trades today", str(summary.trades_today)),
+        ("Active halts", str(summary.active_halts)),
+    ]
+    body = "".join(
+        f'<tr><td style="padding:4px 12px 4px 0;color:#57606a;">{label}</td>'
+        f'<td style="padding:4px 0;font-weight:600;">{value}</td></tr>'
+        for label, value in rows
+    )
+    return (
+        f'<div style="font-family:system-ui,sans-serif;max-width:520px;">'
+        f"<h2 style=\"margin:0 0 4px;\">End-of-day summary</h2>"
+        f'<p style="margin:0 0 16px;color:#57606a;">{summary.summary_date.isoformat()} '
+        f"· {summary.broker.value.replace('_', ' ')}</p>"
+        f'<table style="border-collapse:collapse;font-size:14px;">{body}</table>'
+        f'<p style="margin:16px 0 0;font-size:12px;color:#8b949e;">'
+        f"This is an automated summary. Nothing here is investment advice.</p></div>"
+    )
+
+
+async def _send_eod_digest(session: AsyncSession, summary: DailyAccountSummary) -> None:
+    """Email the summary to every account, if the digest is enabled. Fail-soft.
+
+    Sending is best-effort: `BrevoEmailService.send` never raises, and any other
+    error here is caught by the caller so a mail problem cannot fail the job that
+    already persisted the summary.
+    """
+    if not await eod_digest_enabled(session):
+        return
+    email = BrevoEmailService()
+    if not email.is_configured:
+        log.info("job.generate_eod_summary.digest_skipped", reason="brevo not configured")
+        return
+
+    users = (await session.execute(select(User).where(User.is_active.is_(True)))).scalars().all()
+    subject = f"EOD summary — {summary.summary_date.isoformat()}"
+    html = _render_digest_html(summary)
+    sent = 0
+    for user in users:
+        if await email.send(
+            to_email=user.email, to_name=user.display_name, subject=subject, html=html
+        ):
+            sent += 1
+    log.info("job.generate_eod_summary.digest_sent", recipients=len(users), sent=sent)
+
+
 async def _generate_eod() -> dict[str, Any]:
     async with session_scope() as session:
         broker = resolve_broker(await active_broker_kind(session), session=session)
@@ -102,6 +170,10 @@ async def _generate_eod() -> dict[str, Any]:
             summary = await EODSummaryService(session).generate(broker)
         finally:
             await broker.close()
+        try:
+            await _send_eod_digest(session, summary)
+        except Exception as exc:  # a mail failure must never fail the summary job
+            log.warning("job.generate_eod_summary.digest_failed", error=str(exc))
         return {
             "date": summary.summary_date.isoformat(),
             "equity": str(summary.equity),

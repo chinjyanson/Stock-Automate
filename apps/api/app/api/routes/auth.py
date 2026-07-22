@@ -9,12 +9,21 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.schemas import (
+    DisplayNameUpdate,
+    EmailUpdate,
     LoginRequest,
+    PasswordUpdate,
     ReauthRequest,
     SessionResponse,
     UserResponse,
 )
-from app.auth.dependencies import CSRF_COOKIE, AuthContext, get_auth_context, require_csrf
+from app.auth.dependencies import (
+    CSRF_COOKIE,
+    AuthContext,
+    get_auth_context,
+    require_csrf,
+    require_recent_reauth,
+)
 from app.auth.service import AuthError, AuthService
 from app.config import get_settings
 from app.db import get_db
@@ -155,3 +164,61 @@ async def reauthenticate(
         csrf_token=request.cookies.get(CSRF_COOKIE, ""),
         is_recently_reauthenticated=True,
     )
+
+
+def _session_response(request: Request, context: AuthContext) -> SessionResponse:
+    return SessionResponse(
+        user=UserResponse.model_validate(context.user),
+        expires_at=context.session.expires_at,
+        csrf_token=request.cookies.get(CSRF_COOKIE, ""),
+        is_recently_reauthenticated=context.is_recently_reauthenticated,
+    )
+
+
+@router.patch("/display-name", response_model=SessionResponse)
+async def update_display_name(
+    payload: DisplayNameUpdate,
+    request: Request,
+    context: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_csrf),
+) -> SessionResponse:
+    """Change the account display name. Not a credential — no re-auth required."""
+    await AuthService(db).update_display_name(context.user, payload.display_name)
+    await db.commit()
+    return _session_response(request, context)
+
+
+@router.patch("/email", response_model=SessionResponse)
+async def update_email(
+    payload: EmailUpdate,
+    request: Request,
+    context: AuthContext = Depends(require_recent_reauth),
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_csrf),
+) -> SessionResponse:
+    """Change the login email. Guarded by a fresh password proof (§17)."""
+    try:
+        await AuthService(db).update_email(context.user, payload.email)
+    except AuthError as exc:
+        await db.commit()  # persist the audit trail for the rejected attempt
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    await db.commit()
+    return _session_response(request, context)
+
+
+@router.post("/password", response_model=SessionResponse)
+async def change_password(
+    payload: PasswordUpdate,
+    request: Request,
+    context: AuthContext = Depends(require_recent_reauth),
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_csrf),
+) -> SessionResponse:
+    """Set a new password. Guarded by a fresh password proof (§17)."""
+    try:
+        await AuthService(db).change_password(context.user, payload.new_password)
+    except AuthError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    await db.commit()
+    return _session_response(request, context)

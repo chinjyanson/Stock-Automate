@@ -30,6 +30,9 @@ AUTONOMOUS_LIVE_KEY = "live.autonomous_enabled"
 #: Runtime key for the scheduled-scan toggle.
 SCANNER_AUTORUN_KEY = "scanner.auto_run_enabled"
 
+#: Runtime key for the daily end-of-day email digest toggle.
+EOD_DIGEST_KEY = "notifications.eod_digest_enabled"
+
 #: Runtime key for the paper/live venue toggle. False = paper, True = live.
 TRADING_LIVE_MODE_KEY = "trading.live_mode"
 
@@ -80,6 +83,15 @@ async def scanner_auto_run_enabled(session: AsyncSession) -> bool:
     return await get_bool_setting(
         session, SCANNER_AUTORUN_KEY, env_default=get_settings().scanner_auto_run_enabled
     )
+
+
+async def eod_digest_enabled(session: AsyncSession) -> bool:
+    """Whether the daily EOD summary is emailed — DB overlay over the env default.
+
+    Off by default: emailing account activity is opt-in, and the digest is a
+    no-op anyway until Brevo credentials are configured.
+    """
+    return await get_bool_setting(session, EOD_DIGEST_KEY, env_default=False)
 
 
 async def live_mode_enabled(session: AsyncSession) -> bool:

@@ -10,6 +10,7 @@ import {
   type StrategyDecision,
   api,
 } from "@/lib/api";
+import { useToast } from "@/components/Toast";
 
 const OUTCOME_COLOUR: Record<string, string> = {
   executed: "var(--color-ok)",
@@ -21,6 +22,7 @@ const OUTCOME_COLOUR: Record<string, string> = {
 
 export default function StrategiesPage() {
   const router = useRouter();
+  const toast = useToast();
   const [strategies, setStrategies] = useState<StrategyConfig[]>([]);
   const [decisions, setDecisions] = useState<StrategyDecision[]>([]);
   const [instruments, setInstruments] = useState<Instrument[]>([]);
@@ -28,7 +30,6 @@ export default function StrategiesPage() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [note, setNote] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -72,12 +73,12 @@ export default function StrategiesPage() {
 
   async function onToggleActive(strategy: StrategyConfig) {
     setBusyId(strategy.id);
-    setError(null);
     try {
       await api.updateStrategy(strategy.id, { is_active: !strategy.is_active });
+      toast.success(`${strategy.name} ${strategy.is_active ? "deactivated" : "activated"}.`);
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not update the strategy");
+      toast.error(err instanceof ApiError ? err.message : "Could not update the strategy");
     } finally {
       setBusyId(null);
     }
@@ -85,17 +86,15 @@ export default function StrategiesPage() {
 
   async function onRun(strategy: StrategyConfig) {
     setBusyId(strategy.id);
-    setError(null);
-    setNote(null);
     try {
       const result = await api.runStrategy(strategy.id);
-      setNote(
+      toast.success(
         `${strategy.name}: ${result.signals} signal(s), ${result.executed} executed, ` +
           `${result.rejected} rejected.`,
       );
       await load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Could not run the strategy");
+      toast.error(err instanceof ApiError ? err.message : "Could not run the strategy");
     } finally {
       setBusyId(null);
     }
@@ -122,11 +121,6 @@ export default function StrategiesPage() {
       {error && (
         <div className="rounded-lg border border-[var(--color-warn)] bg-[var(--color-surface-muted)] px-4 py-3 text-sm">
           {error}
-        </div>
-      )}
-      {note && (
-        <div className="rounded-lg border border-[var(--color-border-subtle)] bg-[var(--color-surface-muted)] px-4 py-3 text-sm">
-          {note}
         </div>
       )}
 
@@ -197,7 +191,6 @@ export default function StrategiesPage() {
                     strategy={s}
                     nameFor={nameFor}
                     onSaved={load}
-                    onError={setError}
                     onClose={() => setEditingId(null)}
                   />
                 )}
@@ -280,15 +273,14 @@ function UniverseEditor({
   strategy,
   nameFor,
   onSaved,
-  onError,
   onClose,
 }: {
   strategy: StrategyConfig;
   nameFor: (id: string) => string;
   onSaved: () => Promise<void>;
-  onError: (m: string) => void;
   onClose: () => void;
 }) {
+  const toast = useToast();
   const isPie = strategy.kind === "pie_rebalance";
   const [entries, setEntries] = useState<UniverseEntry[]>(() =>
     initialEntries(strategy, nameFor),
@@ -341,13 +333,13 @@ function UniverseEditor({
       ? { weights: Object.fromEntries(entries.map((e) => [e.id, Number(e.weight) || 0])) }
       : { instrument_ids: entries.map((e) => e.id) };
     setSaving(true);
-    onError("");
     try {
       await api.updateStrategy(strategy.id, { universe });
+      toast.success(`Universe saved for ${strategy.name}.`);
       await onSaved();
       onClose();
     } catch (err) {
-      onError(err instanceof ApiError ? err.message : "Could not save the universe");
+      toast.error(err instanceof ApiError ? err.message : "Could not save the universe");
     } finally {
       setSaving(false);
     }

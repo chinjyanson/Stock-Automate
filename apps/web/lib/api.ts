@@ -482,6 +482,27 @@ export const api = {
       body: JSON.stringify({ password }),
     }),
 
+  /** Change the account display name. Not a credential — no re-auth needed. */
+  updateDisplayName: (displayName: string | null) =>
+    request("/auth/display-name", sessionSchema, {
+      method: "PATCH",
+      body: JSON.stringify({ display_name: displayName }),
+    }),
+
+  /** Change the login email. Requires a fresh re-auth (403 otherwise). */
+  updateEmail: (email: string) =>
+    request("/auth/email", sessionSchema, {
+      method: "PATCH",
+      body: JSON.stringify({ email }),
+    }),
+
+  /** Set a new password. Requires a fresh re-auth (403 otherwise). */
+  changePassword: (newPassword: string) =>
+    request("/auth/password", sessionSchema, {
+      method: "POST",
+      body: JSON.stringify({ new_password: newPassword }),
+    }),
+
   me: () => request("/auth/me", sessionSchema),
 
   account: () => request("/account", accountSchema),
@@ -597,6 +618,16 @@ export const api = {
 
   runEodSummary: () =>
     request("/portfolio/summaries/run", dailySummarySchema, { method: "POST" }),
+
+  // -- Notification preferences --
+  notificationSettings: () =>
+    request("/notifications/settings", z.object({ eod_digest_enabled: z.boolean() })),
+
+  setEodDigest: (enabled: boolean) =>
+    request("/notifications/settings", z.object({ eod_digest_enabled: z.boolean() }), {
+      method: "PUT",
+      body: JSON.stringify({ eod_digest_enabled: enabled }),
+    }),
 
   // -- Strategies (Phase 4) --
   strategies: () => request("/strategies", z.array(strategyConfigSchema)),

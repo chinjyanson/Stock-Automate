@@ -9,6 +9,7 @@ import {
   type ScannerResultDetail,
   api,
 } from "@/lib/api";
+import { useToast } from "@/components/Toast";
 
 const CLASSIFICATION_LABEL: Record<string, string> = {
   screening_candidate: "Screening candidate",
@@ -27,6 +28,7 @@ const COLUMN_COUNT = 9;
 
 export default function ScannerPage() {
   const router = useRouter();
+  const toast = useToast();
   const [results, setResults] = useState<ScannerResult[]>([]);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
@@ -66,12 +68,16 @@ export default function ScannerPage() {
     setRunning(true);
     setError(null);
     try {
-      await api.runScanner({ limit: 200 });
+      const run = await api.runScanner({ limit: 200 });
+      toast.success(
+        `Scan complete — ${run.instruments_scored} scored, ` +
+          `${run.screening_candidates} screening / ${run.watchlist_candidates} watchlist candidates.`,
+      );
       setDetails({});
       setExpandedId(null);
       await load();
     } catch (err) {
-      setError(
+      toast.error(
         err instanceof ApiError || err instanceof ApiUnreachableError ? err.message : "Scan failed",
       );
     } finally {

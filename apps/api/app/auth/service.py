@@ -88,6 +88,66 @@ class AuthService:
         )
         return user
 
+    async def update_display_name(self, user: User, display_name: str | None) -> User:
+        """Change the account's display name. Not a credential — no re-auth needed."""
+        cleaned = display_name.strip() if display_name else None
+        user.display_name = cleaned or None
+        await self._session.flush()
+        await self._audit.record(
+            kind=AuditEventKind.SETTING_CHANGED,
+            summary="Display name updated",
+            actor_kind=ActorKind.USER,
+            actor_user_id=user.id,
+            subject_type="user",
+            subject_id=str(user.id),
+        )
+        return user
+
+    async def update_email(self, user: User, new_email: str) -> User:
+        """Change the login email. Caller must have enforced a fresh re-auth.
+
+        The email is the login identifier, so a change is a credential change:
+        it is audited, and a collision with another account is refused rather
+        than silently swallowed.
+        """
+        cleaned = new_email.strip().lower()
+        existing = (
+            await self._session.execute(select(User).where(User.email == cleaned))
+        ).scalar_one_or_none()
+        if existing is not None and existing.id != user.id:
+            raise AuthError("That email is already in use")
+
+        old_email = user.email
+        user.email = cleaned
+        await self._session.flush()
+        await self._audit.record(
+            kind=AuditEventKind.CREDENTIAL_CHANGED,
+            summary=f"Account email changed from {old_email} to {cleaned}",
+            actor_kind=ActorKind.USER,
+            actor_user_id=user.id,
+            subject_type="user",
+            subject_id=str(user.id),
+            payload={"old_email": old_email, "new_email": cleaned},
+        )
+        return user
+
+    async def change_password(self, user: User, new_password: str) -> User:
+        """Set a new password. Caller must have enforced a fresh re-auth."""
+        if len(new_password) < 12:
+            raise AuthError("Password must be at least 12 characters")
+        user.password_hash = hash_password(new_password)
+        await self._session.flush()
+        await self._audit.record(
+            kind=AuditEventKind.CREDENTIAL_CHANGED,
+            summary="Account password changed",
+            actor_kind=ActorKind.USER,
+            actor_user_id=user.id,
+            subject_type="user",
+            subject_id=str(user.id),
+            # Never any password material, hashed or otherwise.
+        )
+        return user
+
     async def authenticate(
         self,
         *,

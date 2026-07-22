@@ -40,6 +40,18 @@ class ReauthRequest(BaseModel):
     password: str = Field(min_length=1, max_length=1024)
 
 
+class DisplayNameUpdate(BaseModel):
+    display_name: str | None = Field(default=None, max_length=120)
+
+
+class EmailUpdate(BaseModel):
+    email: EmailStr
+
+
+class PasswordUpdate(BaseModel):
+    new_password: str = Field(min_length=12, max_length=1024)
+
+
 class UserResponse(ORMModel):
     id: uuid.UUID
     email: str

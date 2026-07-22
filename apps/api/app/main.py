@@ -19,6 +19,7 @@ from app.api.routes import (
     health,
     instruments,
     live,
+    notifications,
     portfolio,
     risk,
     scanner,
@@ -279,6 +280,7 @@ app.include_router(scanner.router)
 app.include_router(approvals.router)
 app.include_router(audit.router)
 app.include_router(live.router)
+app.include_router(notifications.router)
 app.include_router(portfolio.router)
 app.include_router(risk.router)
 app.include_router(strategies.router)

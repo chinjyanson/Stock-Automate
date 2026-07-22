@@ -30,6 +30,11 @@ from app.models.market_data import Candle
 from app.models.scanner import Classification, ScannerConfiguration, ScannerResult
 from app.scanner.engine import MIN_BARS_TO_SCORE
 
+#: Upper bound on the rotation candidate pool fetched per scan, before the
+#: per-scan instrument cap is applied. A safety bound on the query, not the
+#: scan size.
+_ROTATION_POOL_LIMIT = 2000
+
 
 async def select_instruments(
     session: AsyncSession,
@@ -67,8 +72,11 @@ async def select_instruments(
     _extend(await _watchlist_instrument_ids(session))
     # Tier 2: previously high-ranking candidates.
     _extend(await _previous_candidate_ids(session))
-    # Tiers 3+4: the rotating sweep, oldest-scanned first.
-    _extend(await _rotation_ids(session, configuration))
+    # Tiers 3+4: the rotating sweep, oldest-scanned first. Restricted to the
+    # instruments that can actually be scored, so the sweep's cap and ordering
+    # operate within the scannable set rather than being saturated by the far
+    # larger pool of never-scanned instruments that have no stored history.
+    _extend(await _rotation_ids(session, configuration, eligible_ids))
 
     chosen_ids = ordered_ids[:max_instruments]
     if not chosen_ids:
@@ -120,12 +128,19 @@ async def _previous_candidate_ids(session: AsyncSession) -> list[uuid.UUID]:
 
 
 async def _rotation_ids(
-    session: AsyncSession, config: ScannerConfiguration | None
+    session: AsyncSession,
+    config: ScannerConfiguration | None,
+    eligible_ids: set[uuid.UUID],
 ) -> list[uuid.UUID]:
     conditions = [
         Instrument.is_scanner_eligible.is_(True),
         Instrument.suspended_at.is_(None),
         Instrument.lifecycle_state != LifecycleState.ARCHIVED,
+        # Only sweep instruments that can be scored. Without this, a catalogue
+        # dominated by never-scanned, history-less instruments fills the whole
+        # `last_scanned_at NULLS FIRST` window below, and the scannable ones —
+        # which have been scanned and so sort last — never make the cut.
+        Instrument.id.in_(eligible_ids),
     ]
 
     stmt = select(Instrument.id)
@@ -140,7 +155,7 @@ async def _rotation_ids(
     stmt = (
         stmt.where(and_(*conditions))
         .order_by(Instrument.last_scanned_at.asc().nulls_first())
-        .limit(2000)
+        .limit(_ROTATION_POOL_LIMIT)
     )
 
     result = await session.execute(stmt)

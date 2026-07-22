@@ -129,10 +129,13 @@ class Settings(BaseSettings):
     require_closed_candles: bool = True
     min_history_days_for_signal: int = 252
 
-    # -- Push notifications -------------------------------------------------
-    vapid_public_key: str | None = None
-    vapid_private_key: SecretStr | None = None
-    vapid_subject: str = "mailto:you@example.com"
+    # -- Transactional email (Brevo) ----------------------------------------
+    # The daily EOD digest is sent through Brevo's transactional API. Absent a
+    # key, email sending is a logged no-op — the platform runs unchanged, it
+    # simply does not send. The from-address must be a verified Brevo sender.
+    brevo_api_key: SecretStr | None = None
+    eod_digest_from_email: str = "noreply@example.com"
+    eod_digest_from_name: str = "Stock Automate"
 
     # -- Observability ------------------------------------------------------
     otel_enabled: bool = False

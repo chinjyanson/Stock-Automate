@@ -1,6 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
 import { NavBar } from "@/components/NavBar";
+import { ToastProvider } from "@/components/Toast";
 
 export const metadata: Metadata = {
   title: "Trading Platform",
@@ -31,8 +32,10 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className="min-h-screen antialiased">
-        <NavBar />
-        {children}
+        <ToastProvider>
+          <NavBar />
+          {children}
+        </ToastProvider>
       </body>
     </html>
   );

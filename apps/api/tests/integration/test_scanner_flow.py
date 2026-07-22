@@ -22,6 +22,7 @@ from app.models.instrument import Exchange, Instrument, MarketDataMapping
 from app.models.scanner import ProposalStatus
 from app.scanner.engine import ScannerEngine
 from app.scanner.proposals import ProposalError, ProposalInputs, ProposalService
+from app.scanner.rotation import _ROTATION_POOL_LIMIT, select_instruments
 from app.services.ingestion import IngestionService
 
 
@@ -77,6 +78,49 @@ async def scannable_instrument(db: AsyncSession) -> Instrument:
     await IngestionService(db).ingest_daily(instrument, MockMarketDataProvider(), backfill_days=400)
     await db.commit()
     return instrument
+
+
+class TestRotationSelection:
+    """The rotating sweep must not be crowded out by unscannable instruments."""
+
+    def _bare_instruments(self, count: int) -> list[Instrument]:
+        """Scanner-eligible instruments with no candles and no prior scan."""
+        return [
+            Instrument(
+                id=uuid.uuid4(),
+                isin=f"US_BARE_{i}",
+                exchange_ticker=f"BARE{i}",
+                name=f"BARE{i} Co.",
+                kind=InstrumentKind.STOCK,
+                currency="USD",
+                price_unit=PriceUnit.USD,
+                is_scanner_eligible=True,
+            )
+            for i in range(count)
+        ]
+
+    async def test_scannable_instrument_selected_even_when_history_less_dominate(
+        self, db: AsyncSession, scannable_instrument: Instrument
+    ) -> None:
+        """Regression: the sweep is restricted to instruments that can be scored.
+
+        The scannable instrument has history but a recent scan time, so under
+        `last_scanned_at ASC NULLS FIRST` it sorts *after* every never-scanned,
+        history-less instrument. With more history-less instruments than the
+        sweep's pool cap, the pre-fix query filled its whole window with
+        unscannable rows and dropped the only scorable one entirely.
+        """
+        scannable_instrument.last_scanned_at = datetime.now(UTC)
+        # One more than the pool cap, so an unfiltered sweep is 100% saturated
+        # by never-scanned, history-less instruments (which sort first).
+        db.add_all(self._bare_instruments(_ROTATION_POOL_LIMIT + 1))
+        await db.commit()
+
+        chosen, _ = await select_instruments(db, configuration=None, limit=200)
+
+        chosen_ids = {c.id for c in chosen}
+        # The scorable instrument survives; none of the history-less ones appear.
+        assert chosen_ids == {scannable_instrument.id}
 
 
 class TestScanning:
