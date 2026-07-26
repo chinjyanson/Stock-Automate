@@ -59,9 +59,7 @@ class TestHappyPath:
         executed = await ExecutionService(
             db,  # type: ignore[arg-type]
             broker=InternalPaperBroker(db),  # type: ignore[arg-type]
-        ).execute_approved(
-            proposal, actor_user_id=approver
-        )
+        ).execute_approved(proposal, actor_user_id=approver)
         await db.commit()  # type: ignore[attr-defined]
         assert executed.status is ProposalStatus.EXECUTED
 
@@ -122,9 +120,7 @@ class TestRiskRefusal:
         executed = await ExecutionService(
             db,  # type: ignore[arg-type]
             broker=InternalPaperBroker(db),  # type: ignore[arg-type]
-        ).execute_approved(
-            proposal, actor_user_id=approver
-        )
+        ).execute_approved(proposal, actor_user_id=approver)
         await db.commit()  # type: ignore[attr-defined]
         assert executed.status is ProposalStatus.REJECTED_BY_RISK
 
@@ -140,9 +136,7 @@ class TestRiskRefusal:
         executed = await ExecutionService(
             db,  # type: ignore[arg-type]
             broker=InternalPaperBroker(db),  # type: ignore[arg-type]
-        ).execute_approved(
-            proposal, actor_user_id=approver
-        )
+        ).execute_approved(proposal, actor_user_id=approver)
         await db.commit()  # type: ignore[attr-defined]
         assert executed.status is ProposalStatus.REJECTED_BY_RISK
 

@@ -86,9 +86,7 @@ class PieRebalanceStrategy(Strategy):
                 )
             else:
                 held = ctx.held_quantity(iid)
-                qty = min(
-                    held, Decimal(str(-drift_value / price)).quantize(Decimal("0.00000001"))
-                )
+                qty = min(held, Decimal(str(-drift_value / price)).quantize(Decimal("0.00000001")))
                 if qty <= 0:
                     continue
                 signals.append(

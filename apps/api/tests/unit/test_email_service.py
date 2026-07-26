@@ -7,7 +7,6 @@ asserted to make no HTTP call at all.
 from __future__ import annotations
 
 import httpx
-import pytest
 import respx
 from pydantic import SecretStr
 
@@ -39,7 +38,9 @@ class TestBrevoEmailService:
 
     @respx.mock
     async def test_configured_posts_to_brevo_with_key_header(self) -> None:
-        route = respx.post(_BREVO_SEND_URL).mock(return_value=httpx.Response(201, json={"messageId": "1"}))
+        route = respx.post(_BREVO_SEND_URL).mock(
+            return_value=httpx.Response(201, json={"messageId": "1"})
+        )
         service = BrevoEmailService(_settings(key="secret-key"))
 
         sent = await service.send(

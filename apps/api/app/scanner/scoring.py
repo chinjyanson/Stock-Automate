@@ -995,7 +995,7 @@ def _score_fundamental_value(fundamentals: dict[str, Decimal | None]) -> float |
         signals.append(SubSignal("price_to_book", True, _clamp01(1.0 - (float(ptb) - 1.0) / 4.0)))
 
     # Graham intrinsic value: fair when P/E·P/B = 22.5, so the margin of safety
-    # below that fair value is 1 − √(P/E·P/B / 22.5). ~50%+ below reads as a full
+    # below that fair value is 1 - √(P/E·P/B / 22.5). ~50%+ below reads as a full
     # signal; at or above Graham fair value it is zero. Needs both ratios.
     if pe is not None and pe > 0 and ptb is not None and ptb > 0:
         import math

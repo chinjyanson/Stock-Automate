@@ -29,8 +29,7 @@ _NEW_WEIGHTS = (
     '"liquidity": 15.0, "positioning": 10.0, "sector": 20.0}'
 )
 _OLD_WEIGHTS = (
-    '{"trend": 25.0, "momentum": 20.0, "risk": 20.0, '
-    '"liquidity": 20.0, "positioning": 15.0}'
+    '{"trend": 25.0, "momentum": 20.0, "risk": 20.0, "liquidity": 20.0, "positioning": 15.0}'
 )
 
 

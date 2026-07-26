@@ -85,9 +85,7 @@ class InternalPaperBroker(Broker):
         """Return the single paper account, creating it on first use."""
         account = (
             await self._session.execute(
-                select(PaperBrokerAccount).where(
-                    PaperBrokerAccount.currency == self._currency
-                )
+                select(PaperBrokerAccount).where(PaperBrokerAccount.currency == self._currency)
             )
         ).scalar_one_or_none()
         if account is None:
@@ -132,9 +130,7 @@ class InternalPaperBroker(Broker):
 
     async def sync_instruments(self) -> list[BrokerInstrument]:
         """The venue trades any instrument with stored candles; id is its ticker."""
-        instruments = (
-            (await self._session.execute(select(Instrument))).scalars().all()
-        )
+        instruments = (await self._session.execute(select(Instrument))).scalars().all()
         return [
             BrokerInstrument(
                 broker_ticker=str(i.id),
@@ -175,9 +171,7 @@ class InternalPaperBroker(Broker):
         rows = (
             (
                 await self._session.execute(
-                    select(PaperBrokerPosition).where(
-                        PaperBrokerPosition.account_id == account.id
-                    )
+                    select(PaperBrokerPosition).where(PaperBrokerPosition.account_id == account.id)
                 )
             )
             .scalars()
@@ -210,9 +204,7 @@ class InternalPaperBroker(Broker):
         rows = (
             (
                 await self._session.execute(
-                    select(PaperBrokerOrder).where(
-                        PaperBrokerOrder.account_id == account.id
-                    )
+                    select(PaperBrokerOrder).where(PaperBrokerOrder.account_id == account.id)
                 )
             )
             .scalars()
@@ -335,9 +327,7 @@ class InternalPaperBroker(Broker):
     async def cancel_order(self, broker_order_id: str) -> None:
         order = (
             await self._session.execute(
-                select(PaperBrokerOrder).where(
-                    PaperBrokerOrder.broker_order_id == broker_order_id
-                )
+                select(PaperBrokerOrder).where(PaperBrokerOrder.broker_order_id == broker_order_id)
             )
         ).scalar_one_or_none()
         if order is not None and not order.status.is_terminal:
@@ -404,9 +394,7 @@ class InternalPaperBroker(Broker):
         orders = (
             (
                 await self._session.execute(
-                    select(PaperBrokerOrder).where(
-                        PaperBrokerOrder.account_id == account.id
-                    )
+                    select(PaperBrokerOrder).where(PaperBrokerOrder.account_id == account.id)
                 )
             )
             .scalars()
@@ -427,8 +415,7 @@ class InternalPaperBroker(Broker):
         discrepancies: list[ReconciliationDiscrepancy] = []
         for intent in intents:
             if (
-                intent.status
-                in {TradeIntentStatus.SUBMITTED, TradeIntentStatus.RECONCILED}
+                intent.status in {TradeIntentStatus.SUBMITTED, TradeIntentStatus.RECONCILED}
                 and intent.broker_order_id
                 and intent.broker_order_id not in venue_order_ids
             ):
@@ -436,9 +423,7 @@ class InternalPaperBroker(Broker):
                     ReconciliationDiscrepancy(
                         kind="missing_order",
                         broker_ticker=str(intent.instrument_id),
-                        detail=(
-                            "Local intent references a broker order the venue does not have."
-                        ),
+                        detail=("Local intent references a broker order the venue does not have."),
                         local_value=intent.broker_order_id,
                         broker_value=None,
                     )
@@ -470,9 +455,7 @@ class InternalPaperBroker(Broker):
             average_fill_price=Decimal(order.average_fill_price)
             if order.average_fill_price is not None
             else None,
-            limit_price=Decimal(order.limit_price)
-            if order.limit_price is not None
-            else None,
+            limit_price=Decimal(order.limit_price) if order.limit_price is not None else None,
             stop_price=Decimal(order.stop_price) if order.stop_price is not None else None,
             created_at=order.placed_at,
             updated_at=order.terminal_at or order.placed_at,

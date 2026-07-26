@@ -18,9 +18,6 @@ import asyncio
 from typing import Any
 
 import structlog
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.broker.factory import (
     BrokerNotConfiguredError,
     LiveTradingDisabledError,
@@ -33,10 +30,12 @@ from app.models.user import User
 from app.risk.config import load_active_risk_config
 from app.risk.live_guard import LiveGuardService
 from app.risk.stops import StopService
-from app.services.eod import EODSummaryService
 from app.services.email import BrevoEmailService
+from app.services.eod import EODSummaryService
 from app.services.reconciliation import ReconciliationService
 from app.services.system_settings import active_broker_kind, eod_digest_enabled
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from worker.app import app
 

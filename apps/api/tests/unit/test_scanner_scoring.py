@@ -167,7 +167,7 @@ class TestSectorScoring:
         assert up.categories["sector"].points > down.categories["sector"].points
 
     def test_outperforming_its_sector_reads_positive(self) -> None:
-        """Relative strength = stock return − sector return; beating peers is +."""
+        """Relative strength = stock return - sector return; beating peers is +."""
         strong = _rising_series(n=300, daily=0.003)
         result = scoring.score_series(strong, sector=_falling_series(n=300))
         assert result.metrics["relative_momentum_vs_sector_12m"] > 0
@@ -228,7 +228,7 @@ class TestFundamentalsFirstScoring:
         without_f = self._result(
             fundamental_value=None, price_cheapness=60, reversal=70, quality=55, sector_factor=50
         )
-        # No fundamentals → scored on the rest (renormalised) × 0.90 penalty, so
+        # No fundamentals → scored on the rest (renormalised) * 0.90 penalty, so
         # strictly lower, but still a real score (not zeroed).
         assert scoring.combine_final_score(without_f) < scoring.combine_final_score(with_f)
         assert scoring.combine_final_score(without_f) > 40.0
@@ -236,7 +236,9 @@ class TestFundamentalsFirstScoring:
     def test_score_is_absolute_not_cohort_relative(self) -> None:
         # The same inputs always produce the same score — it never depends on
         # what else was in the batch.
-        r = self._result(fundamental_value=75, price_cheapness=55, reversal=60, quality=50, sector_factor=45)
+        r = self._result(
+            fundamental_value=75, price_cheapness=55, reversal=60, quality=50, sector_factor=45
+        )
         assert scoring.combine_final_score(r) == scoring.combine_final_score(r)
 
 

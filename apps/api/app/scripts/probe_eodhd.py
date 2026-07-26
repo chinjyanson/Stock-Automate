@@ -78,7 +78,7 @@ async def _run(limit: int) -> None:
                 not_found += 1
                 print(f"{i:3} {mic:6} {sym:14} — not found")
                 continue
-            except Exception as exc:  # noqa: BLE001 — probe: report and continue
+            except Exception as exc:
                 print(f"{i:3} {mic:6} {sym:14} — error: {exc}")
                 continue
 
@@ -94,13 +94,23 @@ async def _run(limit: int) -> None:
 
     attempted = quota_hit_after if quota_hit_after is not None else len(rows)
     print("\n==================== SUMMARY ====================")
-    print(f"rate limit:  {'hit after ' + str(quota_hit_after) + ' calls' if quota_hit_after is not None else 'not hit in ' + str(len(rows)) + ' calls'}")
+    rate_limit = (
+        f"hit after {quota_hit_after} calls"
+        if quota_hit_after is not None
+        else f"not hit in {len(rows)} calls"
+    )
+    print(f"rate limit:  {rate_limit}")
     print(f"attempted:   {attempted}")
-    print(f"had data:    {succeeded}  ({100*succeeded/attempted:.0f}%)" if attempted else "attempted: 0")
+    print(
+        f"had data:    {succeeded}  ({100 * succeeded / attempted:.0f}%)"
+        if attempted
+        else "attempted: 0"
+    )
     print(f"not found:   {not_found}   unsupported venue: {unsupported}")
     print("field coverage (of attempts):")
     for name in _FIELDS:
-        print(f"    {name:16} {field_hits[name]:3}  ({100*field_hits[name]/attempted:.0f}%)" if attempted else name)
+        hits = field_hits[name]
+        print(f"    {name:16} {hits:3}  ({100 * hits / attempted:.0f}%)" if attempted else name)
     print("per-venue coverage:")
     for mic in sorted(per_venue):
         tot = per_venue[mic]

@@ -21,11 +21,12 @@ gates.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data.store import CandleStore
@@ -230,7 +231,7 @@ class BackfillService:
             stmt = stmt.where(Instrument.id.in_(self._tradable_ids()))
         return list((await self._session.execute(stmt)).scalars().all())
 
-    def _tradable_ids(self):  # type: ignore[no-untyped-def]
+    def _tradable_ids(self) -> Select[tuple[uuid.UUID]]:
         """Subquery of instrument ids currently tradable on Trading 212."""
         return (
             select(BrokerInstrument.instrument_id)

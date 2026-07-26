@@ -50,9 +50,7 @@ class StopService:
         self._store = CandleStore(session)
         self._audit = AuditService(session)
 
-    async def manage(
-        self, broker: Broker, config: RiskConfiguration | None
-    ) -> dict[str, int]:
+    async def manage(self, broker: Broker, config: RiskConfiguration | None) -> dict[str, int]:
         """One full pass: trigger, record closes, trail, time-stop.
 
         Safe to run repeatedly (it is scheduled): a closed intent is skipped, a
@@ -235,9 +233,7 @@ class StopService:
         await self._audit_close(intent, reason, order.average_fill_price, actor_user_id)
         return order
 
-    def _mark_closed(
-        self, intent: TradeIntent, exit_price: Decimal | None, reason: str
-    ) -> None:
+    def _mark_closed(self, intent: TradeIntent, exit_price: Decimal | None, reason: str) -> None:
         intent.closed_at = datetime.now(UTC)
         intent.exit_price = exit_price
         intent.exit_reason = reason

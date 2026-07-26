@@ -137,9 +137,7 @@ class ExecutionService:
                 )
                 raise ExecutionError(f"Live preflight refused the order: {blocked}")
 
-        broker = self._injected_broker or resolve_broker(
-            self._broker_kind, session=self._session
-        )
+        broker = self._injected_broker or resolve_broker(self._broker_kind, session=self._session)
         try:
             return await self._execute(proposal, instrument, broker, actor_user_id)
         finally:
@@ -165,9 +163,7 @@ class ExecutionService:
             instrument.id, Interval.D1, limit=250, closed_only=True
         )
         benchmark = (
-            await self._benchmark_candles(config.correlation_benchmark_symbol)
-            if config
-            else None
+            await self._benchmark_candles(config.correlation_benchmark_symbol) if config else None
         )
 
         # For live, the affirmed capital ceiling bounds sizing for this session.
@@ -268,8 +264,7 @@ class ExecutionService:
         await self._audit.record(
             kind=AuditEventKind.ORDER_FILLED,
             summary=(
-                f"Filled BUY {order.filled_quantity} {instrument.name} "
-                f"@ {order.average_fill_price}"
+                f"Filled BUY {order.filled_quantity} {instrument.name} @ {order.average_fill_price}"
             ),
             actor_kind=ActorKind.RISK_ENGINE,
             subject_type="trade_intent",
@@ -306,13 +301,17 @@ class ExecutionService:
 
     async def _broker_instrument(self, instrument_id: uuid.UUID) -> BrokerInstrument | None:
         return (
-            await self._session.execute(
-                select(BrokerInstrument).where(
-                    BrokerInstrument.instrument_id == instrument_id,
-                    BrokerInstrument.broker == self._broker_kind,
+            (
+                await self._session.execute(
+                    select(BrokerInstrument).where(
+                        BrokerInstrument.instrument_id == instrument_id,
+                        BrokerInstrument.broker == self._broker_kind,
+                    )
                 )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
 
     async def _broker_ticker(self, instrument: Instrument) -> str:
         """The venue's own ticker for the instrument, or raise if unavailable."""
@@ -351,10 +350,14 @@ class ExecutionService:
 
     async def _intent_for_proposal(self, proposal_id: uuid.UUID) -> TradeIntent | None:
         return (
-            await self._session.execute(
-                select(TradeIntent).where(TradeIntent.proposal_id == proposal_id)
+            (
+                await self._session.execute(
+                    select(TradeIntent).where(TradeIntent.proposal_id == proposal_id)
+                )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
 
     async def _benchmark_candles(self, symbol: str) -> list[Candle] | None:
         """Best-effort benchmark candles for the correlation filter.

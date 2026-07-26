@@ -215,7 +215,11 @@ class TestApprovalRequired:
         # Nothing reached the venue — a human has to approve first.
         assert not fake.orders
         decision = (
-            await db.execute(select(StrategyDecision))  # type: ignore[attr-defined]
-        ).scalars().one()
+            (
+                await db.execute(select(StrategyDecision))  # type: ignore[attr-defined]
+            )
+            .scalars()
+            .one()
+        )
         assert decision.outcome is StrategyDecisionOutcome.PROPOSED
         assert decision.proposal_id is not None

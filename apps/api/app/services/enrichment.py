@@ -76,9 +76,7 @@ class EnrichmentService:
         both the classification and the fundamentals.
         """
         has_snapshot = (
-            select(FundamentalSnapshot.id).where(
-                FundamentalSnapshot.instrument_id == Instrument.id
-            )
+            select(FundamentalSnapshot.id).where(FundamentalSnapshot.instrument_id == Instrument.id)
         ).exists()
         rows = (
             await self._session.execute(
@@ -140,16 +138,20 @@ class EnrichmentService:
         candles = 0
         for symbol, name in SECTOR_ETFS.items():
             instrument = (
-                await self._session.execute(
-                    select(Instrument)
-                    .join(MarketDataMapping, MarketDataMapping.instrument_id == Instrument.id)
-                    .where(
-                        MarketDataMapping.provider == ProviderKind.YFINANCE,
-                        MarketDataMapping.provider_symbol == symbol,
+                (
+                    await self._session.execute(
+                        select(Instrument)
+                        .join(MarketDataMapping, MarketDataMapping.instrument_id == Instrument.id)
+                        .where(
+                            MarketDataMapping.provider == ProviderKind.YFINANCE,
+                            MarketDataMapping.provider_symbol == symbol,
+                        )
+                        .limit(1)
                     )
-                    .limit(1)
                 )
-            ).scalars().first()
+                .scalars()
+                .first()
+            )
 
             if instrument is None:
                 instrument = Instrument(

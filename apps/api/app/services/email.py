@@ -12,8 +12,8 @@ key is added, with no code change.
 
 from __future__ import annotations
 
-import structlog
 import httpx
+import structlog
 
 from app.config import Settings, get_settings
 

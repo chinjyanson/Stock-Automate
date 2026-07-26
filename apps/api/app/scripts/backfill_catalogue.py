@@ -83,9 +83,7 @@ def main() -> None:
     args = parser.parse_args()
 
     batch_size = args.batch_size or get_settings().backfill_ingest_batch_size
-    asyncio.run(
-        _run(batch_size=batch_size, loop=args.loop, trading212_only=not args.all_venues)
-    )
+    asyncio.run(_run(batch_size=batch_size, loop=args.loop, trading212_only=not args.all_venues))
 
 
 if __name__ == "__main__":

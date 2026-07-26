@@ -90,9 +90,7 @@ class TwelveDataProvider(MarketDataProvider):
         if not api_key:
             raise ProviderError("Twelve Data requires an API key")
         self._api_key = api_key
-        self._client = httpx.AsyncClient(
-            base_url=base_url, timeout=httpx.Timeout(timeout_seconds)
-        )
+        self._client = httpx.AsyncClient(base_url=base_url, timeout=httpx.Timeout(timeout_seconds))
 
     async def close(self) -> None:
         await self._client.aclose()

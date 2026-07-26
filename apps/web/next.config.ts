@@ -2,6 +2,11 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  // `next build` and `next dev` write incompatible manifests into the same
+  // directory, so building while a dev server is up corrupts it — the dev
+  // server then fails on modules missing from the production client manifest.
+  // Setting NEXT_DIST_DIR sends a verification build somewhere else instead.
+  ...(process.env.NEXT_DIST_DIR ? { distDir: process.env.NEXT_DIST_DIR } : {}),
   // The API is a separate service (FastAPI); Next never talks to the database
   // and never holds a broker credential (§17).
   env: {

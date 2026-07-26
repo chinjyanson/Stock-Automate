@@ -19,7 +19,6 @@ from app.data.types import Candle as ProviderCandle
 from app.models.enums import (
     BrokerKind,
     InstrumentKind,
-    Interval,
     LifecycleState,
     PriceUnit,
     ProviderKind,

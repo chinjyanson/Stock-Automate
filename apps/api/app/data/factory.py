@@ -62,9 +62,7 @@ def resolve_provider(kind: ProviderKind, settings: Settings | None = None) -> Ma
                 raise ProviderNotConfiguredError(
                     "EODHD requires EODHD_API_KEY. It is the fundamentals gap-fill source."
                 )
-            return EODHDProvider(
-                api_key=key.get_secret_value(), base_url=settings.eodhd_base_url
-            )
+            return EODHDProvider(api_key=key.get_secret_value(), base_url=settings.eodhd_base_url)
 
     raise ValueError(f"Unknown provider kind: {kind}")
 

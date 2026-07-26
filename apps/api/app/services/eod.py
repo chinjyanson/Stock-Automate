@@ -40,17 +40,13 @@ class EODSummaryService:
         account = await broker.get_account()
         positions = await broker.get_positions()
 
-        unrealised = sum(
-            (p.unrealised_pnl or Decimal(0) for p in positions), start=Decimal(0)
-        )
+        unrealised = sum((p.unrealised_pnl or Decimal(0) for p in positions), start=Decimal(0))
         realised = await self._realised_pnl(broker, summary_date)
         trades = await self._trades_on(broker, summary_date)
         active_halts = await self._active_halt_count()
         previous = await self._previous_summary(broker, summary_date)
         equity = account.total
-        equity_change = (
-            equity - Decimal(previous.equity) if previous is not None else None
-        )
+        equity_change = equity - Decimal(previous.equity) if previous is not None else None
 
         summary = await self._existing(broker, summary_date)
         if summary is None:
@@ -146,9 +142,7 @@ class EODSummaryService:
         )
         return int(count.scalar_one())
 
-    async def _existing(
-        self, broker: Broker, summary_date: date
-    ) -> DailyAccountSummary | None:
+    async def _existing(self, broker: Broker, summary_date: date) -> DailyAccountSummary | None:
         return (
             await self._session.execute(
                 select(DailyAccountSummary).where(

@@ -51,7 +51,9 @@ class TestProfileMutations:
     async def test_update_email_rejects_a_collision(self, db: AsyncSession) -> None:
         service = AuthService(db)
         await service.create_user(email="taken@example.com", password="a-long-enough-password")
-        mover = await service.create_user(email="mover@example.com", password="a-long-enough-password")
+        mover = await service.create_user(
+            email="mover@example.com", password="a-long-enough-password"
+        )
         await db.commit()
 
         with pytest.raises(AuthError):

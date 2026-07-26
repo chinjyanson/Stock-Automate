@@ -76,9 +76,7 @@ class PaperBrokerOrder(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     __tablename__ = "paper_broker_orders"
     __table_args__ = (
-        UniqueConstraint(
-            "broker_order_id", name="uq_paper_broker_orders_broker_order_id"
-        ),
+        UniqueConstraint("broker_order_id", name="uq_paper_broker_orders_broker_order_id"),
         Index("ix_paper_broker_orders_account_status", "account_id", "status"),
     )
 

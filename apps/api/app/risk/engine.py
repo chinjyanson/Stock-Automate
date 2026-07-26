@@ -110,9 +110,7 @@ class RiskEngine:
                 f"At the open-position cap ({config.max_open_positions}); no new positions."
             )
         if await self._trades_today(broker) >= config.max_trades_per_day:
-            return RiskDecision.reject(
-                f"At the daily trade cap ({config.max_trades_per_day})."
-            )
+            return RiskDecision.reject(f"At the daily trade cap ({config.max_trades_per_day}).")
 
         # 3. Entry, stop, base size. ---------------------------------------
         series = candles_to_series(candles)
@@ -144,9 +142,7 @@ class RiskEngine:
         # 4. Caps — smallest wins. -----------------------------------------
         caps: dict[str, Decimal] = {"risk_budget": raw_quantity}
 
-        caps["max_position_pct"] = (
-            equity * Decimal(str(config.max_position_pct)) / entry_price
-        )
+        caps["max_position_pct"] = equity * Decimal(str(config.max_position_pct)) / entry_price
 
         held_value = sum(
             (
@@ -262,9 +258,7 @@ class RiskEngine:
             if len(candles) < window + 1:
                 continue
             series = candles_to_series(candles)
-            corr = ind.rolling_correlation(
-                ind.daily_returns(series.close), bench_returns, window
-            )
+            corr = ind.rolling_correlation(ind.daily_returns(series.close), bench_returns, window)
             if corr is not None and corr > threshold:
                 price = position.current_price or position.average_price
                 correlated_value += position.quantity * price

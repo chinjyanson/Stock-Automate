@@ -89,7 +89,11 @@ class EODHDProvider(MarketDataProvider):
     kind = ProviderKind.EODHD
 
     def __init__(
-        self, *, api_key: str, base_url: str = "https://eodhd.com/api", timeout_seconds: float = 20.0
+        self,
+        *,
+        api_key: str,
+        base_url: str = "https://eodhd.com/api",
+        timeout_seconds: float = 20.0,
     ) -> None:
         if not api_key:
             raise ProviderError("EODHD requires an API key")
@@ -150,7 +154,9 @@ class EODHDProvider(MarketDataProvider):
             raise ProviderUnavailableError(f"EODHD transport error: {exc}") from exc
 
         if response.status_code in (402, 429):
-            raise ProviderQuotaExceededError(f"EODHD quota/rate limit (HTTP {response.status_code})")
+            raise ProviderQuotaExceededError(
+                f"EODHD quota/rate limit (HTTP {response.status_code})"
+            )
         if response.status_code == 401:
             raise ProviderError("EODHD rejected the API key (HTTP 401)")
         if response.status_code == 404:
@@ -180,9 +186,7 @@ class EODHDProvider(MarketDataProvider):
     async def resolve_instrument(self, instrument: Instrument) -> ProviderMapping | None:
         raise ProviderError(_NOT_A_PRICE_SOURCE)
 
-    async def get_daily_candles(
-        self, symbol: str, start: datetime, end: datetime
-    ) -> list[Candle]:
+    async def get_daily_candles(self, symbol: str, start: datetime, end: datetime) -> list[Candle]:
         raise ProviderError(_NOT_A_PRICE_SOURCE)
 
     async def get_intraday_candles(

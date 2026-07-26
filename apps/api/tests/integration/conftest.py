@@ -208,9 +208,7 @@ async def candled_instrument(db: AsyncSession) -> object:
         )
     )
     await db.flush()
-    await IngestionService(db).ingest_daily(
-        instrument, MockMarketDataProvider(), backfill_days=400
-    )
+    await IngestionService(db).ingest_daily(instrument, MockMarketDataProvider(), backfill_days=400)
     await db.commit()
     return instrument
 
