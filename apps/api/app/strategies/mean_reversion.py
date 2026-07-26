@@ -31,8 +31,16 @@ class MeanReversionStrategy(Strategy):
 
         signals: list[StrategySignal] = []
         for instrument in ctx.instruments:
-            series = await ctx.series(instrument.id, self.read_interval, limit=sma_period * 6)
-            if series is None or series.length < sma_period + 1:
+            # The z-score window plus the bar being scored against it; RSI needs
+            # its period too. Stated as `required` so a shortfall is recorded
+            # rather than silently skipped.
+            series = await ctx.series(
+                instrument.id,
+                self.read_interval,
+                limit=sma_period * 6,
+                required=max(sma_period + 1, rsi_period + 1),
+            )
+            if series is None:
                 continue
 
             window = series.close[-sma_period:]

@@ -227,7 +227,11 @@ export default function StrategiesPage() {
                       {new Date(d.created_at).toLocaleString()}
                     </td>
                     <td className="px-4 py-2 font-medium">{nameFor(d.instrument_id)}</td>
-                    <td className="px-4 py-2 uppercase">{d.side}</td>
+                    <td className="px-4 py-2 uppercase">
+                      {d.side ?? (
+                        <span className="text-[var(--color-ink-muted)]">&mdash;</span>
+                      )}
+                    </td>
                     <td
                       className="px-4 py-2"
                       style={{ color: OUTCOME_COLOUR[d.outcome] ?? "var(--color-ink)" }}

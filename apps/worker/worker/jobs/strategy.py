@@ -32,13 +32,17 @@ async def _evaluate(interval: Interval | None) -> dict[str, Any]:
         configs = (await session.execute(stmt)).scalars().all()
 
         engine = StrategyEngine(session)
-        totals = {"strategies": 0, "signals": 0, "executed": 0, "rejected": 0}
+        totals = {"strategies": 0, "signals": 0, "executed": 0, "rejected": 0, "skipped": 0}
         for config in configs:
             summary = await engine.run(config, selection_reason="scheduled")
             totals["strategies"] += 1
             totals["signals"] += summary.signals
             totals["executed"] += summary.executed
             totals["rejected"] += summary.rejected
+            # Instruments with too little history to evaluate. Surfaced in the
+            # job result because "0 signals" alone cannot distinguish a healthy
+            # quiet run from one that had no data to look at.
+            totals["skipped"] += summary.skipped
         return totals
 
 

@@ -20,6 +20,7 @@ from app.data.mock_provider import MockMarketDataProvider
 from app.models.enums import InstrumentKind, LifecycleState, PriceUnit, ProviderKind
 from app.models.instrument import Exchange, Instrument, MarketDataMapping
 from app.models.scanner import ProposalStatus
+from app.scanner import watchlist
 from app.scanner.engine import ScannerEngine
 from app.scanner.proposals import ProposalError, ProposalInputs, ProposalService
 from app.scanner.rotation import _ROTATION_POOL_LIMIT, select_instruments
@@ -121,6 +122,217 @@ class TestRotationSelection:
         chosen_ids = {c.id for c in chosen}
         # The scorable instrument survives; none of the history-less ones appear.
         assert chosen_ids == {scannable_instrument.id}
+
+
+class TestWatchlistSelection:
+    """A pinned instrument is selected next run — that is the whole promise."""
+
+    async def test_pinned_instrument_leads_the_selection(
+        self, db: AsyncSession, approver: uuid.UUID, scannable_instrument: Instrument
+    ) -> None:
+        """Freshly scanned, so the sweep would rank it last — the pin overrides that.
+
+        Without the pin, `last_scanned_at ASC` puts an instrument scanned seconds
+        ago behind everything else; under a tight cap it would not be scanned
+        again for days.
+        """
+        scannable_instrument.last_scanned_at = datetime.now(UTC)
+        await watchlist.add(db, approver, scannable_instrument.id)
+        await db.commit()
+
+        chosen, reason = await select_instruments(db, configuration=None, limit=200)
+
+        assert chosen[0].id == scannable_instrument.id
+        assert "1 watchlisted" in reason
+
+    async def test_pin_survives_a_cap_that_would_otherwise_exclude_it(
+        self, db: AsyncSession, approver: uuid.UUID, scannable_instrument: Instrument
+    ) -> None:
+        """A one-instrument scan still spends its single slot on the pinned one."""
+        scannable_instrument.last_scanned_at = datetime.now(UTC)
+        db.add_all(self._other_scannables(3))
+        await watchlist.add(db, approver, scannable_instrument.id)
+        await db.commit()
+
+        chosen, _ = await select_instruments(db, configuration=None, limit=1)
+
+        assert [c.id for c in chosen] == [scannable_instrument.id]
+
+    async def test_pinned_without_history_is_excluded_and_reported(
+        self, db: AsyncSession, approver: uuid.UUID, scannable_instrument: Instrument
+    ) -> None:
+        """The one case where "definitely rescanned" cannot hold, said out loud.
+
+        An instrument with no stored candles cannot be scored, so pinning it
+        does not conjure data. Silently dropping it is what makes this look like
+        a bug; the selection reason names it instead.
+        """
+        bare = Instrument(
+            id=uuid.uuid4(),
+            exchange_ticker="NOHIST",
+            name="No History Co.",
+            kind=InstrumentKind.STOCK,
+            currency="USD",
+            price_unit=PriceUnit.USD,
+            is_scanner_eligible=True,
+        )
+        db.add(bare)
+        await db.flush()
+        await watchlist.add(db, approver, bare.id)
+        await db.commit()
+
+        chosen, reason = await select_instruments(db, configuration=None, limit=200)
+
+        assert bare.id not in {c.id for c in chosen}
+        assert "1 watchlisted excluded: too little stored history to score" in reason
+
+    async def test_listing_loads_the_venue_without_lazy_io(
+        self, db: AsyncSession, approver: uuid.UUID, scannable_instrument: Instrument
+    ) -> None:
+        """Regression: the read path must not touch a lazy relationship.
+
+        `list_entries` eager-loads the instrument; the route then reads
+        `instrument.exchange.mic`. When that second hop was left lazy, asyncio
+        SQLAlchemy raised `MissingGreenlet` instead of querying, so every GET
+        500'd — and the page, which swallowed the failure, showed an empty
+        watchlist. The pin was in the database the whole time.
+
+        `expunge_all` matters: with the objects still in the identity map the
+        attribute resolves from memory and the missing eager load stays hidden.
+        """
+        await watchlist.add(db, approver, scannable_instrument.id)
+        await db.commit()
+        db.expunge_all()
+
+        entries = await watchlist.list_entries(db, approver)
+
+        assert len(entries) == 1
+        _, instrument = entries[0]
+        assert instrument is not None
+        # Exactly what the route handler does next.
+        assert instrument.exchange is not None
+        assert instrument.exchange.mic == "XNAS"
+
+    async def test_listing_an_absent_watchlist_creates_nothing(
+        self, db: AsyncSession, approver: uuid.UUID
+    ) -> None:
+        """A read must not write. The GET handler never commits, so a row created
+        here would be rolled back on every request — churn with nothing to show."""
+        assert await watchlist.list_entries(db, approver) == []
+        assert await watchlist.find_default(db, approver) is None
+
+    async def test_pinning_is_idempotent(
+        self, db: AsyncSession, approver: uuid.UUID, scannable_instrument: Instrument
+    ) -> None:
+        _, first = await watchlist.add(db, approver, scannable_instrument.id)
+        _, second = await watchlist.add(db, approver, scannable_instrument.id)
+        await db.commit()
+
+        assert first is True
+        assert second is False
+        assert await watchlist.watchlisted_instrument_ids(db) == [scannable_instrument.id]
+
+    async def test_unpinning_returns_it_to_the_ordinary_rotation(
+        self, db: AsyncSession, approver: uuid.UUID, scannable_instrument: Instrument
+    ) -> None:
+        await watchlist.add(db, approver, scannable_instrument.id)
+        await db.commit()
+        removed = await watchlist.remove(db, approver, scannable_instrument.id)
+        await db.commit()
+
+        assert removed is True
+        assert await watchlist.watchlisted_instrument_ids(db) == []
+        _, reason = await select_instruments(db, configuration=None, limit=200)
+        assert "watchlisted" not in reason
+
+    def _other_scannables(self, count: int) -> list[Instrument]:
+        """Never-scanned instruments that would otherwise win the sweep's slots."""
+        return [
+            Instrument(
+                id=uuid.uuid4(),
+                exchange_ticker=f"OTHER{i}",
+                name=f"OTHER{i} Co.",
+                kind=InstrumentKind.STOCK,
+                currency="USD",
+                price_unit=PriceUnit.USD,
+                is_scanner_eligible=True,
+            )
+            for i in range(count)
+        ]
+
+
+class TestSectorContext:
+    """Sector-ETF proxy feeds the sector score + relative-strength signal."""
+
+    async def _sector_etf(self, db: AsyncSession, symbol: str) -> Instrument:
+        """A sector-ETF instrument (mock-candled) the scorer can load by symbol."""
+        exchange = Exchange(mic="ARCX", name="NYSE Arca", country="US", timezone="America/New_York")
+        db.add(exchange)
+        await db.flush()
+        etf = Instrument(
+            id=uuid.uuid4(),
+            exchange_id=exchange.id,
+            exchange_ticker=symbol,
+            name=f"{symbol} Sector ETF",
+            kind=InstrumentKind.ETF,
+            currency="USD",
+            price_unit=PriceUnit.USD,
+            is_scanner_eligible=True,
+        )
+        db.add(etf)
+        await db.flush()
+        db.add(
+            MarketDataMapping(
+                instrument_id=etf.id,
+                provider=ProviderKind.MOCK,
+                provider_symbol=symbol,  # loaded by _load_benchmark(symbol)
+                is_signal_source=True,
+                confirmed_by_user=True,
+            )
+        )
+        await db.flush()
+        await IngestionService(db).ingest_daily(etf, MockMarketDataProvider(), backfill_days=400)
+        await db.commit()
+        return etf
+
+    async def test_tagged_instrument_gets_a_real_sector_score(
+        self, db: AsyncSession, scannable_instrument: Instrument
+    ) -> None:
+        await self._sector_etf(db, "XLK")
+        scannable_instrument.sector = "Technology"  # → XLK proxy
+        await db.commit()
+
+        await ScannerEngine(db).run([scannable_instrument])
+        await db.commit()
+
+        from app.models.scanner import ScannerResult
+
+        result = (
+            await db.execute(
+                select(ScannerResult).where(ScannerResult.instrument_id == scannable_instrument.id)
+            )
+        ).scalar_one()
+        # The sector category was computed from the proxy (not the neutral midpoint),
+        # and the relative-strength-vs-sector signal was recorded.
+        assert result.sector_score is not None
+        assert "relative_momentum_vs_sector_12m" in (result.metrics or {})
+
+    async def test_untagged_instrument_sector_is_neutral(
+        self, db: AsyncSession, scannable_instrument: Instrument
+    ) -> None:
+        # No sector tag and no proxy → the sector category is the neutral midpoint
+        # (half of its 20-point weight), never a penalty.
+        await ScannerEngine(db).run([scannable_instrument])
+        await db.commit()
+
+        from app.models.scanner import ScannerResult
+
+        result = (
+            await db.execute(
+                select(ScannerResult).where(ScannerResult.instrument_id == scannable_instrument.id)
+            )
+        ).scalar_one()
+        assert float(result.sector_score) == 10.0
 
 
 class TestScanning:

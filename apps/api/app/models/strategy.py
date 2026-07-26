@@ -142,7 +142,10 @@ class StrategyDecision(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("instruments.id", ondelete="CASCADE"), nullable=False
     )
     kind: Mapped[StrategyKind] = mapped_column(StrEnumType(StrategyKind, 32), nullable=False)
-    side: Mapped[OrderSide] = mapped_column(StrEnumType(OrderSide, 8), nullable=False)
+    #: Null when nothing was decided — an instrument the strategy could not
+    #: evaluate has no side, and inventing one would read as an intent it never
+    #: formed. Every row with an actual signal behind it sets this.
+    side: Mapped[OrderSide | None] = mapped_column(StrEnumType(OrderSide, 8))
     conviction: Mapped[Any] = mapped_column(Ratio, nullable=False, default=0)
     outcome: Mapped[StrategyDecisionOutcome] = mapped_column(
         StrEnumType(StrategyDecisionOutcome, 24), nullable=False

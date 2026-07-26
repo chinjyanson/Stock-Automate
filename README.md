@@ -90,7 +90,12 @@ pnpm db:seed         # exchanges, settings, and a dev user
 
 pnpm api:dev         # http://localhost:8000  (API docs at /docs)
 pnpm dev             # http://localhost:3000
+pnpm worker:dev      # background jobs + scheduler — daily scan, EOD email, stops
 ```
+
+> Each of the three `dev` commands runs in the foreground — use a separate
+> terminal (or tab) for each. The worker is optional for clicking around, but
+> **nothing scheduled runs without it** (see [Background jobs](#background-jobs-worker--scheduler)).
 
 > **Do not run `pnpm build` / `next build` while `pnpm dev` is running.** Both
 > write to `apps/web/.next`. A production build overwrites the dev server's
@@ -136,6 +141,73 @@ local Postgres/Redis:
 
 ---
 
+## Background jobs (worker + scheduler)
+
+The API and web hot-reload, but **the scheduled jobs run in a separate Celery
+worker** — the daily scan, the end-of-day summary/email, stop monitoring, broker
+reconciliation, and the strategy evaluations. Without it running, none of those
+fire: the app still works for anything you trigger by hand (a manual scan, an
+approval), it just isn't *automated*.
+
+One process runs both the worker and the `beat` scheduler. It needs Postgres and
+Redis up (the broker).
+
+**Dev**
+
+```bash
+docker compose up -d postgres redis   # broker + DB the worker connects to
+pnpm worker:dev                        # celery worker + beat — leave it running
+```
+
+**Prod** — the `worker` service in `docker-compose.yml` runs it for you
+(`restart: unless-stopped`, `--concurrency=2`), so the scheduler comes up with
+the rest of the stack:
+
+```bash
+docker compose up -d                   # postgres, redis, api, worker, web
+```
+
+> **⚠️ Celery does not hot-reload.** Unlike `pnpm api:dev` / `pnpm dev`, the
+> worker loads your code once at startup. After changing anything the jobs import
+> (services, tasks, models), **restart it** — `Ctrl-C` then `pnpm worker:dev` in
+> dev, or `docker compose restart worker` in prod — otherwise it keeps executing
+> the old code (a stale worker will happily run yesterday's scan logic nightly).
+
+### Schedule (UTC)
+
+| Time | Job | Purpose |
+|---|---|---|
+| 06:00 | `sync-instruments` | Refresh the broker catalogue |
+| 21:30 | `refresh-daily-candles` | Update prices for mapped instruments |
+| 21:45 | `monitor-stops` | Trail / trigger protective stops |
+| 22:00 | `scanner-rotation` | The daily rotating scan |
+| 22:15 | `eod-summary` | End-of-day summary **+ email digest** |
+| 22:30 | `evaluate-daily-strategies` | Run daily strategies |
+| every 2–30 min | `live-guard` / `reconcile-broker` / `expire-approvals` | Safety + housekeeping |
+| 14:00–21:00 | intraday refresh + strategies | 15-minute signals (needs Twelve Data) |
+
+### Daily email digest
+
+The 22:15 job emails the summary **only when both** are true: `BREVO_API_KEY` is
+set in `.env`, and the digest is switched **on** in **Settings → Notifications**
+(it defaults to off). Otherwise the summary is still computed and stored — just
+not emailed. See the Brevo block in `.env` for the sender configuration.
+
+### One-time catalogue backfill
+
+The scanner only scores instruments with stored candles. To light up the whole
+tradable universe (map a data symbol + backfill daily history), run the sweep
+once — it is idempotent and resumable:
+
+```bash
+uv --directory apps/api run python -m app.scripts.backfill_catalogue --loop
+```
+
+Progress is visible at `GET /admin/backfill/status` (admin only). Afterwards the
+daily `refresh-daily-candles` job keeps everything current.
+
+---
+
 ## Commands
 
 ```bash
@@ -156,8 +228,9 @@ pnpm db:migrate                  # alembic upgrade head
 pnpm db:revision -- "message"    # autogenerate a migration
 pnpm db:seed
 
-# Worker
-pnpm worker:dev                  # celery worker + beat
+# Worker  (see "Background jobs" above — restart after code changes)
+pnpm worker:dev                  # celery worker + beat (dev)
+docker compose restart worker    # reload the worker after a change (prod)
 ```
 
 The integration tests require PostgreSQL, deliberately: the schema depends on

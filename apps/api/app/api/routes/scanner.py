@@ -9,7 +9,7 @@ from decimal import Decimal
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -20,14 +20,16 @@ from app.broker.factory import default_paper_broker_kind, resolve_broker
 from app.broker.read_cache import broker_read_cache
 from app.config import get_settings
 from app.db import get_db
-from app.models.enums import ActorKind, AuditEventKind
+from app.models.enums import ActorKind, AuditEventKind, Interval
 from app.models.instrument import Instrument
+from app.models.market_data import Candle
 from app.models.scanner import (
     ScannerConfiguration,
     ScannerResult,
     ScannerRun,
 )
-from app.scanner.engine import ScannerEngine
+from app.scanner import watchlist
+from app.scanner.engine import MIN_BARS_TO_SCORE, ScannerEngine
 from app.scanner.proposals import ProposalError, ProposalInputs, ProposalService
 from app.scanner.rotation import select_instruments
 from app.services.system_settings import (
@@ -70,6 +72,9 @@ class ScannerResultResponse(ORMModel):
     instrument_name: str | None = None
     exchange_name: str | None = None
     exchange_mic: str | None = None
+    #: The instrument's sector (yfinance/GICS), so the table can show industry
+    #: context alongside the sector score.
+    sector: str | None = None
     #: The score driving classification/ranking (momentum, value, or a blend,
     #: per the run's configuration).
     primary_score: SerializedDecimal
@@ -79,6 +84,12 @@ class ScannerResultResponse(ORMModel):
     risk_score: SerializedDecimal
     liquidity_score: SerializedDecimal
     positioning_score: SerializedDecimal
+    #: Health of the instrument's own sector (via its sector-ETF proxy).
+    sector_score: SerializedDecimal | None = None
+    #: Two more of the five final-score factors: turning-up strength, and
+    #: soundness (fundamentals + low-risk + liquidity).
+    reversal_score: SerializedDecimal | None = None
+    quality_score: SerializedDecimal | None = None
     fundamental_score: SerializedDecimal | None
     #: The valuation lens (0-100): how cheap the instrument looks. Separate from
     #: the momentum core score.
@@ -195,7 +206,7 @@ async def list_results(
     classification: str | None = Query(default=None),
     min_score: float = Query(default=0.0, ge=0, le=100),
     tradable_only: bool = Query(default=False),
-    limit: int = Query(default=50, ge=1, le=500),
+    limit: int = Query(default=50, ge=1, le=2000),
     context: AuthContext = Depends(get_auth_context),
     db: AsyncSession = Depends(get_db),
 ) -> list[ScannerResultResponse]:
@@ -246,6 +257,7 @@ async def list_results(
         instrument = instruments.get(r.instrument_id)
         if instrument is not None:
             response.instrument_name = instrument.name
+            response.sector = instrument.sector
             if instrument.exchange is not None:
                 response.exchange_name = instrument.exchange.name
                 response.exchange_mic = instrument.exchange.mic
@@ -278,6 +290,7 @@ async def get_result(
     base_data = base.model_dump()
     base_data.update(
         instrument_name=instrument.name if instrument else None,
+        sector=instrument.sector if instrument else None,
         exchange_name=instrument.exchange.name if instrument and instrument.exchange else None,
         exchange_mic=instrument.exchange.mic if instrument and instrument.exchange else None,
     )
@@ -351,6 +364,142 @@ async def propose_trade(
     await db.commit()
     await db.refresh(proposal)
     return TradeProposalResponse.model_validate(proposal)
+
+
+# -- Watchlist ---------------------------------------------------------------
+
+
+class WatchlistEntryResponse(BaseModel):
+    instrument_id: uuid.UUID
+    instrument_name: str | None = None
+    exchange_mic: str | None = None
+    note: str | None = None
+    added_at: datetime
+    #: Whether the local store holds enough daily history to actually score this
+    #: instrument. False means the next scan will *not* cover it, however it is
+    #: ranked — reported so a pin that cannot be honoured says so.
+    is_scannable: bool
+
+
+class AddToWatchlistRequest(BaseModel):
+    instrument_id: uuid.UUID
+    note: str | None = Field(default=None, max_length=500)
+
+
+async def _scannable_ids(db: AsyncSession, instrument_ids: set[uuid.UUID]) -> set[uuid.UUID]:
+    """Which of `instrument_ids` have enough stored daily bars to be scored.
+
+    The same floor the rotation applies, asked here so the watchlist can warn at
+    pin time instead of leaving the operator to infer it from an absence.
+    """
+    if not instrument_ids:
+        return set()
+    rows = await db.execute(
+        select(Candle.instrument_id)
+        .where(
+            Candle.instrument_id.in_(instrument_ids),
+            Candle.interval == Interval.D1,
+            Candle.is_closed.is_(True),
+        )
+        .group_by(Candle.instrument_id)
+        .having(func.count(Candle.id) >= MIN_BARS_TO_SCORE)
+    )
+    return {row[0] for row in rows.all()}
+
+
+@router.get("/watchlist", response_model=list[WatchlistEntryResponse])
+async def list_watchlist(
+    context: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+) -> list[WatchlistEntryResponse]:
+    """The instruments pinned for the next scan (§6, rotation tier 1)."""
+    entries = await watchlist.list_entries(db, context.user.id)
+    scannable = await _scannable_ids(db, {e.instrument_id for e, _ in entries})
+    return [
+        WatchlistEntryResponse(
+            instrument_id=entry.instrument_id,
+            instrument_name=instrument.name if instrument else None,
+            exchange_mic=(instrument.exchange.mic if instrument and instrument.exchange else None),
+            note=entry.note,
+            added_at=entry.created_at,
+            is_scannable=entry.instrument_id in scannable,
+        )
+        for entry, instrument in entries
+    ]
+
+
+@router.post(
+    "/watchlist", response_model=WatchlistEntryResponse, status_code=status.HTTP_201_CREATED
+)
+async def add_to_watchlist(
+    payload: AddToWatchlistRequest,
+    context: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_csrf),
+) -> WatchlistEntryResponse:
+    """Pin an instrument so the next scan covers it before the rotating sweep.
+
+    Idempotent — pinning twice returns the existing entry rather than failing.
+    """
+    instrument_result = await db.execute(
+        select(Instrument)
+        .where(Instrument.id == payload.instrument_id)
+        .options(selectinload(Instrument.exchange))
+    )
+    instrument = instrument_result.scalar_one_or_none()
+    if instrument is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instrument not found")
+
+    entry, created = await watchlist.add(
+        db, context.user.id, payload.instrument_id, note=payload.note
+    )
+    if created:
+        await AuditService(db).record(
+            kind=AuditEventKind.WATCHLIST_CHANGED,
+            summary=f"Watchlisted '{instrument.name}' for the next scan",
+            actor_kind=ActorKind.USER,
+            actor_user_id=context.user.id,
+            subject_type="instrument",
+            subject_id=str(instrument.id),
+            payload={"action": "added"},
+        )
+    await db.commit()
+
+    scannable = await _scannable_ids(db, {payload.instrument_id})
+    return WatchlistEntryResponse(
+        instrument_id=entry.instrument_id,
+        instrument_name=instrument.name,
+        exchange_mic=instrument.exchange.mic if instrument.exchange else None,
+        note=entry.note,
+        added_at=entry.created_at,
+        is_scannable=payload.instrument_id in scannable,
+    )
+
+
+@router.delete("/watchlist/{instrument_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def remove_from_watchlist(
+    instrument_id: uuid.UUID,
+    context: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_csrf),
+) -> None:
+    """Unpin an instrument. It falls back to the ordinary rotation."""
+    removed = await watchlist.remove(db, context.user.id, instrument_id)
+    if not removed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Instrument is not on the watchlist"
+        )
+    instrument = await db.get(Instrument, instrument_id)
+    await AuditService(db).record(
+        kind=AuditEventKind.WATCHLIST_CHANGED,
+        summary=f"Removed '{instrument.name if instrument else instrument_id}' from the watchlist",
+        actor_kind=ActorKind.USER,
+        actor_user_id=context.user.id,
+        subject_type="instrument",
+        subject_id=str(instrument_id),
+        payload={"action": "removed"},
+    )
+    await db.commit()
 
 
 class ScannerSettingsResponse(BaseModel):

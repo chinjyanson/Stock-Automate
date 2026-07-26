@@ -43,6 +43,23 @@ log = structlog.get_logger(__name__)
 #: thinly-covered instrument "failed").
 MIN_BARS_TO_SCORE = 30
 
+#: Yahoo `.info` sector name → SPDR sector-ETF symbol, used as a global GICS
+#: proxy for that sector's performance. A stock whose sector is absent or not in
+#: this map simply gets no sector signal (it drops out, never penalised).
+_SECTOR_ETF: dict[str, str] = {
+    "Technology": "XLK",
+    "Financial Services": "XLF",
+    "Healthcare": "XLV",
+    "Consumer Cyclical": "XLY",
+    "Consumer Defensive": "XLP",
+    "Energy": "XLE",
+    "Industrials": "XLI",
+    "Basic Materials": "XLB",
+    "Real Estate": "XLRE",
+    "Utilities": "XLU",
+    "Communication Services": "XLC",
+}
+
 
 @dataclass
 class ScanSummary:
@@ -97,10 +114,15 @@ class ScannerEngine:
             if run_config.benchmark_symbol
             else None
         )
+        # Each sector ETF is loaded at most once per run and reused across every
+        # instrument in that sector (≤11 loads, not one per stock).
+        sector_cache: dict[str, PriceSeries | None] = {}
 
         for instrument in instruments:
             try:
-                scored = await self._score_one(run, instrument, run_config, benchmark_series)
+                scored = await self._score_one(
+                    run, instrument, run_config, benchmark_series, sector_cache
+                )
             except Exception as exc:
                 log.exception("scanner.instrument_failed", instrument_id=str(instrument.id))
                 summary.errors.append(f"{instrument.name}: {exc}")
@@ -160,6 +182,7 @@ class ScannerEngine:
         instrument: Instrument,
         run_config: RunConfig,
         benchmark: PriceSeries | None,
+        sector_cache: dict[str, PriceSeries | None],
     ) -> Classification | None:
         candles = await self._store.get_candles(
             instrument.id, Interval.D1, limit=ind_year_plus(), closed_only=True
@@ -171,24 +194,25 @@ class ScannerEngine:
 
         series = candles_to_series(candles)
         fundamentals = await self._load_fundamentals(instrument.id)
+        sector_series = await self._resolve_sector_series(instrument, sector_cache)
 
         result = scoring.score_series(
             series,
             weights=run_config.weights,
             thresholds=run_config.thresholds,
             benchmark=benchmark,
+            sector=sector_series,
             fundamentals=fundamentals,
         )
 
-        # The primary score (and the classification derived from it) blends
-        # momentum and value per the run's configuration. A value-primary run
-        # classifies on cheapness; a momentum-primary run on strength.
-        value_score = result.value.value_score if result.value else None
-        primary_score = scoring.combine_primary_score(
-            result.core_score,
-            value_score,
-            momentum_weight=run_config.momentum_weight,
-            value_weight=run_config.value_weight,
+        # The primary (final) score is an absolute, fundamentals-first blend of
+        # five factors — intrinsic value + P/E lead, with cheapness, reversal,
+        # quality and sector in support. Absolute so it is comparable batch to
+        # batch; see scoring.combine_final_score.
+        primary_score = scoring.combine_final_score(
+            result,
+            weights=run_config.factor_weights,
+            fundamentals_penalty=run_config.fundamentals_penalty,
         )
         primary_classification = scoring.classify(primary_score, run_config.thresholds)
 
@@ -208,6 +232,13 @@ class ScannerEngine:
                 risk_score=Decimal(str(round(result.categories["risk"].points, 2))),
                 liquidity_score=Decimal(str(round(result.categories["liquidity"].points, 2))),
                 positioning_score=Decimal(str(round(result.categories["positioning"].points, 2))),
+                sector_score=Decimal(str(round(result.categories["sector"].points, 2))),
+                reversal_score=(
+                    Decimal(str(result.reversal)) if result.reversal is not None else None
+                ),
+                quality_score=(
+                    Decimal(str(result.quality)) if result.quality is not None else None
+                ),
                 fundamental_score=(
                     Decimal(str(result.fundamental_score))
                     if result.fundamental_score is not None
@@ -246,6 +277,23 @@ class ScannerEngine:
         await self._session.flush()
         return primary_classification
 
+    async def _resolve_sector_series(
+        self, instrument: Instrument, cache: dict[str, PriceSeries | None]
+    ) -> PriceSeries | None:
+        """The sector-ETF proxy series for `instrument`, cached per run.
+
+        Maps the instrument's `sector` tag to its SPDR ETF symbol and loads that
+        ETF's candles (once per run). None when the instrument is untagged, its
+        sector has no proxy, or the ETF has not been ingested yet — the sector
+        signals then drop out with no penalty.
+        """
+        symbol = _SECTOR_ETF.get((instrument.sector or "").strip())
+        if symbol is None:
+            return None
+        if symbol not in cache:
+            cache[symbol] = await self._load_benchmark(symbol)
+        return cache[symbol]
+
     async def _load_benchmark(self, symbol: str) -> PriceSeries | None:
         """Load a benchmark series by its provider symbol, for relative momentum.
 
@@ -283,6 +331,7 @@ class ScannerEngine:
             "price_to_book": snap.price_to_book,
             "profit_margin": snap.profit_margin,
             "revenue_growth": snap.revenue_growth,
+            "earnings_growth": snap.earnings_growth,
             "debt_to_equity": snap.debt_to_equity,
             "dividend_yield": snap.dividend_yield,
         }
@@ -320,6 +369,10 @@ class RunConfig:
     benchmark_symbol: str | None
     momentum_weight: float
     value_weight: float
+    #: Weights of the five final-score factors, and the missing-fundamentals
+    #: penalty (see scoring.combine_final_score).
+    factor_weights: dict[str, float]
+    fundamentals_penalty: float
 
     @property
     def is_value_primary(self) -> bool:
@@ -334,13 +387,21 @@ def _config_values(config: ScannerConfiguration | None) -> RunConfig:
             benchmark_symbol="SPY",
             momentum_weight=1.0,
             value_weight=0.0,
+            factor_weights=scoring.DEFAULT_FACTOR_WEIGHTS,
+            fundamentals_penalty=scoring.DEFAULT_FUNDAMENTALS_PENALTY,
         )
+    penalty = getattr(config, "fundamentals_penalty", None)
     return RunConfig(
         weights=_floatify(config.weights) or scoring.DEFAULT_WEIGHTS,
         thresholds=_floatify(config.thresholds) or scoring.DEFAULT_THRESHOLDS,
         benchmark_symbol=config.benchmark_symbol,
         momentum_weight=float(config.momentum_weight),
         value_weight=float(config.value_weight),
+        factor_weights=_floatify(getattr(config, "factor_weights", None))
+        or scoring.DEFAULT_FACTOR_WEIGHTS,
+        fundamentals_penalty=float(penalty)
+        if penalty is not None
+        else scoring.DEFAULT_FUNDAMENTALS_PENALTY,
     )
 
 

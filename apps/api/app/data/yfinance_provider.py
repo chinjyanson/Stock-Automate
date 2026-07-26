@@ -471,6 +471,52 @@ class YFinanceProvider(MarketDataProvider):
             raw={},
         )
 
+    async def get_classification(self, symbol: str) -> tuple[str | None, str | None]:
+        """The (sector, industry) yfinance assigns a symbol, or (None, None).
+
+        Read from the same `.info` payload the fundamentals come from — no extra
+        request. Yahoo omits these for ETPs, SPACs and many obscure lines; that
+        is returned as (None, None), i.e. "unknown", never an error.
+        """
+        info = await self._fetch_info(symbol)
+        sector = info.get("sector") if info else None
+        industry = info.get("industry") if info else None
+        return (str(sector) if sector else None, str(industry) if industry else None)
+
+    async def get_profile(self, symbol: str) -> tuple[str | None, str | None, Fundamentals]:
+        """Sector, industry AND fundamentals from a single `.info` call.
+
+        Used by the enrichment sweep so tagging and fundamentals ride one request
+        each. Every field is None when Yahoo lacks it (§6). yfinance now reports
+        `dividendYield` as a percent (2.96), not a fraction — normalised here to a
+        fraction so the scorer's thresholds stay meaningful.
+        """
+        info = await self._fetch_info(symbol)
+        sector = str(info.get("sector")) if info.get("sector") else None
+        industry = str(info.get("industry")) if info.get("industry") else None
+
+        raw_yield = info.get("dividendYield")
+        div_yield = _to_decimal(raw_yield)
+        if div_yield is not None and div_yield > 1:  # percent → fraction
+            div_yield = div_yield / 100
+
+        fundamentals = Fundamentals(
+            symbol=symbol,
+            provider=self.kind,
+            as_of=datetime.now(UTC),
+            currency=info.get("financialCurrency") or info.get("currency"),
+            market_cap=_to_decimal(info.get("marketCap")),
+            trailing_pe=_to_decimal(info.get("trailingPE")),
+            price_to_book=_to_decimal(info.get("priceToBook")),
+            dividend_yield=div_yield,
+            revenue_growth=_to_decimal(info.get("revenueGrowth")),
+            earnings_growth=_to_decimal(info.get("earningsGrowth")),
+            profit_margin=_to_decimal(info.get("profitMargins")),
+            debt_to_equity=_to_decimal(info.get("debtToEquity")),
+            raw={},
+        )
+        return sector, industry, fundamentals
+
     async def health_check(self) -> bool:
         try:
             # A liquid, always-present symbol. Cheap and unambiguous.

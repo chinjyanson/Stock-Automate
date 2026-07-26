@@ -266,6 +266,10 @@ class AuditEventKind(StrEnum):
     INSTRUMENT_SUSPENDED = "instrument_suspended"
     SCANNER_RUN_STARTED = "scanner_run_started"
     SCANNER_RUN_COMPLETED = "scanner_run_completed"
+    #: An instrument was pinned to, or unpinned from, the scanner watchlist —
+    #: which changes what the scheduled scan looks at, so it is an operator
+    #: action worth a trail, not a UI preference.
+    WATCHLIST_CHANGED = "watchlist_changed"
     TRADE_PROPOSED = "trade_proposed"
     TRADE_APPROVED = "trade_approved"
     TRADE_REJECTED = "trade_rejected"

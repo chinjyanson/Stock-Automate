@@ -59,7 +59,9 @@ class StrategyDecisionResponse(ORMModel):
     run_id: uuid.UUID
     instrument_id: uuid.UUID
     kind: str
-    side: str
+    #: Null for a decision where nothing was decided (an instrument the strategy
+    #: could not evaluate); set whenever a signal is behind the row.
+    side: str | None
     conviction: SerializedDecimal
     outcome: str
     reason: str

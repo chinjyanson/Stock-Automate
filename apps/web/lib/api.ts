@@ -259,6 +259,7 @@ export const scannerResultSchema = z.object({
   instrument_name: z.string().nullable(),
   exchange_name: z.string().nullable(),
   exchange_mic: z.string().nullable(),
+  sector: z.string().nullable().optional(),
   primary_score: z.string(),
   core_score: z.string(),
   trend_score: z.string(),
@@ -266,6 +267,9 @@ export const scannerResultSchema = z.object({
   risk_score: z.string(),
   liquidity_score: z.string(),
   positioning_score: z.string(),
+  sector_score: z.string().nullable().optional(),
+  reversal_score: z.string().nullable().optional(),
+  quality_score: z.string().nullable().optional(),
   fundamental_score: z.string().nullable(),
   value_score: z.string().nullable(),
   price_value_score: z.string().nullable(),
@@ -299,6 +303,17 @@ export const scannerRunSchema = z.object({
   screening_candidates: z.number(),
   watchlist_candidates: z.number(),
   selection_reason: z.string().nullable(),
+});
+
+export const watchlistEntrySchema = z.object({
+  instrument_id: z.string(),
+  instrument_name: z.string().nullable(),
+  exchange_mic: z.string().nullable(),
+  note: z.string().nullable(),
+  added_at: z.string(),
+  // False when the local store lacks enough daily history to score it — the pin
+  // is recorded but the next scan cannot honour it.
+  is_scannable: z.boolean(),
 });
 
 export const auditEventSchema = z.object({
@@ -404,7 +419,9 @@ export const strategyDecisionSchema = z.object({
   run_id: z.string(),
   instrument_id: z.string(),
   kind: z.string(),
-  side: z.string(),
+  // Null when the strategy could not evaluate the instrument at all — there was
+  // no side to take.
+  side: z.string().nullable(),
   conviction: z.string(),
   outcome: z.string(),
   reason: z.string(),
@@ -462,6 +479,7 @@ export type StrategyConfigUpdate = Partial<{
 export type ScannerResult = z.infer<typeof scannerResultSchema>;
 export type ScannerResultDetail = z.infer<typeof scannerResultDetailSchema>;
 export type ScannerRun = z.infer<typeof scannerRunSchema>;
+export type WatchlistEntry = z.infer<typeof watchlistEntrySchema>;
 
 /* -- Endpoints ------------------------------------------------------------ */
 
@@ -551,7 +569,22 @@ export const api = {
     request("/scanner/run", scannerRunSchema, {
       method: "POST",
       body: JSON.stringify(body),
+      // A full-slice scan scores up to a couple thousand instruments (~15s+),
+      // well past the default 15s request timeout — give this call its own.
+      signal: AbortSignal.timeout(120_000),
     }),
+
+  // -- Scanner watchlist: instruments pinned for the next scan --
+  scannerWatchlist: () => request("/scanner/watchlist", z.array(watchlistEntrySchema)),
+
+  addToWatchlist: (instrumentId: string, note?: string) =>
+    request("/scanner/watchlist", watchlistEntrySchema, {
+      method: "POST",
+      body: JSON.stringify({ instrument_id: instrumentId, note: note ?? null }),
+    }),
+
+  removeFromWatchlist: (instrumentId: string) =>
+    request(`/scanner/watchlist/${instrumentId}`, z.undefined(), { method: "DELETE" }),
 
   scannerSettings: () =>
     request("/scanner/settings", z.object({ auto_run_enabled: z.boolean() })),

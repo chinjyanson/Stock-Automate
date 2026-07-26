@@ -11,6 +11,7 @@ import structlog
 
 from app.config import Settings, get_settings
 from app.data.base import MarketDataProvider
+from app.data.eodhd_provider import EODHDProvider
 from app.data.mock_provider import MockMarketDataProvider
 from app.data.twelve_data_provider import TwelveDataProvider
 from app.data.yfinance_provider import YFinanceProvider
@@ -40,8 +41,8 @@ def resolve_provider(kind: ProviderKind, settings: Settings | None = None) -> Ma
             )
 
         case ProviderKind.TWELVE_DATA:
-            # The intraday source for the S&P 15-minute strategy (§8). A missing
-            # key is a configuration gap, not a cue to serve daily bars to a 15m
+            # The intraday backup behind yfinance (§8). A missing key is a
+            # configuration gap, not a cue to serve daily bars to a 15m
             # strategy — that substitution would look like it worked.
             key = settings.twelve_data_api_key
             if key is None or not key.get_secret_value():
@@ -56,8 +57,13 @@ def resolve_provider(kind: ProviderKind, settings: Settings | None = None) -> Ma
             )
 
         case ProviderKind.EODHD:
-            raise NotImplementedError(
-                "EODHDProvider arrives in Phase 2 as a verification and gap-fill source."
+            key = settings.eodhd_api_key
+            if key is None or not key.get_secret_value():
+                raise ProviderNotConfiguredError(
+                    "EODHD requires EODHD_API_KEY. It is the fundamentals gap-fill source."
+                )
+            return EODHDProvider(
+                api_key=key.get_secret_value(), base_url=settings.eodhd_base_url
             )
 
     raise ValueError(f"Unknown provider kind: {kind}")
@@ -97,14 +103,32 @@ def daily_provider_chain(settings: Settings | None = None) -> list[ProviderKind]
 def intraday_provider_chain(settings: Settings | None = None) -> list[ProviderKind]:
     """Provider priority for intraday (15m) data (§4, §8).
 
-    Twelve Data is the only real intraday source. As with the daily chain, an
-    empty chain is a configuration error rather than a silent fall back to the
-    mock — a 15m strategy on invented bars is a confident, wrong answer.
+    yfinance leads. It serves 15m bars for the European listings this portfolio
+    actually holds, which Twelve Data's free tier does not cover at all — so
+    putting Twelve Data first left the intraday strategies with no data. Its
+    ceiling is history, not freshness: roughly 59 days of 15m bars, which bounds
+    backtesting but not live evaluation.
+
+    Twelve Data stays as the backup, for symbols yfinance cannot serve and for
+    the days Yahoo's unofficial endpoints misbehave.
+
+    As with the daily chain, an empty chain is a configuration error rather than
+    a silent fall back to the mock — a 15m strategy on invented bars is a
+    confident, wrong answer.
     """
     settings = settings or get_settings()
+    chain: list[ProviderKind] = []
+
+    if settings.yfinance_enabled:
+        chain.append(ProviderKind.YFINANCE)
     if settings.twelve_data_api_key and settings.twelve_data_api_key.get_secret_value():
-        return [ProviderKind.TWELVE_DATA]
-    raise ProviderNotConfiguredError(
-        "No intraday market-data provider is configured. Set TWELVE_DATA_API_KEY, or "
-        "request ProviderKind.MOCK explicitly to run offline against intraday fixtures."
-    )
+        chain.append(ProviderKind.TWELVE_DATA)
+
+    if not chain:
+        raise ProviderNotConfiguredError(
+            "No intraday market-data provider is configured. Set YFINANCE_ENABLED=true "
+            "(no API key required) or TWELVE_DATA_API_KEY, or request ProviderKind.MOCK "
+            "explicitly to run offline against intraday fixtures."
+        )
+
+    return chain

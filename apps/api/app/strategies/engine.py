@@ -13,7 +13,11 @@ without passing a gate**:
     filled directly.
 
 Every signal produces a `StrategyDecision` recording its outcome, so "the strategy
-wanted to but the risk engine said no" is visible, never silent.
+wanted to but the risk engine said no" is visible, never silent. So does every
+instrument the strategy could *not* evaluate for want of candle history — a
+SKIPPED decision with no side. Without that row the two failure modes are
+indistinguishable from the outside: a run that looked and found nothing, and a
+run that had nothing to look at, both report zero signals.
 """
 
 from __future__ import annotations
@@ -57,7 +61,11 @@ from app.strategies.registry import build_strategy
 
 log = structlog.get_logger(__name__)
 
-#: Staleness threshold for a daily strategy; intraday uses the minutes value below.
+#: Staleness thresholds, chosen per the interval the strategy actually reads.
+#: Five days for daily bars tolerates a long weekend plus a holiday; 45 minutes
+#: for intraday is three missed 15m refreshes. Applying the daily threshold to a
+#: 15m strategy — as this did until the interval was threaded through — makes the
+#: gate vacuous: bars days old would pass a check meant to catch minutes.
 _DAILY_STALE_MAX_AGE = timedelta(days=5)
 _INTRADAY_STALE_MAX_AGE = timedelta(minutes=45)
 
@@ -70,6 +78,10 @@ class StrategyRunSummary:
     proposals: int = 0
     executed: int = 0
     rejected: int = 0
+    #: Instruments the strategy could not evaluate for want of history. Counted
+    #: separately from `rejected`: nothing was judged and refused, the data to
+    #: judge it was not there.
+    skipped: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -123,12 +135,10 @@ class StrategyEngine:
             self._broker_kind = self._injected_broker.kind
         else:
             self._broker_kind = await active_broker_kind(self._session)
-        self._propose_only = (
-            self._broker_kind.is_live and not await autonomous_live_enabled(self._session)
+        self._propose_only = self._broker_kind.is_live and not await autonomous_live_enabled(
+            self._session
         )
-        broker = self._injected_broker or resolve_broker(
-            self._broker_kind, session=self._session
-        )
+        broker = self._injected_broker or resolve_broker(self._broker_kind, session=self._session)
         try:
             await self._evaluate_and_act(run, config, broker, instruments, summary, actor_user_id)
         finally:
@@ -166,9 +176,25 @@ class StrategyEngine:
             summary.errors.append(str(exc))
             return
 
+        # Instruments the store could not serve enough history for produced no
+        # signal because the strategy never saw them — record that explicitly, so
+        # a silent run is distinguishable from a considered "no".
+        for instrument_id, shortfall in ctx.insufficient_history.items():
+            self._skip_decision(run, config, instrument_id, shortfall)
+            summary.skipped += 1
+        if ctx.insufficient_history:
+            log.warning(
+                "strategy.insufficient_history",
+                run_id=str(run.id),
+                kind=config.kind.value,
+                instruments=len(ctx.insufficient_history),
+            )
+
         summary.signals = len(signals)
         for signal in signals:
-            await self._process(run, config, broker, signal, equity, summary)
+            await self._process(
+                run, config, broker, signal, equity, summary, strategy.read_interval
+            )
 
         run.status = StrategyRunStatus.COMPLETED
         run.completed_at = datetime.now(UTC)
@@ -181,7 +207,8 @@ class StrategyEngine:
             kind=AuditEventKind.STRATEGY_RUN_COMPLETED,
             summary=(
                 f"Strategy '{config.name}': {summary.signals} signals, "
-                f"{summary.executed} executed, {summary.rejected} rejected"
+                f"{summary.executed} executed, {summary.rejected} rejected, "
+                f"{summary.skipped} not evaluated"
             ),
             actor_kind=ActorKind.USER if actor_user_id else ActorKind.SCHEDULER,
             actor_user_id=actor_user_id,
@@ -191,6 +218,7 @@ class StrategyEngine:
                 "signals": summary.signals,
                 "executed": summary.executed,
                 "rejected": summary.rejected,
+                "skipped": summary.skipped,
             },
         )
         log.info(
@@ -198,6 +226,7 @@ class StrategyEngine:
             run_id=str(run.id),
             kind=config.kind.value,
             executed=summary.executed,
+            skipped=summary.skipped,
         )
 
     # -- Per-signal handling ------------------------------------------------
@@ -210,6 +239,7 @@ class StrategyEngine:
         signal: StrategySignal,
         equity: Decimal,
         summary: StrategyRunSummary,
+        interval: Interval,
     ) -> None:
         instrument = await self._session.get(Instrument, signal.instrument_id)
         if instrument is None:
@@ -231,7 +261,7 @@ class StrategyEngine:
             return
 
         # A long entry / add. Fail-closed gates first.
-        blocked = await self._blocked_reason(instrument)
+        blocked = await self._blocked_reason(instrument, interval)
         if blocked is not None:
             decision.outcome = StrategyDecisionOutcome.REJECTED_BY_RISK
             decision.reason = f"{signal.reason} — blocked: {blocked}"
@@ -406,43 +436,84 @@ class StrategyEngine:
         self._session.add(decision)
         return decision
 
+    def _skip_decision(
+        self,
+        run: StrategyRun,
+        config: StrategyConfiguration,
+        instrument_id: uuid.UUID,
+        reason: str,
+    ) -> StrategyDecision:
+        """Record an instrument the strategy could not evaluate at all.
+
+        `side` is null and conviction zero because nothing was decided — there
+        was no opinion to have. Without this row the only trace of a data
+        outage is a run whose `signals` count is zero, which reads exactly like
+        a healthy run that found no setup.
+        """
+        decision = StrategyDecision(
+            run_id=run.id,
+            configuration_id=config.id,
+            instrument_id=instrument_id,
+            kind=config.kind,
+            side=None,
+            conviction=Decimal(0),
+            outcome=StrategyDecisionOutcome.SKIPPED,
+            reason=f"Not evaluated: {reason}",
+        )
+        self._session.add(decision)
+        return decision
+
     async def _venue_ticker(self, instrument_id: uuid.UUID) -> str | None:
         """The current venue's ticker: instrument id for paper, BrokerInstrument for live."""
         if self._broker_kind is BrokerKind.INTERNAL_PAPER:
             return str(instrument_id)
         bi = (
-            await self._session.execute(
-                select(BrokerInstrument).where(
-                    BrokerInstrument.instrument_id == instrument_id,
-                    BrokerInstrument.broker == self._broker_kind,
+            (
+                await self._session.execute(
+                    select(BrokerInstrument).where(
+                        BrokerInstrument.instrument_id == instrument_id,
+                        BrokerInstrument.broker == self._broker_kind,
+                    )
                 )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         if bi is None or not bi.is_currently_available:
             return None
         return bi.broker_ticker
 
-    async def _blocked_reason(self, instrument: Instrument) -> str | None:
+    async def _blocked_reason(self, instrument: Instrument, interval: Interval) -> str | None:
+        """Halt and freshness gates for an entry, against the bars actually traded.
+
+        `interval` is the strategy's read interval, not a constant: a 15m
+        strategy entering on bars that are hours old is exactly what the
+        freshness gate exists to stop, and checking daily bars instead would let
+        it through.
+        """
         halt = await self._halts.blocking_halt(instrument.id)
         if halt is not None:
             return f"halt {halt.kind.value}"
-        interval = Interval.D1
-        max_age = _DAILY_STALE_MAX_AGE
+        max_age = _INTRADAY_STALE_MAX_AGE if interval.is_intraday else _DAILY_STALE_MAX_AGE
         if await self._store.is_stale(instrument.id, interval, max_age=max_age):
-            return "stale daily data"
+            return f"stale {interval.value} data (older than {max_age})"
         return None
 
     async def _close_intent(self, instrument_id: uuid.UUID, exit_price: Decimal | None) -> None:
         intent = (
-            await self._session.execute(
-                select(TradeIntent).where(
-                    TradeIntent.instrument_id == instrument_id,
-                    TradeIntent.broker == self._broker_kind,
-                    TradeIntent.status == TradeIntentStatus.RECONCILED,
-                    TradeIntent.closed_at.is_(None),
+            (
+                await self._session.execute(
+                    select(TradeIntent).where(
+                        TradeIntent.instrument_id == instrument_id,
+                        TradeIntent.broker == self._broker_kind,
+                        TradeIntent.status == TradeIntentStatus.RECONCILED,
+                        TradeIntent.closed_at.is_(None),
+                    )
                 )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         if intent is not None:
             intent.closed_at = datetime.now(UTC)
             intent.exit_price = exit_price
@@ -456,7 +527,7 @@ class StrategyEngine:
                 ids.add(uuid.UUID(str(raw)))
             except (ValueError, TypeError):
                 continue
-        for raw in (universe.get("weights") or {}):
+        for raw in universe.get("weights") or {}:
             try:
                 ids.add(uuid.UUID(str(raw)))
             except (ValueError, TypeError):

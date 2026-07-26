@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { type Account, type Health, type LiveStatus, api } from "@/lib/api";
 
@@ -32,18 +32,28 @@ export function NavBar() {
   const [liveStatus, setLiveStatus] = useState<LiveStatus | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
 
-  useEffect(() => {
+  // Best-effort: the nav must still render if any of these fail (e.g. a broker
+  // outage), so each is swallowed independently.
+  const refresh = useCallback(() => {
     if (isBare) return;
-    let cancelled = false;
-    // Best-effort: the nav must still render if any of these fail (e.g. a broker
-    // outage), so each is swallowed independently.
-    void api.activeAccount().then((a) => !cancelled && setAccount(a)).catch(() => {});
-    void api.liveStatus().then((s) => !cancelled && setLiveStatus(s)).catch(() => {});
-    void api.health().then((h) => !cancelled && setHealth(h)).catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [isBare, pathname]);
+    void api.activeAccount().then(setAccount).catch(() => {});
+    void api.liveStatus().then(setLiveStatus).catch(() => {});
+    void api.health().then(setHealth).catch(() => {});
+  }, [isBare]);
+
+  // Refetch on mount and whenever the route changes.
+  useEffect(() => {
+    refresh();
+  }, [refresh, pathname]);
+
+  // …and immediately when the venue is switched elsewhere (the Settings toggle
+  // fires `venue:changed`), so the paper/live pill never lags the real mode —
+  // switching to live must be reflected the instant it happens.
+  useEffect(() => {
+    const onVenueChanged = () => refresh();
+    window.addEventListener("venue:changed", onVenueChanged);
+    return () => window.removeEventListener("venue:changed", onVenueChanged);
+  }, [refresh]);
 
   if (isBare) return null;
 

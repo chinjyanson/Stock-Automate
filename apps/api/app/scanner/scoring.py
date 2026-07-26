@@ -32,15 +32,34 @@ from app.indicators.series import PriceSeries
 from app.models.scanner import Classification
 
 # -- Default weights (§6). Sum to 100. --------------------------------------
+# `sector` scores the health of the instrument's own industry (via its sector
+# ETF); the others were trimmed to make room while keeping the 0-100 scale, so
+# the screening/watchlist thresholds still mean the same thing.
 DEFAULT_WEIGHTS: dict[str, float] = {
-    "trend": 25.0,
+    "trend": 20.0,
     "momentum": 20.0,
-    "risk": 20.0,
-    "liquidity": 20.0,
-    "positioning": 15.0,
+    "risk": 15.0,
+    "liquidity": 15.0,
+    "positioning": 10.0,
+    "sector": 20.0,
 }
 
 DEFAULT_THRESHOLDS: dict[str, float] = {"screening": 75.0, "watchlist": 60.0}
+
+# -- Final-score factor weights. Fundamentals-first: intrinsic value + P/E lead,
+# with price cheapness and the reversal/quality/sector signals in support. Sum to
+# 1.0; a missing factor drops out and the rest re-normalise (see combine_final_score).
+DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
+    "fundamental_value": 0.35,
+    "price_cheapness": 0.20,
+    "reversal": 0.20,
+    "quality": 0.15,
+    "sector": 0.10,
+}
+
+#: A stock with no fundamentals at all loses this fraction of its final score — a
+#: mild, deliberate disadvantage (we cannot confirm the value is real), not a cliff.
+DEFAULT_FUNDAMENTALS_PENALTY = 0.10
 
 #: Preferred minimum history (§6). Scoring proceeds below this with reduced
 #: confidence rather than refusing — a shorter series is still informative,
@@ -117,6 +136,13 @@ class ScoreResult:
     negative_signals: list[str] = field(default_factory=list)
     missing_information: list[str] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
+    # -- The five factors the *primary* (final) score blends (each 0-100, or None
+    # when uncomputable). See combine_final_score.
+    fundamental_value: float | None = None  # intrinsic value + P/E (heaviest)
+    price_cheapness: float | None = None  # price pulled back / oversold
+    reversal: float | None = None  # turning up from a decline
+    quality: float | None = None  # fundamentals soundness + low-risk + liquidity
+    sector_factor: float | None = None  # sector-ETF health, 0-100
 
 
 def _category_points(signals: list[SubSignal], max_points: float, name: str) -> CategoryScore:
@@ -157,9 +183,17 @@ def score_series(
     weights: dict[str, float] | None = None,
     thresholds: dict[str, float] | None = None,
     benchmark: PriceSeries | None = None,
+    sector: PriceSeries | None = None,
     fundamentals: dict[str, Decimal | None] | None = None,
 ) -> ScoreResult:
-    """Score one instrument's series. Pure — no I/O, fully deterministic."""
+    """Score one instrument's series. Pure — no I/O, fully deterministic.
+
+    `sector`, when given, is the price series of the instrument's sector proxy
+    (a sector ETF). It feeds two things: a relative-strength-vs-sector momentum
+    signal, and a dedicated `sector` category measuring the industry's own
+    health. Absent (untagged instrument, or a sector with no proxy) it drops out
+    with no penalty, exactly like `benchmark`.
+    """
     weights = weights or DEFAULT_WEIGHTS
     thresholds = thresholds or DEFAULT_THRESHOLDS
     closes = series.preferred_close
@@ -167,23 +201,25 @@ def score_series(
     metrics: dict[str, Any] = {}
 
     trend = _score_trend(series, closes, metrics)
-    momentum = _score_momentum(closes, benchmark, metrics)
+    momentum = _score_momentum(closes, benchmark, sector, metrics)
     risk = _score_risk(closes, metrics)
     liquidity = _score_liquidity(closes, volumes, metrics)
     positioning = _score_positioning(closes, metrics)
+    sector_signals = _score_sector(closes, sector, metrics)
 
     categories = {
-        "trend": _category_points(trend, weights.get("trend", 25.0), "trend"),
+        "trend": _category_points(trend, weights.get("trend", 20.0), "trend"),
         "momentum": _category_points(momentum, weights.get("momentum", 20.0), "momentum"),
-        "risk": _category_points(risk, weights.get("risk", 20.0), "risk"),
-        "liquidity": _category_points(liquidity, weights.get("liquidity", 20.0), "liquidity"),
+        "risk": _category_points(risk, weights.get("risk", 15.0), "risk"),
+        "liquidity": _category_points(liquidity, weights.get("liquidity", 15.0), "liquidity"),
         "positioning": _category_points(
-            positioning, weights.get("positioning", 15.0), "positioning"
+            positioning, weights.get("positioning", 10.0), "positioning"
         ),
+        "sector": _category_points(sector_signals, weights.get("sector", 20.0), "sector"),
     }
     core_score = sum(c.points for c in categories.values())
 
-    all_signals = trend + momentum + risk + liquidity + positioning
+    all_signals = trend + momentum + risk + liquidity + positioning + sector_signals
     available = sum(1 for s in all_signals if s.available)
     completeness = available / len(all_signals) if all_signals else 0.0
 
@@ -194,6 +230,13 @@ def score_series(
 
     fundamental_score = _score_fundamentals(fundamentals) if fundamentals else None
     value = score_value(series, fundamentals=fundamentals)
+
+    # -- The five factors the final score blends. Reuse the signals already
+    # computed here (risk/liquidity for soundness, the value lens for
+    # cheapness/intrinsic), and add the reversal read.
+    reversal_score = score_reversal(series)
+    quality_score = _score_quality(risk, liquidity, fundamentals)
+    sector_factor = _factor_from_signals(sector_signals)
 
     positives = [s.explanation for s in all_signals if s.available and s.positive and s.explanation]
     negatives = [
@@ -214,6 +257,11 @@ def score_series(
         negative_signals=negatives,
         missing_information=missing,
         metrics=metrics,
+        fundamental_value=value.fundamental_value_score if value else None,
+        price_cheapness=value.price_value_score if value else None,
+        reversal=round(reversal_score, 2) if reversal_score is not None else None,
+        quality=round(quality_score, 2),
+        sector_factor=round(sector_factor, 2) if sector_factor is not None else None,
     )
 
 
@@ -241,6 +289,60 @@ def combine_primary_score(
         return momentum_core
     effective_value = value_score if value_score is not None else 50.0
     return (momentum_weight * momentum_core + value_weight * effective_value) / total
+
+
+def combine_final_score(
+    result: ScoreResult,
+    *,
+    weights: dict[str, float] | None = None,
+    fundamentals_penalty: float = DEFAULT_FUNDAMENTALS_PENALTY,
+) -> float:
+    """The absolute 0-100 ranking score: a fundamentals-first weighted blend.
+
+    Weighted average of the five factors, over *available* factors only (a
+    missing factor drops out and the remainder re-normalise), so the result is
+    always a clean 0-100 and absence is neutral — not zero. Because the factors
+    are different axes (intrinsic value / price level / turn / soundness /
+    sector) rather than inverses, the blend reinforces instead of cancelling.
+
+    A stock with no fundamentals at all (its Fundamental Value factor is None)
+    additionally loses `fundamentals_penalty` of its score: a deliberate, mild
+    disadvantage since its value cannot be confirmed. The score is *absolute* —
+    it does not depend on the rest of the scanned batch — so it is comparable run
+    to run.
+    """
+    weights = weights or DEFAULT_FACTOR_WEIGHTS
+    factors: dict[str, float | None] = {
+        "fundamental_value": result.fundamental_value,
+        "price_cheapness": result.price_cheapness,
+        "reversal": result.reversal,
+        "quality": result.quality,
+        "sector": result.sector_factor,
+    }
+
+    weighted = 0.0
+    total_weight = 0.0
+    for name, score in factors.items():
+        if score is None:
+            continue
+        w = weights.get(name, 0.0)
+        weighted += w * score
+        total_weight += w
+    if total_weight <= 0:
+        return 0.0
+
+    final = weighted / total_weight
+    if result.fundamental_value is None:
+        final *= 1.0 - fundamentals_penalty
+    return round(_clamp01(final / 100.0) * 100.0, 2)
+
+
+def _factor_from_signals(signals: list[SubSignal]) -> float | None:
+    """A 0-100 factor score from raw sub-signals, or None if none are available."""
+    available = [s.value for s in signals if s.available]
+    if not available:
+        return None
+    return 100.0 * sum(available) / len(available)
 
 
 def classify(core_score: float, thresholds: dict[str, float] | None = None) -> Classification:
@@ -335,7 +437,10 @@ def _score_trend(series: PriceSeries, closes: Any, metrics: dict[str, Any]) -> l
 
 
 def _score_momentum(
-    closes: Any, benchmark: PriceSeries | None, metrics: dict[str, Any]
+    closes: Any,
+    benchmark: PriceSeries | None,
+    sector: PriceSeries | None,
+    metrics: dict[str, Any],
 ) -> list[SubSignal]:
     windows = {
         "1m": ind.TRADING_DAYS_PER_MONTH,
@@ -380,6 +485,30 @@ def _score_momentum(
             )
     else:
         signals.append(SubSignal("relative_momentum_12m", False))
+
+    # Relative strength vs the instrument's own sector — beating your peers is a
+    # stronger signal than beating the broad market. Same shape as the benchmark
+    # signal; drops out when there is no sector proxy.
+    if sector is not None:
+        rel_sector = ind.relative_momentum(
+            closes, sector.preferred_close, ind.TRADING_DAYS_PER_YEAR
+        )
+        metrics["relative_momentum_vs_sector_12m"] = rel_sector
+        if rel_sector is None:
+            signals.append(SubSignal("relative_momentum_vs_sector", False))
+        else:
+            strength = _clamp01(0.5 + rel_sector / 0.4)
+            signals.append(
+                SubSignal(
+                    "relative_momentum_vs_sector",
+                    True,
+                    strength,
+                    f"12-month return vs its sector is {rel_sector:+.1%}",
+                    positive=rel_sector > 0,
+                )
+            )
+    else:
+        signals.append(SubSignal("relative_momentum_vs_sector", False))
 
     return signals
 
@@ -553,6 +682,169 @@ def _score_positioning(closes: Any, metrics: dict[str, Any]) -> list[SubSignal]:
     return signals
 
 
+def _score_sector(
+    closes: Any, sector: PriceSeries | None, metrics: dict[str, Any]
+) -> list[SubSignal]:
+    """Health of the instrument's own sector, via its sector-ETF proxy (§6).
+
+    Rewards being in an industry that is itself in favour: the sector index above
+    its 200-day average, that average rising, and positive medium-term sector
+    momentum. Entirely dropped (never penalised) when the instrument has no
+    sector tag or its sector has no proxy series — every sub-signal reports
+    unavailable and `_category_points` awards the neutral midpoint, the same
+    missing-data discipline as any other category.
+    """
+    if sector is None:
+        return [
+            SubSignal("sector_above_200d", False),
+            SubSignal("sector_trend_rising", False),
+            SubSignal("sector_momentum_3m", False),
+            SubSignal("sector_momentum_6m", False),
+        ]
+
+    sclose = sector.preferred_close
+    price = float(sclose[-1]) if sclose.size else None
+    sma200 = ind.simple_moving_average(sclose, 200)
+    slope = ind.sma_slope(sclose, 200, slope_window=21)
+    ret3m = ind.trailing_return(sclose, ind.TRADING_DAYS_PER_MONTH * 3)
+    ret6m = ind.trailing_return(sclose, ind.TRADING_DAYS_PER_MONTH * 6)
+    metrics.update(
+        {
+            "sector_sma200": sma200,
+            "sector_sma200_slope": slope,
+            "sector_return_3m": ret3m,
+            "sector_return_6m": ret6m,
+        }
+    )
+
+    signals: list[SubSignal] = []
+
+    if price is not None and sma200 is not None:
+        above = price > sma200
+        signals.append(
+            SubSignal(
+                "sector_above_200d",
+                True,
+                1.0 if above else 0.0,
+                "Sector is above its 200-day average"
+                if above
+                else "Sector is below its 200-day average",
+                positive=above,
+            )
+        )
+    else:
+        signals.append(SubSignal("sector_above_200d", False))
+
+    if slope is not None:
+        signals.append(
+            SubSignal(
+                "sector_trend_rising",
+                True,
+                _clamp01(0.5 + slope / 0.002),
+                "Sector trend is rising" if slope > 0 else "Sector trend is falling",
+                positive=slope > 0,
+            )
+        )
+    else:
+        signals.append(SubSignal("sector_trend_rising", False))
+
+    for label, ret in (("3m", ret3m), ("6m", ret6m)):
+        if ret is None:
+            signals.append(SubSignal(f"sector_momentum_{label}", False))
+        else:
+            signals.append(
+                SubSignal(
+                    f"sector_momentum_{label}",
+                    True,
+                    _clamp01(0.5 + ret / 0.4),
+                    f"Sector {label} return is {ret:+.1%}",
+                    positive=ret > 0,
+                )
+            )
+
+    return signals
+
+
+def score_reversal(series: PriceSeries) -> float | None:
+    """How strongly a beaten-down instrument is *turning up* (0-100), or None.
+
+    The "predicted to recover" signal: a stock that fell but is now stabilising
+    and inflecting higher. Distinct from cheapness (a price *level*) and from
+    momentum (already up) — it reads the recent *derivative*. Missing sub-signals
+    drop out; None when history is too short to read a turn.
+    """
+    closes = series.preferred_close
+    if closes.size < 30:
+        return None
+    price = float(closes[-1])
+    signals: list[SubSignal] = []
+
+    # RSI rising, especially off an oversold trough ~10 sessions ago.
+    rsi_now = ind.relative_strength_index(closes, 14)
+    rsi_prev = ind.relative_strength_index(closes[:-10], 14) if closes.size > 24 else None
+    if rsi_now is not None and rsi_prev is not None:
+        strength = _clamp01(0.5 + (rsi_now - rsi_prev) / 20.0)
+        if rsi_prev < 40 and rsi_now < 60:
+            strength = _clamp01(strength + 0.2)
+        signals.append(SubSignal("rsi_turning_up", True, strength))
+
+    # Reclaimed the 20-day average (short-term trend regained).
+    sma20 = ind.simple_moving_average(closes, 20)
+    if sma20 is not None and sma20 > 0:
+        signals.append(
+            SubSignal("reclaimed_20d", True, _clamp01(0.5 + (price - sma20) / sma20 / 0.10))
+        )
+
+    # Short-term up while the medium term is still down = a bottom forming.
+    ret1m = ind.trailing_return(closes, ind.TRADING_DAYS_PER_MONTH)
+    ret6m = ind.trailing_return(closes, ind.TRADING_DAYS_PER_MONTH * 6)
+    if ret1m is not None and ret6m is not None and ret6m < 0:
+        signals.append(SubSignal("momentum_inflection", True, _clamp01(ret1m / 0.10)))
+
+    # Bounced off the 52-week low, but not yet recovered (sweet spot ~15% up).
+    dist_low = ind.distance_from_low(closes)
+    if dist_low is not None:
+        off_low = (
+            _clamp01(dist_low / 0.15)
+            if dist_low <= 0.15
+            else _clamp01(1.0 - (dist_low - 0.15) / 0.35)
+        )
+        signals.append(SubSignal("off_the_low", True, off_low))
+
+    # Recent selling pressure easing vs the longer window.
+    dd20 = ind.downside_deviation(closes, 20)
+    dd60 = ind.downside_deviation(closes, 60)
+    if dd20 is not None and dd60 is not None and dd60 > 0:
+        signals.append(SubSignal("downside_easing", True, _clamp01(1.0 - dd20 / dd60)))
+
+    return _factor_from_signals(signals)
+
+
+def _score_quality(
+    risk_signals: list[SubSignal],
+    liquidity_signals: list[SubSignal],
+    fundamentals: dict[str, Decimal | None] | None,
+) -> float:
+    """Is this a sound business, not a falling knife (0-100)?
+
+    Blends fundamental quality (margins, growth, low debt — when available) with
+    always-computable soundness from candles (low volatility, contained drawdown,
+    liquidity). The soundness half comes from prices, so quality is always
+    scorable even with no fundamentals.
+    """
+    parts: list[float] = []
+    fund_q = _score_fundamentals(fundamentals) if fundamentals else None
+    if fund_q is not None:
+        parts.append(fund_q / 100.0)
+    for signals in (risk_signals, liquidity_signals):
+        available = [s.value for s in signals if s.available]
+        if available:
+            parts.append(sum(available) / len(available))
+    if not parts:
+        return 50.0
+    return 100.0 * sum(parts) / len(parts)
+
+
 def score_value(
     series: PriceSeries, *, fundamentals: dict[str, Decimal | None] | None = None
 ) -> ValueResult:
@@ -690,17 +982,32 @@ def _score_fundamental_value(fundamentals: dict[str, Decimal | None]) -> float |
     separate is what lets a reader tell them apart.
     """
     signals: list[SubSignal] = []
-
     pe = fundamentals.get("trailing_pe")
+    ptb = fundamentals.get("price_to_book")
+
     if pe is not None and pe > 0:
         # Earnings yield = 1/PE. A PE of 10 (10% yield) is cheap; 40 is not.
         earnings_yield = 1.0 / float(pe)
         signals.append(SubSignal("earnings_yield", True, _clamp01(earnings_yield / 0.10)))
 
-    ptb = fundamentals.get("price_to_book")
     if ptb is not None and ptb > 0:
         # P/B of 1 or below is cheap; above ~5 is not.
         signals.append(SubSignal("price_to_book", True, _clamp01(1.0 - (float(ptb) - 1.0) / 4.0)))
+
+    # Graham intrinsic value: fair when P/E·P/B = 22.5, so the margin of safety
+    # below that fair value is 1 − √(P/E·P/B / 22.5). ~50%+ below reads as a full
+    # signal; at or above Graham fair value it is zero. Needs both ratios.
+    if pe is not None and pe > 0 and ptb is not None and ptb > 0:
+        import math
+
+        margin_of_safety = 1.0 - math.sqrt(float(pe) * float(ptb) / 22.5)
+        signals.append(SubSignal("graham_margin_of_safety", True, _clamp01(margin_of_safety / 0.5)))
+
+    # PEG: P/E relative to earnings growth. Cheap vs growth when ≤ 1.
+    growth = fundamentals.get("earnings_growth")
+    if pe is not None and pe > 0 and growth is not None and float(growth) > 0:
+        peg = float(pe) / (float(growth) * 100.0)
+        signals.append(SubSignal("peg", True, _clamp01((2.0 - peg) / 1.5)))
 
     dy = fundamentals.get("dividend_yield")
     if dy is not None and dy >= 0:

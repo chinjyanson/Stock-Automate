@@ -25,10 +25,11 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.enums import BrokerKind, Interval, LifecycleState
-from app.models.instrument import BrokerInstrument, Instrument, WatchlistInstrument
+from app.models.instrument import BrokerInstrument, Instrument
 from app.models.market_data import Candle
 from app.models.scanner import Classification, ScannerConfiguration, ScannerResult
 from app.scanner.engine import MIN_BARS_TO_SCORE
+from app.scanner.watchlist import watchlisted_instrument_ids
 
 #: Upper bound on the rotation candidate pool fetched per scan, before the
 #: per-scan instrument cap is applied. A safety bound on the query, not the
@@ -68,8 +69,14 @@ async def select_instruments(
                 seen.add(iid)
                 ordered_ids.append(iid)
 
-    # Tier 1: watchlist members.
-    _extend(await _watchlist_instrument_ids(session))
+    # Tier 1: watchlist members. Pinning an instrument is a promise that it gets
+    # looked at next run, so the ways that promise can fail are counted and
+    # reported below rather than being quietly absorbed.
+    watchlisted = await watchlisted_instrument_ids(session)
+    _extend(watchlisted)
+    unscannable = [iid for iid in watchlisted if iid not in eligible_ids]
+    watchlist_selected = len(ordered_ids)
+
     # Tier 2: previously high-ranking candidates.
     _extend(await _previous_candidate_ids(session))
     # Tiers 3+4: the rotating sweep, oldest-scanned first. Restricted to the
@@ -83,10 +90,25 @@ async def select_instruments(
         return [], "no eligible instruments"
 
     instruments = await _load(session, chosen_ids)
-    reason = (
+
+    parts = [
         f"rotation: {len(chosen_ids)} instruments (watchlist + prior candidates + oldest-scanned)"
-    )
-    return instruments, reason
+    ]
+    if watchlist_selected:
+        parts.append(f"{min(watchlist_selected, max_instruments)} watchlisted")
+    if unscannable:
+        # Pinned, but with fewer than MIN_BARS_TO_SCORE stored daily bars, so
+        # scoring it would only produce a skip. Named here because "I watchlisted
+        # it and it never appears" is otherwise indistinguishable from a bug.
+        parts.append(f"{len(unscannable)} watchlisted excluded: too little stored history to score")
+    if watchlist_selected > max_instruments:
+        # The cap is a data-budget guard (§6) and still wins, but a watchlist
+        # bigger than a whole scan means some pins genuinely will not be honoured.
+        parts.append(
+            f"WARNING: watchlist ({watchlist_selected}) exceeds the per-scan cap "
+            f"({max_instruments}); the newest pins were not selected"
+        )
+    return instruments, "; ".join(parts)
 
 
 def _max_instruments(config: ScannerConfiguration | None, limit: int | None) -> int:
@@ -95,11 +117,6 @@ def _max_instruments(config: ScannerConfiguration | None, limit: int | None) -> 
     if config is not None:
         return config.max_instruments_per_scan
     return 200
-
-
-async def _watchlist_instrument_ids(session: AsyncSession) -> list[uuid.UUID]:
-    result = await session.execute(select(WatchlistInstrument.instrument_id))
-    return [row[0] for row in result.all()]
 
 
 async def _previous_candidate_ids(session: AsyncSession) -> list[uuid.UUID]:

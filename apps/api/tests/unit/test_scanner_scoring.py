@@ -147,9 +147,108 @@ class TestConfidenceAndCompleteness:
         assert 0.0 <= result.data_completeness <= 1.0
 
     def test_full_series_has_full_completeness(self) -> None:
-        # A 300-bar series with volume can compute every signal.
-        result = scoring.score_series(_rising_series(n=300))
+        # Every signal is computable only with volume AND the two optional
+        # comparison series (benchmark + sector); without them the relative and
+        # sector signals correctly report unavailable.
+        result = scoring.score_series(
+            _rising_series(n=300),
+            benchmark=_rising_series(n=300),
+            sector=_rising_series(n=300),
+        )
         assert result.data_completeness > 0.9
+
+
+class TestSectorScoring:
+    def test_rising_sector_scores_higher_than_falling_sector(self) -> None:
+        """The sector-health category tracks the sector proxy's own trend."""
+        stock = _rising_series(n=300)
+        up = scoring.score_series(stock, sector=_rising_series(n=300))
+        down = scoring.score_series(stock, sector=_falling_series(n=300))
+        assert up.categories["sector"].points > down.categories["sector"].points
+
+    def test_outperforming_its_sector_reads_positive(self) -> None:
+        """Relative strength = stock return − sector return; beating peers is +."""
+        strong = _rising_series(n=300, daily=0.003)
+        result = scoring.score_series(strong, sector=_falling_series(n=300))
+        assert result.metrics["relative_momentum_vs_sector_12m"] > 0
+
+    def test_missing_sector_is_neutral_not_penalised(self) -> None:
+        """No sector proxy → the category is scored at the neutral midpoint, and
+        contributes no sector metrics — the same discipline as any missing data."""
+        result = scoring.score_series(_rising_series(n=300))
+        sector_cat = result.categories["sector"]
+        assert sector_cat.signals_available == 0
+        assert sector_cat.points == sector_cat.max_points * 0.5
+        assert "sector_sma200" not in result.metrics
+        assert "relative_momentum_vs_sector_12m" not in result.metrics
+
+
+class TestFundamentalsFirstScoring:
+    def _result(self, **factors: float | None) -> scoring.ScoreResult:
+        """A minimal ScoreResult carrying just the five final-score factors."""
+        from app.models.scanner import Classification
+
+        return scoring.ScoreResult(
+            core_score=50.0,
+            categories={},
+            fundamental_score=None,
+            classification=Classification.DOES_NOT_PASS,
+            data_completeness=1.0,
+            confidence=1.0,
+            candles_used=300,
+            **factors,
+        )
+
+    def test_intrinsic_value_rewards_cheap_fundamentals(self) -> None:
+        cheap = scoring.score_value(
+            _rising_series(n=300),
+            fundamentals={"trailing_pe": Decimal("8"), "price_to_book": Decimal("1.0")},
+        )
+        dear = scoring.score_value(
+            _rising_series(n=300),
+            fundamentals={"trailing_pe": Decimal("40"), "price_to_book": Decimal("8")},
+        )
+        assert cheap.fundamental_value_score is not None
+        assert dear.fundamental_value_score is not None
+        assert cheap.fundamental_value_score > dear.fundamental_value_score
+
+    def test_final_score_is_a_clean_0_100(self) -> None:
+        r = self._result(
+            fundamental_value=80, price_cheapness=60, reversal=70, quality=55, sector_factor=50
+        )
+        final = scoring.combine_final_score(r)
+        assert 0.0 <= final <= 100.0
+        # Weighted average of the factors (fundamentals lead at 0.35).
+        assert abs(final - (0.35 * 80 + 0.20 * 60 + 0.20 * 70 + 0.15 * 55 + 0.10 * 50)) < 0.01
+
+    def test_missing_fundamentals_is_penalised_but_not_buried(self) -> None:
+        with_f = self._result(
+            fundamental_value=70, price_cheapness=60, reversal=70, quality=55, sector_factor=50
+        )
+        without_f = self._result(
+            fundamental_value=None, price_cheapness=60, reversal=70, quality=55, sector_factor=50
+        )
+        # No fundamentals → scored on the rest (renormalised) × 0.90 penalty, so
+        # strictly lower, but still a real score (not zeroed).
+        assert scoring.combine_final_score(without_f) < scoring.combine_final_score(with_f)
+        assert scoring.combine_final_score(without_f) > 40.0
+
+    def test_score_is_absolute_not_cohort_relative(self) -> None:
+        # The same inputs always produce the same score — it never depends on
+        # what else was in the batch.
+        r = self._result(fundamental_value=75, price_cheapness=55, reversal=60, quality=50, sector_factor=45)
+        assert scoring.combine_final_score(r) == scoring.combine_final_score(r)
+
+
+class TestReversalScoring:
+    def test_bottoming_series_scores_higher_than_still_falling(self) -> None:
+        # A V-shape: 150 sessions down, then 30 turning up.
+        down = [100.0 * (0.995**i) for i in range(150)]
+        up = [down[-1] * (1.01**i) for i in range(1, 31)]
+        bottoming = scoring.score_reversal(_series_from_closes(down + up))
+        falling = scoring.score_reversal(_falling_series(n=180))
+        assert bottoming is not None and falling is not None
+        assert bottoming > falling
 
 
 class TestExplanations:

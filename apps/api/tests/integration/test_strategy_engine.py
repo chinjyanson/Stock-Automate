@@ -64,9 +64,15 @@ async def _instrument(db: object, ticker: str) -> Instrument:
 
 
 async def _upsert(
-    db: object, instrument: Instrument, interval: Interval, closes: list[float]
+    db: object,
+    instrument: Instrument,
+    interval: Interval,
+    closes: list[float],
+    *,
+    age: timedelta = timedelta(0),
 ) -> None:
-    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    """Seed `closes` as candles, the last one `age` old (fresh by default)."""
+    now = datetime.now(UTC).replace(second=0, microsecond=0) - age
     step = _STEP[interval]
     n = len(closes)
     candles = [
@@ -184,6 +190,133 @@ class TestMeanReversion:
         assert summary.signals == 1
         assert summary.executed == 1
 
+    async def test_stale_intraday_bars_block_the_entry(self, db: object) -> None:
+        """Freshness is judged on the bars traded, not on daily ones.
+
+        The daily series here is current, so a gate hardcoded to `Interval.D1`
+        would wave this through — and fill on 15-minute prices three hours old.
+        """
+        await _risk_config(db)
+        instrument = await _instrument(db, "SPY")
+        await _upsert(db, instrument, Interval.D1, [100.0] * 60)
+        intraday = [100.0] * 185 + [98, 96, 94, 92, 90, 88, 86, 84, 82, 80, 78, 76, 74, 72, 70]
+        await _upsert(db, instrument, Interval.M15, intraday, age=timedelta(hours=3))
+
+        config = StrategyConfiguration(
+            kind=StrategyKind.SP500_MEAN_REVERSION,
+            name="meanrev-stale",
+            is_active=True,
+            interval=Interval.M15,
+            auto_execute=True,
+            params={
+                "sma_period": 20,
+                "zscore_entry": -1.0,
+                "rsi_period": 14,
+                "rsi_oversold": 45.0,
+                "zscore_exit": 0.0,
+            },
+            universe={"instrument_ids": [str(instrument.id)]},
+        )
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        summary = await StrategyEngine(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).run(config)
+        await db.commit()  # type: ignore[attr-defined]
+
+        # The setup was seen and signalled, then refused at the gate.
+        assert summary.signals == 1
+        assert summary.executed == 0
+        assert summary.rejected == 1
+        decision = (
+            (await db.execute(select(StrategyDecision)))  # type: ignore[attr-defined]
+            .scalars()
+            .one()
+        )
+        assert decision.outcome is StrategyDecisionOutcome.REJECTED_BY_RISK
+        assert "stale 15m data" in decision.reason
+        assert await InternalPaperBroker(db).get_positions() == []  # type: ignore[arg-type]
+
+
+class TestInsufficientHistory:
+    async def test_too_few_bars_is_recorded_not_silent(self, db: object) -> None:
+        """A strategy that could not look must not resemble one that found nothing.
+
+        Both report zero signals; only the SKIPPED decision distinguishes them,
+        and its absence is why a fortnight of empty intraday runs went unnoticed.
+        """
+        await _risk_config(db)
+        instrument = await _instrument(db, "THIN")
+        # 10 bars against a 20-period SMA: nowhere near enough to evaluate.
+        await _upsert(db, instrument, Interval.M15, [100.0] * 10)
+
+        config = StrategyConfiguration(
+            kind=StrategyKind.SP500_MEAN_REVERSION,
+            name="meanrev-thin",
+            is_active=True,
+            interval=Interval.M15,
+            auto_execute=True,
+            params={"sma_period": 20},
+            universe={"instrument_ids": [str(instrument.id)]},
+        )
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        summary = await StrategyEngine(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).run(config)
+        await db.commit()  # type: ignore[attr-defined]
+
+        assert summary.signals == 0
+        assert summary.skipped == 1
+        decision = (
+            (await db.execute(select(StrategyDecision)))  # type: ignore[attr-defined]
+            .scalars()
+            .one()
+        )
+        assert decision.outcome is StrategyDecisionOutcome.SKIPPED
+        # Nothing was decided, so there is no side to record.
+        assert decision.side is None
+        assert decision.instrument_id == instrument.id
+        assert "10 closed 15m bars available, needs 21" in decision.reason
+
+    async def test_sufficient_history_records_no_skip(self, db: object) -> None:
+        """The counterpart: a real evaluation that declines leaves no skip behind."""
+        await _risk_config(db)
+        instrument = await _instrument(db, "CALM")
+        # Flat and plentiful: evaluated in full, and legitimately uninteresting.
+        await _upsert(db, instrument, Interval.M15, [100.0 + (i % 3) * 0.1 for i in range(120)])
+
+        config = StrategyConfiguration(
+            kind=StrategyKind.SP500_MEAN_REVERSION,
+            name="meanrev-calm",
+            is_active=True,
+            interval=Interval.M15,
+            auto_execute=True,
+            params={"sma_period": 20},
+            universe={"instrument_ids": [str(instrument.id)]},
+        )
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        summary = await StrategyEngine(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).run(config)
+        await db.commit()  # type: ignore[attr-defined]
+
+        assert summary.signals == 0
+        assert summary.skipped == 0
+        assert (
+            (await db.execute(select(StrategyDecision)))  # type: ignore[attr-defined]
+            .scalars()
+            .all()
+            == []
+        )
+
 
 class TestPie:
     async def test_rebalance_buys_toward_target_weights(self, db: object) -> None:
@@ -250,7 +383,11 @@ class TestRiskGate:
         assert summary.executed == 0
         assert summary.rejected == 1
         decision = (
-            await db.execute(select(StrategyDecision))  # type: ignore[attr-defined]
-        ).scalars().one()
+            (
+                await db.execute(select(StrategyDecision))  # type: ignore[attr-defined]
+            )
+            .scalars()
+            .one()
+        )
         assert decision.outcome is StrategyDecisionOutcome.REJECTED_BY_RISK
         assert await InternalPaperBroker(db).get_positions() == []  # type: ignore[arg-type]

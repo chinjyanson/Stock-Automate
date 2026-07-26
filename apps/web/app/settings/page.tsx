@@ -106,6 +106,7 @@ export default function SettingsPage() {
         await action();
         if (successMessage) toast.success(successMessage);
         await load();
+        window.dispatchEvent(new Event("venue:changed"));
       } catch (err) {
         if (isReauthError(err)) {
           const pw = window.prompt("Confirm your password to continue:");
@@ -115,6 +116,7 @@ export default function SettingsPage() {
             await action();
             if (successMessage) toast.success(successMessage);
             await load();
+            window.dispatchEvent(new Event("venue:changed"));
           } catch (err2) {
             toast.error(err2 instanceof ApiError ? err2.message : "Action failed");
           }

@@ -39,6 +39,11 @@ class StrategySignal:
     metrics: dict[str, float] = field(default_factory=dict)
 
 
+#: Floor below which no indicator in this codebase is meaningful, whatever a
+#: strategy asks for. A strategy needing more says so via `series(required=...)`.
+_MIN_SERIES_BARS = 20
+
+
 @dataclass
 class StrategyContext:
     """Everything a strategy pass needs, resolved once by the engine."""
@@ -47,6 +52,11 @@ class StrategyContext:
     store: CandleStore
     instruments: list[Instrument]
     positions: list[BrokerPosition]
+    #: Instruments `series()` could not serve, and why. Populated as a side
+    #: effect so strategies stay branch-free about it; the engine drains this
+    #: into SKIPPED decisions after the pass, which is what makes a data outage
+    #: visible instead of looking like a run that found no setup.
+    insufficient_history: dict[uuid.UUID, str] = field(default_factory=dict)
 
     def held_quantity(self, instrument_id: uuid.UUID) -> Decimal:
         """How much of `instrument_id` the paper venue currently holds."""
@@ -57,17 +67,32 @@ class StrategyContext:
         )
 
     async def series(
-        self, instrument_id: uuid.UUID, interval: Interval, *, limit: int = 250
+        self,
+        instrument_id: uuid.UUID,
+        interval: Interval,
+        *,
+        limit: int = 250,
+        required: int = _MIN_SERIES_BARS,
     ) -> PriceSeries | None:
         """Closed candles for an instrument at `interval`, as a `PriceSeries`.
 
-        None when there is not enough history to form even a short series — the
-        strategy then simply produces no signal for that instrument (fail closed).
+        `required` is the strategy's own minimum — the longest lookback it will
+        index into. Passing it here rather than re-checking `series.length`
+        afterwards keeps the shortfall recordable: a strategy that discards a
+        too-short series itself leaves no trace of having done so.
+
+        Returns None when the store cannot meet it, recording the shortfall in
+        `insufficient_history`. The strategy then produces no signal for that
+        instrument (fail closed).
         """
+        floor = max(required, _MIN_SERIES_BARS)
         candles = await self.store.get_candles(
-            instrument_id, interval, limit=limit, closed_only=True
+            instrument_id, interval, limit=max(limit, floor), closed_only=True
         )
-        if len(candles) < 20:
+        if len(candles) < floor:
+            self.insufficient_history[instrument_id] = (
+                f"{len(candles)} closed {interval.value} bars available, needs {floor}"
+            )
             return None
         return candles_to_series(candles)
 

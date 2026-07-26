@@ -27,15 +27,23 @@ class TrendFollowingStrategy(Strategy):
 
         signals: list[StrategySignal] = []
         for instrument in ctx.instruments:
-            series = await ctx.series(instrument.id, self.read_interval, limit=sma_period * 3)
-            if series is None or series.length < sma_period + slope_window:
+            # The longest lookback of the three indicators below, so a shortfall
+            # is reported once here rather than surfacing as three None results
+            # that are indistinguishable from "no trend".
+            series = await ctx.series(
+                instrument.id,
+                self.read_interval,
+                limit=sma_period * 3,
+                required=max(sma_period + slope_window, return_lookback + 1),
+            )
+            if series is None:
                 continue
 
             sma = ind.simple_moving_average(series.close, sma_period)
             slope = ind.sma_slope(series.close, sma_period, slope_window)
             trailing = ind.trailing_return(series.close, return_lookback)
             if sma is None or slope is None or trailing is None:
-                continue
+                continue  # defensive: `required` above should already guarantee these
             last = float(series.close[-1])
             held = ctx.held_quantity(instrument.id)
 

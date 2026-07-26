@@ -101,7 +101,7 @@ class ScannerConfiguration(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     include_etfs: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     min_price: Mapped[Any | None] = mapped_column(Price)
     min_avg_traded_value: Mapped[Any | None] = mapped_column(Money)
-    max_instruments_per_scan: Mapped[int] = mapped_column(Integer, nullable=False, default=200)
+    max_instruments_per_scan: Mapped[int] = mapped_column(Integer, nullable=False, default=2000)
     trading212_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     # -- Scoring (§6) -------------------------------------------------------
@@ -120,6 +120,14 @@ class ScannerConfiguration(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     #: stored regardless; these only decide which leads.
     momentum_weight: Mapped[Any] = mapped_column(Ratio, nullable=False, default=1)
     value_weight: Mapped[Any] = mapped_column(Ratio, nullable=False, default=0)
+
+    #: Weights of the five factors the *final* score blends — fundamental_value,
+    #: price_cheapness, reversal, quality, sector (see scoring.DEFAULT_FACTOR_WEIGHTS).
+    #: Fundamentals-first by default. Supersedes momentum_weight/value_weight.
+    factor_weights: Mapped[dict[str, Any] | None] = mapped_column()
+    #: Fraction of the final score a stock loses when it has no fundamentals at
+    #: all — a mild, deliberate disadvantage. 0 disables it.
+    fundamentals_penalty: Mapped[Any] = mapped_column(Ratio, nullable=False, default=0.1)
 
     runs: Mapped[list[ScannerRun]] = relationship(back_populates="configuration")
 
@@ -185,6 +193,14 @@ class ScannerResult(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     risk_score: Mapped[Any] = mapped_column(Ratio, nullable=False)
     liquidity_score: Mapped[Any] = mapped_column(Ratio, nullable=False)
     positioning_score: Mapped[Any] = mapped_column(Ratio, nullable=False)
+    #: Health of the instrument's own sector (via its sector-ETF proxy). Nullable
+    #: for rows written before the sector category existed.
+    sector_score: Mapped[Any | None] = mapped_column(Ratio)
+    #: Two of the five factors the *final* (primary) score blends: how strongly
+    #: the instrument is turning up, and how sound the business is. The other
+    #: three reuse fundamental_value_score / price_value_score / sector_score.
+    reversal_score: Mapped[Any | None] = mapped_column(Ratio)
+    quality_score: Mapped[Any | None] = mapped_column(Ratio)
 
     #: Separate, optional. Never gates the core score (§6, acceptance 7).
     fundamental_score: Mapped[Any | None] = mapped_column(Ratio)

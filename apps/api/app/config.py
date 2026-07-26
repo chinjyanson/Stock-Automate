@@ -108,6 +108,16 @@ class Settings(BaseSettings):
     yfinance_backoff_base_seconds: float = 2.0
     yfinance_max_retries: int = 5
 
+    # -- Catalogue backfill (one-time map→backfill of tradable instruments) --
+    # Pacing knobs for the bulk pipeline that maps and backfills the Trading 212
+    # catalogue. Conservative by default to stay under yfinance's soft IP limit.
+    backfill_map_batch_size: int = 500
+    backfill_ingest_batch_size: int = 200
+    backfill_continuation_delay_seconds: int = 30
+    #: Hard ceiling on self-chained continuation rounds — a safety stop against a
+    #: runaway loop if a provider throttles indefinitely.
+    backfill_max_rounds: int = 500
+
     # -- Market data: Twelve Data ------------------------------------------
     twelve_data_api_key: SecretStr | None = None
     twelve_data_base_url: str = "https://api.twelvedata.com"

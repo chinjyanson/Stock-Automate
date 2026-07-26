@@ -15,12 +15,13 @@ from typing import Any
 import redis
 import structlog
 from app.config import get_settings
+from app.data.base import MarketDataProvider
 from app.data.factory import (
     ProviderNotConfiguredError,
     intraday_provider_chain,
     resolve_provider,
 )
-from app.data.types import ProviderQuotaExceededError
+from app.data.types import ProviderError, ProviderQuotaExceededError
 from app.db import session_scope
 from app.models.enums import Interval, ProviderKind
 from app.models.instrument import Instrument, MarketDataMapping
@@ -146,8 +147,24 @@ async def _intraday_universe(session: Any) -> list[Instrument]:
 
 
 async def _refresh_intraday(interval: Interval) -> dict[str, Any]:
+    """Walk the intraday chain per instrument, stopping at the first that serves it.
+
+    Falling through matters because the providers cover different listings: a
+    London line yfinance serves is invisible to Twelve Data's free tier, and a
+    "no active mapping" skip is a *return value*, not an exception — taking only
+    the head of the chain silently left such instruments with no bars at all.
+    Providers are built once and shared across instruments, and only on demand,
+    so an unreachable backup costs nothing.
+    """
     settings = get_settings()
-    provider = resolve_provider(intraday_provider_chain(settings)[0], settings)
+    chain = intraday_provider_chain(settings)
+    providers: dict[ProviderKind, MarketDataProvider] = {}
+
+    def _provider(kind: ProviderKind) -> MarketDataProvider:
+        if kind not in providers:
+            providers[kind] = resolve_provider(kind, settings)
+        return providers[kind]
+
     try:
         async with session_scope() as session:
             instruments = await _intraday_universe(session)
@@ -155,12 +172,39 @@ async def _refresh_intraday(interval: Interval) -> dict[str, Any]:
                 return {"instruments": 0, "note": "no active intraday strategy universe"}
             service = IngestionService(session)
             written = 0
+            unserved: list[str] = []
             for instrument in instruments:
-                result = await service.ingest_intraday(instrument, provider, interval=interval)
-                written += result.candles_written
-            return {"instruments": len(instruments), "candles_written": written}
+                reason = "no provider in the intraday chain"
+                for kind in chain:
+                    try:
+                        result = await service.ingest_intraday(
+                            instrument, _provider(kind), interval=interval
+                        )
+                    except (ProviderNotConfiguredError, ProviderError) as exc:
+                        # This provider cannot serve it (no key, quota spent,
+                        # upstream down). Try the next; an exhausted chain is
+                        # reported, never papered over.
+                        reason = f"{kind.value}: {exc}"
+                        continue
+                    if result.skipped_reason is None:
+                        written += result.candles_written
+                        break
+                    reason = f"{kind.value}: {result.skipped_reason}"
+                else:
+                    unserved.append(f"{instrument.id}: {reason}")
+
+            outcome: dict[str, Any] = {
+                "instruments": len(instruments),
+                "candles_written": written,
+                "providers": [k.value for k in chain],
+            }
+            if unserved:
+                log.warning("job.refresh_intraday_candles.unserved", instruments=unserved)
+                outcome["unserved"] = len(unserved)
+            return outcome
     finally:
-        await provider.close()
+        for provider in providers.values():
+            await provider.close()
 
 
 @app.task(bind=True, name="worker.jobs.market_data.refresh_intraday_candles", max_retries=2)

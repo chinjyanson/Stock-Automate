@@ -25,13 +25,15 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data.store import CandleStore
 from app.data.yfinance_provider import _MIC_TO_SUFFIX, YFinanceProvider
-from app.models.enums import DataSeriesType, Interval, ProviderKind
-from app.models.instrument import Exchange, Instrument, MarketDataMapping
+from app.models.enums import BrokerKind, DataSeriesType, Interval, ProviderKind
+from app.models.instrument import BrokerInstrument, Exchange, Instrument, MarketDataMapping
+from app.models.market_data import Candle
+from app.scanner.engine import MIN_BARS_TO_SCORE
 
 log = structlog.get_logger(__name__)
 
@@ -58,6 +60,16 @@ class BackfillResult:
             f"({self.candles_written} candles), {self.no_data} returned no data, "
             f"{self.skipped_unsupported} unsupported venues, {len(self.errors)} errors"
         )
+
+
+@dataclass
+class FunnelCounts:
+    """How far the tradable universe has progressed toward being scannable."""
+
+    tradable: int = 0
+    mapped: int = 0
+    candled: int = 0
+    scannable: int = 0
 
 
 def _yfinance_symbol(instrument: Instrument, exchange: Exchange | None) -> str | None:
@@ -181,17 +193,26 @@ class BackfillService:
         )
 
     async def select_backfill_candidates(
-        self, *, limit: int, mics: list[str] | None = None
+        self,
+        *,
+        limit: int,
+        mics: list[str] | None = None,
+        trading212_only: bool = True,
     ) -> list[Instrument]:
-        """Instruments that lack candles, on supported venues, for backfill.
+        """Never-attempted instruments on supported venues, for backfill.
 
-        Prioritises instruments with no stored daily candles at all, so a run
-        broadens coverage rather than re-fetching what is already held.
+        Selects instruments that have **no yfinance mapping yet** — i.e. this
+        service has never touched them — on a supported venue and (by default)
+        tradable on Trading 212. Excluding already-mapped instruments is what
+        makes the sweep *terminate*: every instrument a run touches gets a
+        mapping, so it is never re-selected, whether or not data came back.
+        Stragglers left mapped-but-empty (transient throttles) are picked up
+        incrementally by the daily refresh job, which selects by mapping.
         """
-        from app.models.market_data import Candle
-
-        have_candles = select(Candle.instrument_id).where(Candle.interval == Interval.D1).distinct()
-        target_mics = mics or ["XNAS", "XNYS", "ARCX"]
+        attempted = select(MarketDataMapping.instrument_id).where(
+            MarketDataMapping.provider == ProviderKind.YFINANCE
+        )
+        target_mics = mics or sorted(_SUPPORTED_MICS)
 
         stmt = (
             select(Instrument)
@@ -200,9 +221,61 @@ class BackfillService:
                 Exchange.mic.in_(target_mics),
                 Instrument.exchange_ticker.is_not(None),
                 Instrument.suspended_at.is_(None),
-                Instrument.id.notin_(have_candles),
+                Instrument.id.notin_(attempted),
             )
             .order_by(Instrument.exchange_ticker.asc())
             .limit(limit)
         )
+        if trading212_only:
+            stmt = stmt.where(Instrument.id.in_(self._tradable_ids()))
         return list((await self._session.execute(stmt)).scalars().all())
+
+    def _tradable_ids(self):  # type: ignore[no-untyped-def]
+        """Subquery of instrument ids currently tradable on Trading 212."""
+        return (
+            select(BrokerInstrument.instrument_id)
+            .where(
+                BrokerInstrument.broker.in_(
+                    [BrokerKind.TRADING212_DEMO, BrokerKind.TRADING212_LIVE]
+                ),
+                BrokerInstrument.is_currently_available.is_(True),
+            )
+            .distinct()
+        )
+
+    async def funnel_counts(self, *, trading212_only: bool = True) -> FunnelCounts:
+        """Progress across the pipeline stages, for the admin status view."""
+        scope = Instrument.id.in_(self._tradable_ids()) if trading212_only else None
+
+        async def _count(*conditions) -> int:  # type: ignore[no-untyped-def]
+            preds = [c for c in (scope, *conditions) if c is not None]
+            stmt = select(func.count()).select_from(Instrument)
+            if preds:
+                stmt = stmt.where(*preds)
+            return int((await self._session.execute(stmt)).scalar() or 0)
+
+        has_signal_mapping = (
+            select(MarketDataMapping.id).where(
+                MarketDataMapping.instrument_id == Instrument.id,
+                MarketDataMapping.provider == ProviderKind.YFINANCE,
+                MarketDataMapping.is_signal_source.is_(True),
+                MarketDataMapping.is_active.is_(True),
+            )
+        ).exists()
+        has_candles = (
+            select(Candle.id).where(
+                Candle.instrument_id == Instrument.id, Candle.interval == Interval.D1
+            )
+        ).exists()
+        scannable = (
+            select(Candle.instrument_id)
+            .where(Candle.interval == Interval.D1, Candle.is_closed.is_(True))
+            .group_by(Candle.instrument_id)
+            .having(func.count(Candle.id) >= MIN_BARS_TO_SCORE)
+        )
+        return FunnelCounts(
+            tradable=await _count(),
+            mapped=await _count(has_signal_mapping),
+            candled=await _count(has_candles),
+            scannable=await _count(Instrument.id.in_(scannable)),
+        )

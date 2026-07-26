@@ -197,7 +197,12 @@ async def seed_scanner_configuration() -> int:
     an operator's tuned configuration is never overwritten.
     """
     from app.models.scanner import ScannerConfiguration
-    from app.scanner.scoring import DEFAULT_THRESHOLDS, DEFAULT_WEIGHTS
+    from app.scanner.scoring import (
+        DEFAULT_FACTOR_WEIGHTS,
+        DEFAULT_FUNDAMENTALS_PENALTY,
+        DEFAULT_THRESHOLDS,
+        DEFAULT_WEIGHTS,
+    )
 
     created = 0
     async with session_scope() as session:
@@ -212,15 +217,16 @@ async def seed_scanner_configuration() -> int:
                     include_stocks=True,
                     include_etfs=True,
                     trading212_only=True,
-                    max_instruments_per_scan=200,
+                    max_instruments_per_scan=2000,
                     weights=dict(DEFAULT_WEIGHTS),
                     thresholds=dict(DEFAULT_THRESHOLDS),
                     benchmark_symbol="SPY",
-                    # Value-primary ("buy low"): the value lens leads and momentum
-                    # is a secondary signal. Flip to momentum_weight=1/value=0 for
-                    # a momentum-primary ("buy strength") screen.
                     momentum_weight=Decimal("0.3"),
                     value_weight=Decimal("0.7"),
+                    # Fundamentals-first final score: intrinsic value + P/E lead,
+                    # with cheapness, reversal, quality and sector in support.
+                    factor_weights=dict(DEFAULT_FACTOR_WEIGHTS),
+                    fundamentals_penalty=Decimal(str(DEFAULT_FUNDAMENTALS_PENALTY)),
                 )
             )
             created = 1
