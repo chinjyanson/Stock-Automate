@@ -11,9 +11,10 @@ import uuid
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import false, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.sql.elements import ColumnElement
 
 from app.api.schemas import (
     CandleResponse,
@@ -119,6 +120,15 @@ async def sync_instruments(
 @router.get("", response_model=InstrumentListResponse)
 async def list_instruments(
     search: str | None = Query(default=None, description="Match name, ticker or ISIN"),
+    ids: str | None = Query(
+        default=None,
+        description=(
+            "Comma-separated instrument ids. Resolves an exact, known set — a "
+            "strategy universe, say — which paging cannot: those ids are "
+            "scattered through a 16k catalogue, so any single page mostly misses "
+            "them and the caller is left rendering raw UUIDs."
+        ),
+    ),
     lifecycle_state: str | None = None,
     bot_universe_only: bool = False,
     tradable_only: bool = Query(
@@ -130,7 +140,25 @@ async def list_instruments(
     db: AsyncSession = Depends(get_db),
 ) -> InstrumentListResponse:
     """Search the synchronised catalogue (acceptance criterion 2)."""
-    conditions = []
+    # Annotated: the branches below append several expression types, and letting
+    # the first one fix the element type rejects the rest.
+    conditions: list[ColumnElement[bool]] = []
+
+    if ids:
+        parsed: list[uuid.UUID] = []
+        for raw in ids.split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                parsed.append(uuid.UUID(raw))
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Not a valid instrument id: {raw!r}",
+                ) from exc
+        # An explicit but empty selection must return nothing, not everything.
+        conditions.append(Instrument.id.in_(parsed) if parsed else false())
 
     if search:
         pattern = f"%{search.strip()}%"

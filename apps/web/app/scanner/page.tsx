@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import {
   ApiError,
   ApiUnreachableError,
+  type Instrument,
   type ScannerResult,
   type ScannerResultDetail,
   type WatchlistEntry,
@@ -25,7 +26,13 @@ function scoreColour(classification: string): string {
 }
 
 // Number of body columns, so an expanded detail row can span the full table.
-const COLUMN_COUNT = 12;
+const COLUMN_COUNT = 13;
+
+// Below this many days old, a score is treated as current. The rotation
+// guarantees the top-ranked band is rescanned nightly, so anything materially
+// older is a name the sweep has not reached recently — worth showing plainly
+// rather than letting it pass as today's reading.
+const STALE_SCORE_DAYS = 3;
 
 export default function ScannerPage() {
   const router = useRouter();
@@ -49,6 +56,10 @@ export default function ScannerPage() {
   );
   // Instruments with a request in flight, so a row cannot be double-toggled.
   const [pendingWatch, setPendingWatch] = useState<Set<string>>(new Set());
+  // Instruments currently being fetched and rescored after being pinned from
+  // the search box. Separate from `pendingWatch`: the pin has already landed,
+  // and what is outstanding is the market-data round trip.
+  const [scanningIds, setScanningIds] = useState<Set<string>>(new Set());
 
   /**
    * Pinned first, then by score.
@@ -164,6 +175,80 @@ export default function ScannerPage() {
     }
   }
 
+  /**
+   * Pin an instrument found through the search box, then score it right away.
+   *
+   * The two steps are separate calls on purpose. Pinning is instant and is what
+   * the operator asked for; fetching candles goes out to a market-data provider
+   * and can take seconds. Binding them into one request would make the pin as
+   * slow as the slowest provider, and a provider failure would leave it unclear
+   * whether the stock had been pinned at all.
+   *
+   * The rescan matters because the rotation reaches most of the catalogue only
+   * over days. Without it a newly pinned stock shows either nothing or whatever
+   * it scored weeks ago — at exactly the moment someone is looking at it.
+   */
+  async function pinAndScan(instrument: Instrument) {
+    const id = instrument.id;
+    if (pendingWatch.has(id) || scanningIds.has(id)) return;
+    setPendingWatch((prev) => new Set(prev).add(id));
+    try {
+      const entry = await api.addToWatchlist(id);
+      setWatchlist((prev) =>
+        prev.some((w) => w.instrument_id === id) ? prev : [...prev, entry],
+      );
+    } catch (err) {
+      toast.error(
+        err instanceof ApiError || err instanceof ApiUnreachableError
+          ? err.message
+          : "Could not add to the watchlist",
+      );
+      return;
+    } finally {
+      setPendingWatch((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }
+
+    setScanningIds((prev) => new Set(prev).add(id));
+    try {
+      const refreshed = await api.refreshInstrument(id);
+      if (refreshed.result) {
+        const scored = refreshed.result;
+        setResults((prev) => [
+          scored,
+          ...prev.filter((r) => r.instrument_id !== id),
+        ]);
+        toast.success(
+          `${instrument.name} pinned and scored ${Number(scored.primary_score).toFixed(1)} ` +
+            `on ${refreshed.candles_written} fresh bar(s).`,
+        );
+      } else {
+        // Pinned, but not scoreable. Say which, rather than leave a silent row.
+        toast.error(
+          refreshed.reason ??
+            `${instrument.name} is pinned but could not be scored.`,
+        );
+      }
+    } catch (err) {
+      toast.error(
+        `${instrument.name} is pinned, but the rescan failed: ` +
+          (err instanceof ApiError || err instanceof ApiUnreachableError
+            ? err.message
+            : "market data could not be fetched") +
+          ". It will be scored by the next scan.",
+      );
+    } finally {
+      setScanningIds((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }
+  }
+
   useEffect(() => {
     void load();
   }, [load]);
@@ -237,6 +322,19 @@ export default function ScannerPage() {
         <div className="rounded-lg border border-[var(--color-warn)] bg-[var(--color-surface-muted)] px-4 py-3 text-sm">
           {error}
         </div>
+      )}
+
+      <WatchlistSearch
+        onPin={pinAndScan}
+        watchedIds={watchedIds}
+        busyIds={new Set([...pendingWatch, ...scanningIds])}
+      />
+
+      {scanningIds.size > 0 && (
+        <p className="text-xs text-[var(--color-ink-muted)]">
+          Fetching market data and scoring {scanningIds.size} newly pinned
+          instrument{scanningIds.size === 1 ? "" : "s"}…
+        </p>
       )}
 
       {watchlistError && (
@@ -342,6 +440,12 @@ export default function ScannerPage() {
                   Sec.
                 </th>
                 <th className="px-4 py-2 font-medium">Tradable</th>
+                <th
+                  className="px-4 py-2 font-medium"
+                  title="When this score was computed. The scan rotates through the catalogue, so rows are not all from the same day."
+                >
+                  Scored
+                </th>
                 <th className="px-4 py-2" aria-label="Expand" />
               </tr>
             </thead>
@@ -478,6 +582,9 @@ function FragmentRow({
             <span className="text-[var(--color-ink-muted)]">Scanner only</span>
           )}
         </td>
+        <td className="px-4 py-2 text-xs" title={new Date(r.scanned_at).toLocaleString()}>
+          <ScoreAge scannedAt={r.scanned_at} />
+        </td>
         <td className="px-4 py-2 text-right text-[var(--color-ink-muted)]">{isOpen ? "▲" : "▼"}</td>
       </tr>
       {isOpen && (
@@ -532,6 +639,141 @@ function ExpandedDetail({ detail }: { detail: ScannerResultDetail }) {
           tone="warn"
         />
       </div>
+    </div>
+  );
+}
+
+/**
+ * How old a score is, in words.
+ *
+ * The default listing shows each instrument's most recent result across runs,
+ * which is the only way a rotating scan can present a whole catalogue — but it
+ * means the rows are not all from the same day. Stating the age is what stops a
+ * three-week-old score from reading as this morning's.
+ */
+function ScoreAge({ scannedAt }: { scannedAt: string }) {
+  const scanned = new Date(scannedAt);
+  const days = Math.floor((Date.now() - scanned.getTime()) / 86_400_000);
+  const stale = days >= STALE_SCORE_DAYS;
+  const label = days <= 0 ? "today" : days === 1 ? "yesterday" : `${days}d ago`;
+  return (
+    <span style={{ color: stale ? "var(--color-warn)" : "var(--color-ink-muted)" }}>
+      {label}
+    </span>
+  );
+}
+
+/**
+ * Find any stock in the catalogue by name or ticker and pin it.
+ *
+ * The star on a row can only pin what a scan already returned, which is a small
+ * slice of the catalogue on any given day. This reaches the other ~15k.
+ */
+function WatchlistSearch({
+  onPin,
+  watchedIds,
+  busyIds,
+}: {
+  onPin: (instrument: Instrument) => void | Promise<void>;
+  watchedIds: Set<string>;
+  busyIds: Set<string>;
+}) {
+  const [query, setQuery] = useState("");
+  const [matches, setMatches] = useState<Instrument[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  // Debounced: a request per keystroke would search a 15k catalogue on every
+  // letter, and the answers would arrive out of order.
+  useEffect(() => {
+    const term = query.trim();
+    if (term.length < 2) {
+      setMatches([]);
+      setFailed(false);
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      setSearching(true);
+      try {
+        const page = await api.instruments({ search: term, limit: 15 });
+        if (!cancelled) {
+          setMatches(page.items);
+          setFailed(false);
+        }
+      } catch {
+        // An empty dropdown would claim the catalogue holds no such stock,
+        // which is a different statement from "the search did not run".
+        if (!cancelled) {
+          setMatches([]);
+          setFailed(true);
+        }
+      } finally {
+        if (!cancelled) setSearching(false);
+      }
+    }, 300);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [query]);
+
+  const open = query.trim().length >= 2;
+
+  return (
+    <div className="relative">
+      <label htmlFor="watchlist-search" className="sr-only">
+        Search for a stock to add to the watchlist
+      </label>
+      <input
+        id="watchlist-search"
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        placeholder="Add a stock to the watchlist — search by name or ticker…"
+        className="w-full rounded-md border border-[var(--color-border-subtle)] bg-[var(--color-surface)] px-3 py-2 text-sm"
+        autoComplete="off"
+      />
+      {open && (
+        <div className="absolute z-20 mt-1 max-h-72 w-full overflow-auto rounded-md border border-[var(--color-border-subtle)] bg-[var(--color-surface)] shadow-lg">
+          {searching ? (
+            <p className="px-3 py-2 text-sm text-[var(--color-ink-muted)]">Searching…</p>
+          ) : failed ? (
+            <p className="px-3 py-2 text-sm text-[var(--color-warn)]">
+              The catalogue search failed. This does not mean there is no such stock —
+              try again.
+            </p>
+          ) : matches.length === 0 ? (
+            <p className="px-3 py-2 text-sm text-[var(--color-ink-muted)]">
+              Nothing in the catalogue matches “{query.trim()}”.
+            </p>
+          ) : (
+            matches.map((inst) => {
+              const pinned = watchedIds.has(inst.id);
+              const busy = busyIds.has(inst.id);
+              return (
+                <button
+                  key={inst.id}
+                  type="button"
+                  disabled={pinned || busy}
+                  onClick={() => {
+                    void onPin(inst);
+                    setQuery("");
+                    setMatches([]);
+                  }}
+                  className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-sm hover:bg-[var(--color-surface-muted)] disabled:opacity-50"
+                >
+                  <span className="min-w-0 truncate">{inst.name}</span>
+                  <span className="shrink-0 font-mono text-xs text-[var(--color-ink-muted)]">
+                    {inst.exchange_ticker ?? "—"}
+                    {inst.exchange?.mic ? ` · ${inst.exchange.mic}` : ""}
+                    {pinned ? " · pinned" : busy ? " · adding…" : ""}
+                  </span>
+                </button>
+              );
+            })
+          )}
+        </div>
+      )}
     </div>
   );
 }

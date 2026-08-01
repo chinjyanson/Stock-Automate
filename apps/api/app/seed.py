@@ -256,42 +256,35 @@ async def seed_risk_configuration() -> int:
 
 
 async def seed_strategy_configurations() -> int:
-    """Seed the three strategies (§8), inactive, if they do not exist.
+    """Seed the mean-reversion strategy (§8), inactive, if it does not exist.
 
     Inactive and with an empty universe by default: a fresh install must never
-    auto-trade before a human has mapped instruments into a strategy and turned
-    it on. Parameters are the documented defaults; idempotent per name.
+    auto-trade before a human has turned it on. Parameters are the documented
+    defaults; idempotent per name.
+
+    One strategy, because that is what the product runs. The universe is not
+    seeded and is not meant to be edited by hand — it is rewritten nightly from
+    the scanner's ranking by `worker.jobs.strategy.sync_strategy_universe`.
     """
     from app.models.enums import Interval, StrategyKind
     from app.models.strategy import StrategyConfiguration
 
     defaults: list[dict[str, object]] = [
         {
-            "kind": StrategyKind.SP500_MEAN_REVERSION,
-            "name": "S&P 500 mean reversion",
-            "interval": Interval.M15,
+            "kind": StrategyKind.MEAN_REVERSION,
+            "name": "Daily mean reversion",
+            "interval": Interval.D1,
             "params": {
-                "sma_period": 20,
-                "zscore_entry": -2.0,
+                "bb_period": 20,
+                "bb_std": 2.0,
                 "rsi_period": 14,
-                "rsi_oversold": 30.0,
-                "zscore_exit": 0.0,
+                "rsi_oversold": 35.0,
+                "atr_period": 14,
+                "min_atr_pct": 0.02,
             },
+            # Populated nightly from the scanner ranking by
+            # `worker.jobs.strategy.sync_strategy_universe`.
             "universe": {"instrument_ids": []},
-        },
-        {
-            "kind": StrategyKind.TREND_FOLLOWING,
-            "name": "Gold & oil trend",
-            "interval": Interval.D1,
-            "params": {"sma_period": 100, "slope_window": 21, "return_lookback": 60},
-            "universe": {"instrument_ids": []},
-        },
-        {
-            "kind": StrategyKind.PIE_REBALANCE,
-            "name": "Balanced pie",
-            "interval": Interval.D1,
-            "params": {"drift_band": 0.05},
-            "universe": {"weights": {}},
         },
     ]
 

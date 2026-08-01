@@ -19,11 +19,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.data.mock_provider import MockMarketDataProvider
 from app.models.enums import InstrumentKind, LifecycleState, PriceUnit, ProviderKind
 from app.models.instrument import Exchange, Instrument, MarketDataMapping
-from app.models.scanner import ProposalStatus
+from app.models.scanner import Classification, ProposalStatus
 from app.scanner import watchlist
 from app.scanner.engine import ScannerEngine
 from app.scanner.proposals import ProposalError, ProposalInputs, ProposalService
-from app.scanner.rotation import _ROTATION_POOL_LIMIT, select_instruments
+from app.scanner.rotation import (
+    _ROTATION_POOL_LIMIT,
+    _top_ranked_ids,
+    select_instruments,
+)
 from app.services.ingestion import IngestionService
 
 
@@ -122,6 +126,149 @@ class TestRotationSelection:
         chosen_ids = {c.id for c in chosen}
         # The scorable instrument survives; none of the history-less ones appear.
         assert chosen_ids == {scannable_instrument.id}
+
+
+class TestExploreExploit:
+    """The rotation guarantees the best band is re-scored, then explores."""
+
+    async def _scored(
+        self, db: AsyncSession, ticker: str, primary: float, core: float, days_ago: int = 0
+    ) -> Instrument:
+        """An instrument with candles and one scanner result at a given age."""
+        from app.models.scanner import ScannerResult, ScannerRun, ScannerRunStatus
+
+        exchange = (
+            await db.execute(select(Exchange).where(Exchange.mic == "XNAS"))
+        ).scalar_one_or_none()
+        if exchange is None:
+            exchange = Exchange(
+                mic="XNAS", name="Nasdaq", country="US", timezone="America/New_York"
+            )
+            db.add(exchange)
+            await db.flush()
+        inst = Instrument(
+            id=uuid.uuid4(),
+            exchange_id=exchange.id,
+            exchange_ticker=ticker,
+            name=f"{ticker} Co.",
+            kind=InstrumentKind.STOCK,
+            currency="USD",
+            price_unit=PriceUnit.USD,
+            is_scanner_eligible=True,
+        )
+        db.add(inst)
+        await db.flush()
+        db.add(
+            MarketDataMapping(
+                instrument_id=inst.id,
+                provider=ProviderKind.MOCK,
+                provider_symbol=ticker,
+                is_signal_source=True,
+                confirmed_by_user=True,
+            )
+        )
+        await db.flush()
+        await IngestionService(db).ingest_daily(inst, MockMarketDataProvider(), backfill_days=120)
+        run = ScannerRun(
+            status=ScannerRunStatus.COMPLETED,
+            started_at=datetime.now(UTC) - timedelta(days=days_ago),
+        )
+        db.add(run)
+        await db.flush()
+        result = ScannerResult(
+            run_id=run.id,
+            instrument_id=inst.id,
+            primary_score=Decimal(str(primary)),
+            core_score=Decimal(str(core)),
+            trend_score=Decimal("50"),
+            momentum_score=Decimal("50"),
+            risk_score=Decimal("50"),
+            liquidity_score=Decimal("50"),
+            positioning_score=Decimal("50"),
+            classification=Classification.DOES_NOT_PASS,
+            data_completeness=Decimal("1"),
+            confidence=Decimal("1"),
+            candles_used=120,
+        )
+        db.add(result)
+        # created_at drives recency; set it explicitly for the stale-score test.
+        result.created_at = datetime.now(UTC) - timedelta(days=days_ago)
+        await db.flush()
+        return inst
+
+    async def test_ranks_by_primary_score_not_the_momentum_core(self, db: AsyncSession) -> None:
+        """The tier re-verifying "the best" must use the score that defines best.
+
+        Ordering by `core_score` — as this did — sorted the re-check tier by a
+        different number than the one deciding the ranking and the strategy's
+        universe.
+        """
+        good = await self._scored(db, "GOODPRI", primary=90, core=10)
+        other = await self._scored(db, "HIGHCORE", primary=20, core=99)
+        await db.commit()
+
+        top = await _top_ranked_ids(db, 1)
+        assert top == [good.id]
+        assert other.id not in top
+
+    async def _add_result(
+        self, db: AsyncSession, inst: Instrument, primary: float, days_ago: int
+    ) -> None:
+        """A second scanner result for an instrument already scored."""
+        from app.models.scanner import ScannerResult, ScannerRun, ScannerRunStatus
+
+        run = ScannerRun(
+            status=ScannerRunStatus.COMPLETED,
+            started_at=datetime.now(UTC) - timedelta(days=days_ago),
+        )
+        db.add(run)
+        await db.flush()
+        result = ScannerResult(
+            run_id=run.id,
+            instrument_id=inst.id,
+            primary_score=Decimal(str(primary)),
+            core_score=Decimal("50"),
+            trend_score=Decimal("50"),
+            momentum_score=Decimal("50"),
+            risk_score=Decimal("50"),
+            liquidity_score=Decimal("50"),
+            positioning_score=Decimal("50"),
+            classification=Classification.DOES_NOT_PASS,
+            data_completeness=Decimal("1"),
+            confidence=Decimal("1"),
+            candles_used=120,
+        )
+        db.add(result)
+        result.created_at = datetime.now(UTC) - timedelta(days=days_ago)
+        await db.flush()
+
+    async def test_a_demoted_stock_stops_being_treated_as_top_ranked(
+        self, db: AsyncSession
+    ) -> None:
+        """One instrument, two scores: a stale 95 and a fresh 10.
+
+        De-duplicating a score-ordered history keeps the highest score an
+        instrument ever had, so re-scanning it could never demote it — it would
+        occupy an exploit slot forever on the strength of one good night.
+        """
+        faded = await self._scored(db, "FADED", primary=95, core=50, days_ago=21)
+        await self._add_result(db, faded, primary=10, days_ago=0)
+        steady = await self._scored(db, "STEADY", primary=60, core=50, days_ago=0)
+        await db.commit()
+
+        top = await _top_ranked_ids(db, 5)
+
+        # Ranked on its latest score (10), so it sits below the steady 60.
+        assert top.index(steady.id) < top.index(faded.id)
+
+    async def test_the_selection_reason_reports_the_split(
+        self, db: AsyncSession, scannable_instrument: Instrument
+    ) -> None:
+        """Operators should be able to see how the budget was spent."""
+        await db.commit()
+        _, reason = await select_instruments(db, configuration=None, limit=50)
+        assert "top-ranked re-scored" in reason
+        assert "explored" in reason
 
 
 class TestWatchlistSelection:

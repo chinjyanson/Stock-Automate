@@ -35,6 +35,7 @@ from app.models.scanner import (
     ScannerRunStatus,
 )
 from app.scanner import scoring
+from app.services.insider import InsiderIngestionService
 
 log = structlog.get_logger(__name__)
 
@@ -85,8 +86,15 @@ class ScannerEngine:
         configuration: ScannerConfiguration | None = None,
         selection_reason: str = "manual",
         actor_user_id: uuid.UUID | None = None,
+        is_ad_hoc: bool = False,
     ) -> ScanSummary:
-        """Score a slice of instruments under a single run."""
+        """Score a slice of instruments under a single run.
+
+        Set `is_ad_hoc` when the slice was named explicitly rather than chosen
+        by the rotation. The scores are recorded identically either way; the
+        flag only stops a one-off rescan from being mistaken for the nightly
+        ranking when the strategy universe is synced (see `ScannerRun`).
+        """
         run_config = _config_values(configuration)
 
         run = ScannerRun(
@@ -95,6 +103,7 @@ class ScannerEngine:
             started_at=datetime.now(UTC),
             instruments_considered=len(instruments),
             selection_reason=selection_reason,
+            is_ad_hoc=is_ad_hoc,
         )
         self._session.add(run)
         await self._session.flush()
@@ -205,8 +214,14 @@ class ScannerEngine:
             fundamentals=fundamentals,
         )
 
+        # Insider activity is looked up rather than derived from the series, so
+        # it is attached after scoring and before the blend. None for anything
+        # without recent Form 4 filings, which is most of the catalogue — the
+        # blend drops missing factors and renormalises, so absence is neutral.
+        result.insider, result.insider_sell_penalty = await self._insider_factor(instrument.id)
+
         # The primary (final) score is an absolute, fundamentals-first blend of
-        # five factors — intrinsic value + P/E lead, with cheapness, reversal,
+        # six factors — intrinsic value + P/E lead, with cheapness, reversal,
         # quality and sector in support. Absolute so it is comparable batch to
         # batch; see scoring.combine_final_score.
         primary_score = scoring.combine_final_score(
@@ -239,6 +254,10 @@ class ScannerEngine:
                 quality_score=(
                     Decimal(str(result.quality)) if result.quality is not None else None
                 ),
+                insider_score=(
+                    Decimal(str(result.insider)) if result.insider is not None else None
+                ),
+                insider_sell_penalty=Decimal(str(round(result.insider_sell_penalty, 4))),
                 fundamental_score=(
                     Decimal(str(result.fundamental_score))
                     if result.fundamental_score is not None
@@ -313,6 +332,27 @@ class ScannerEngine:
         if len(candles) < MIN_BARS_TO_SCORE:
             return None
         return candles_to_series(candles)
+
+    async def _insider_factor(self, instrument_id: uuid.UUID) -> tuple[float | None, float]:
+        """Insider buying/selling as a 0-100 factor, or None if there is none.
+
+        Wrapped rather than called inline so a fault in the insider path can
+        never fail a scan: this is a small, optional factor over a minority of
+        the catalogue, and an exception here would take down the scoring of an
+        instrument whose other five factors are perfectly good.
+        """
+        try:
+            score = await InsiderIngestionService(self._session).score_instrument(instrument_id)
+        except Exception as exc:
+            log.warning(
+                "scanner.insider_factor_failed",
+                instrument_id=str(instrument_id),
+                error=str(exc),
+            )
+            return None, 0.0
+        if score is None:
+            return None, 0.0
+        return score.score, score.sell_penalty
 
     async def _load_fundamentals(
         self, instrument_id: uuid.UUID

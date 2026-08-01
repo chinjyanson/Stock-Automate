@@ -17,6 +17,7 @@ Two invariants this module enforces on behalf of every caller:
 from __future__ import annotations
 
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -214,6 +215,26 @@ class CandleStore:
             )
         )
         return result.scalar_one_or_none()
+
+    async def latest_timestamps(
+        self, instrument_ids: Collection[uuid.UUID], interval: Interval
+    ) -> dict[uuid.UUID, datetime]:
+        """Newest stored bar time for many instruments, in one query.
+
+        The single-instrument version is a query each. A nightly sweep of
+        several thousand names would spend more round trips deciding what to
+        fetch than it spends fetching. Instruments with no stored bars are
+        absent from the result rather than mapped to None — "not present" is the
+        same answer, and it makes the caller state the default explicitly.
+        """
+        if not instrument_ids:
+            return {}
+        rows = await self._session.execute(
+            select(Candle.instrument_id, func.max(Candle.timestamp))
+            .where(Candle.instrument_id.in_(instrument_ids), Candle.interval == interval)
+            .group_by(Candle.instrument_id)
+        )
+        return dict(rows.all())  # type: ignore[arg-type]
 
     async def count_candles(self, instrument_id: uuid.UUID, interval: Interval) -> int:
         result = await self._session.execute(

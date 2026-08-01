@@ -7,7 +7,8 @@ import { type Account, type Health, type LiveStatus, api } from "@/lib/api";
 const LINKS = [
   { href: "/dashboard", label: "Dashboard" },
   { href: "/scanner", label: "Scanner" },
-  { href: "/strategies", label: "Strategies" },
+  // One strategy, so the tab names it rather than implying a choice of several.
+  { href: "/strategies", label: "Mean reversion" },
   { href: "/settings", label: "Settings" },
 ];
 

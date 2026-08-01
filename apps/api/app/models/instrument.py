@@ -145,7 +145,23 @@ class Instrument(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     suspended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     suspension_reason: Mapped[str | None] = mapped_column(Text)
 
+    #: When the scanner last *scored* this instrument. The scanner's rotation
+    #: cursor, and only the scanner writes it.
     last_scanned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    #: When the daily candle refresh last *attempted* this instrument — set
+    #: whether or not data came back.
+    #:
+    #: Its own cursor, deliberately separate from `last_scanned_at`. The refresh
+    #: used to order by that one, which it never wrote, so the queue never
+    #: advanced: it re-fetched the same never-scanned instruments every run. Those
+    #: were mostly delisted symbols that return nothing, and a symbol with no
+    #: candles is one the scanner will not score (it needs 30 bars), so its
+    #: `last_scanned_at` stayed null and it stayed at the head of the queue
+    #: forever. Recording the *attempt* is what breaks that: a dead symbol is
+    #: stamped, drops to the back, and the sweep moves on.
+    last_refresh_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), index=True
+    )
 
     exchange: Mapped[Exchange | None] = relationship(back_populates="instruments")
     broker_instruments: Mapped[list[BrokerInstrument]] = relationship(
@@ -250,6 +266,26 @@ class MarketDataMapping(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     last_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
+
+    #: How many times in a row the provider returned nothing for this symbol.
+    #: Reset to zero the moment any candle arrives.
+    #:
+    #: A delisted ticker is not distinguishable from a live one until you ask,
+    #: and asking is the expensive part. Roughly a fifth of this catalogue's
+    #: mapped instruments return nothing and always will — without a count they
+    #: occupy a slot in every rotation, forever, and the sweep spends that
+    #: fraction of its budget learning what it already knew.
+    consecutive_empty_fetches: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    #: When this symbol may next be attempted. Null means "any time".
+    #:
+    #: Deliberately a timestamp rather than a `is_dead` flag. A ticker can come
+    #: back — a relisting, a provider backfilling its own history, a rename that
+    #: resolves — and a permanent exclusion would never notice. This costs one
+    #: attempt per backoff period to keep checking, which is the price of not
+    #: being permanently wrong about a security.
+    retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
     instrument: Mapped[Instrument] = relationship(back_populates="data_mappings")
 

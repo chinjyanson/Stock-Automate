@@ -39,6 +39,7 @@ app = Celery(
         "worker.jobs.risk",
         "worker.jobs.strategy",
         "worker.jobs.backfill",
+        "worker.jobs.market_regime",
     ],
 )
 
@@ -79,6 +80,13 @@ app.conf.beat_schedule = {
         "task": "worker.jobs.market_data.refresh_daily_candles",
         "schedule": crontab(hour=21, minute=30),
         "options": {"expires": 7200},
+    },
+    # Before the scan, so the day's risk posture is measured from fresh candles
+    # and is already in place when the risk engine sizes anything tonight.
+    "measure-market-regime": {
+        "task": "worker.jobs.market_regime.measure_market_regime",
+        "schedule": crontab(hour=21, minute=50),
+        "options": {"expires": 3600},
     },
     # After the candle refresh, so the scan reads fresh data. The rotation caps
     # itself per §6, so this covers the universe over successive days.
@@ -135,6 +143,24 @@ app.conf.beat_schedule = {
         "schedule": crontab(minute="2-59/15", hour="7-21"),
         "kwargs": {"interval": "15m"},
         "options": {"expires": 900},
+    },
+    # Insider filings, hourly through the US session and a little beyond. EDGAR
+    # publishes Form 4s within minutes, and the scanner reads whatever has
+    # landed by 22:00 — so this only has to keep the store roughly current, not
+    # catch every filing the instant it appears.
+    "ingest-insider-filings": {
+        "task": "worker.jobs.market_data.ingest_insider_filings",
+        "schedule": crontab(minute="5", hour="12-23"),
+        "options": {"expires": 3000},
+    },
+    # Between the scan and the evaluation: repoint the mean-reversion strategy at
+    # the scanner's current top names. Order matters — ranking from a scan that
+    # has not finished would hand the strategy yesterday's list, and syncing after
+    # the evaluation would delay every change by a full day.
+    "sync-strategy-universe": {
+        "task": "worker.jobs.strategy.sync_strategy_universe",
+        "schedule": crontab(hour=22, minute=10),
+        "options": {"expires": 3600},
     },
     # Daily strategies evaluate once, after the daily candle refresh and scan.
     "evaluate-daily-strategies": {

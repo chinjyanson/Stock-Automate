@@ -5,10 +5,8 @@ and records what happened. The safety story is that **no signal reaches the brok
 without passing a gate**:
 
   * A long *entry* is sized and gated by the full risk engine (via a proposal and
-    `ExecutionService`), exactly like a scanner candidate.
-  * A pie *rebalance* carries an explicit target quantity — its risk control is
-    the allocation itself — so it is filled directly, but still refused under an
-    active halt or on stale data (fail closed).
+    `ExecutionService`), exactly like a scanner candidate. There is no route
+    around it: every entry is risk-sized, without exception.
   * An *exit / trim* reduces risk, so it is always allowed (even under a halt) and
     filled directly.
 
@@ -44,7 +42,6 @@ from app.models.enums import (
     OrderSide,
     OrderType,
     StrategyDecisionOutcome,
-    StrategyKind,
     StrategyRunStatus,
     TradeIntentStatus,
 )
@@ -55,8 +52,9 @@ from app.models.strategy import StrategyConfiguration, StrategyDecision, Strateg
 from app.risk.execution import ExecutionError, ExecutionService
 from app.risk.halts import HaltService
 from app.scanner.proposals import ProposalError, ProposalInputs, ProposalService
+from app.services.insider import InsiderIngestionService
 from app.services.system_settings import active_broker_kind, autonomous_live_enabled
-from app.strategies.base import StrategyContext, StrategySignal
+from app.strategies.base import InsiderPressure, StrategyContext, StrategySignal
 from app.strategies.registry import build_strategy
 
 log = structlog.get_logger(__name__)
@@ -82,6 +80,11 @@ class StrategyRunSummary:
     #: separately from `rejected`: nothing was judged and refused, the data to
     #: judge it was not there.
     skipped: int = 0
+    #: Instruments whose newest bar is older than the freshness threshold for the
+    #: interval traded. They are still evaluated — the answer is just computed
+    #: from old prices, which the caller deserves to know before trusting a
+    #: quiet result.
+    stale: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -162,8 +165,29 @@ class StrategyEngine:
         )
 
         strategy = build_strategy(config)
+
+        # How old is the data this pass will read? Measured before evaluating and
+        # regardless of the outcome, because the freshness gate in
+        # `_blocked_reason` only fires on an entry attempt — a run that produces
+        # no signal never reaches it, so evaluating days-old bars otherwise looks
+        # identical to a healthy quiet run.
+        summary.stale = await self._count_stale(instruments, strategy.read_interval)
+        if summary.stale:
+            log.warning(
+                "strategy.stale_data",
+                run_id=str(run.id),
+                kind=config.kind.value,
+                interval=strategy.read_interval.value,
+                stale_instruments=summary.stale,
+                of=len(instruments),
+            )
+
         ctx = StrategyContext(
-            config=config, store=self._store, instruments=instruments, positions=positions
+            config=config,
+            store=self._store,
+            instruments=instruments,
+            positions=positions,
+            insider_sell_pressure=await self._insider_pressure(instruments),
         )
         try:
             signals = await strategy.evaluate(ctx)
@@ -249,7 +273,7 @@ class StrategyEngine:
         # Approval-required arming: the engine only records; a human approves
         # each entry (which routes it live). It does not auto-act.
         if self._propose_only:
-            if signal.side is OrderSide.BUY and config.kind is not StrategyKind.PIE_REBALANCE:
+            if signal.side is OrderSide.BUY:
                 await self._propose_only_entry(instrument, signal, decision, equity, summary)
             else:
                 decision.outcome = StrategyDecisionOutcome.SIGNALLED
@@ -268,16 +292,11 @@ class StrategyEngine:
             summary.rejected += 1
             return
 
-        if config.kind is StrategyKind.PIE_REBALANCE and signal.target_quantity is not None:
-            # The pie fills targeted, un-risk-sized orders; withheld from live
-            # (autonomous) execution, where every order must be risk-gated.
-            if self._broker_kind.is_live:
-                decision.outcome = StrategyDecisionOutcome.SKIPPED
-                decision.reason = f"{signal.reason} — pie auto-rebalance is paper-only"
-                return
-            await self._buy_targeted(broker, instrument, signal, decision, summary)
-        else:
-            await self._buy_sized(config, instrument, broker, signal, decision, equity, summary)
+        # Every entry is risk-sized. There is no targeted-quantity buy path: the
+        # one strategy that had one (pie rebalancing, filling to a target weight)
+        # is gone, and an un-risk-sized order is not something to keep a route
+        # open for.
+        await self._buy_sized(config, instrument, broker, signal, decision, equity, summary)
 
     async def _propose_only_entry(
         self,
@@ -347,31 +366,6 @@ class StrategyEngine:
         else:
             decision.outcome = StrategyDecisionOutcome.REJECTED_BY_RISK
             summary.rejected += 1
-
-    async def _buy_targeted(
-        self,
-        broker: Broker,
-        instrument: Instrument,
-        signal: StrategySignal,
-        decision: StrategyDecision,
-        summary: StrategyRunSummary,
-    ) -> None:
-        assert signal.target_quantity is not None
-        try:
-            await broker.place_order(
-                BrokerOrderRequest(
-                    broker_ticker=str(instrument.id),
-                    side=OrderSide.BUY,
-                    quantity=signal.target_quantity,
-                    order_type=OrderType.MARKET,
-                )
-            )
-        except BrokerOrderRejectedError as exc:
-            decision.outcome = StrategyDecisionOutcome.SKIPPED
-            decision.reason = f"{signal.reason} — venue refused: {exc}"
-            return
-        decision.outcome = StrategyDecisionOutcome.EXECUTED
-        summary.executed += 1
 
     async def _exit(
         self,
@@ -482,6 +476,51 @@ class StrategyEngine:
         if bi is None or not bi.is_currently_available:
             return None
         return bi.broker_ticker
+
+    async def _insider_pressure(
+        self, instruments: list[Instrument]
+    ) -> dict[uuid.UUID, InsiderPressure]:
+        """Insider selling pressure across the universe, resolved once per run.
+
+        Looked up here rather than inside the strategy so `Strategy.evaluate`
+        keeps its contract of reading only what it is handed, and stays testable
+        against fixtures with no database.
+
+        Failures degrade to an empty map. This is an optional overlay on a
+        working strategy: losing it must return the strategy to its pre-insider
+        behaviour, never stop it evaluating.
+        """
+        service = InsiderIngestionService(self._session)
+        pressure: dict[uuid.UUID, InsiderPressure] = {}
+        for instrument in instruments:
+            try:
+                score = await service.score_instrument(instrument.id)
+            except Exception as exc:
+                log.warning(
+                    "strategy.insider_pressure_failed",
+                    instrument_id=str(instrument.id),
+                    error=str(exc),
+                )
+                continue
+            if score is not None and score.sell_penalty > 0:
+                pressure[instrument.id] = InsiderPressure(
+                    sell_penalty=score.sell_penalty,
+                    move_atr=score.move_since_filing_atr,
+                )
+        return pressure
+
+    async def _count_stale(self, instruments: list[Instrument], interval: Interval) -> int:
+        """How many instruments hold no bar newer than the freshness threshold.
+
+        Shares its threshold with `_blocked_reason`, so the count and the gate
+        can never disagree about what "stale" means.
+        """
+        max_age = _INTRADAY_STALE_MAX_AGE if interval.is_intraday else _DAILY_STALE_MAX_AGE
+        stale = 0
+        for instrument in instruments:
+            if await self._store.is_stale(instrument.id, interval, max_age=max_age):
+                stale += 1
+        return stale
 
     async def _blocked_reason(self, instrument: Instrument, interval: Interval) -> str | None:
         """Halt and freshness gates for an entry, against the bars actually traded.

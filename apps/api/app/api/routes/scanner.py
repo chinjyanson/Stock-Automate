@@ -8,7 +8,7 @@ from decimal import Decimal
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -19,8 +19,10 @@ from app.auth.dependencies import AuthContext, get_auth_context, require_csrf
 from app.broker.factory import default_paper_broker_kind, resolve_broker
 from app.broker.read_cache import broker_read_cache
 from app.config import get_settings
+from app.data.factory import resolve_provider
+from app.data.yfinance_provider import YFinanceProvider
 from app.db import get_db
-from app.models.enums import ActorKind, AuditEventKind, Interval
+from app.models.enums import ActorKind, AuditEventKind, Interval, ProviderKind
 from app.models.instrument import Instrument
 from app.models.market_data import Candle
 from app.models.scanner import (
@@ -32,6 +34,7 @@ from app.scanner import watchlist
 from app.scanner.engine import MIN_BARS_TO_SCORE, ScannerEngine
 from app.scanner.proposals import ProposalError, ProposalInputs, ProposalService
 from app.scanner.rotation import select_instruments
+from app.services.backfill import BackfillService
 from app.services.system_settings import (
     SCANNER_AUTORUN_KEY,
     scanner_auto_run_enabled,
@@ -90,6 +93,10 @@ class ScannerResultResponse(ORMModel):
     #: soundness (fundamentals + low-risk + liquidity).
     reversal_score: SerializedDecimal | None = None
     quality_score: SerializedDecimal | None = None
+    #: Insider *buying*, 50 = neutral, up to 100. Null when nobody senior bought.
+    insider_score: SerializedDecimal | None = None
+    #: Fraction of the score removed for insider selling (0..0.30).
+    insider_sell_penalty: SerializedDecimal | None = None
     fundamental_score: SerializedDecimal | None
     #: The valuation lens (0-100): how cheap the instrument looks. Separate from
     #: the momentum core score.
@@ -102,6 +109,12 @@ class ScannerResultResponse(ORMModel):
     confidence: SerializedDecimal
     candles_used: int
     is_trading212_tradable: bool
+    #: When this score was computed. The default listing shows each instrument's
+    #: latest result across runs, so rows can legitimately carry different dates
+    #: — without this the table would present a mixed-age ranking as if every row
+    #: were scored today. Both names validate: `created_at` reading the ORM row,
+    #: `scanned_at` when `ScannerResultDetail` is rebuilt from this model's dump.
+    scanned_at: datetime = Field(validation_alias=AliasChoices("scanned_at", "created_at"))
 
 
 class ScannerResultDetail(ScannerResultResponse):
@@ -173,10 +186,13 @@ async def run_scanner(
         )
         instruments = list(result.scalars().all())
         reason = f"explicit selection of {len(instruments)} instruments"
+        # Named by hand, so it ranks nothing: see `ScannerRun.is_ad_hoc`.
+        is_ad_hoc = True
     else:
         instruments, reason = await select_instruments(
             db, configuration=configuration, limit=payload.limit
         )
+        is_ad_hoc = False
 
     if not instruments:
         raise HTTPException(
@@ -192,6 +208,7 @@ async def run_scanner(
         configuration=configuration,
         selection_reason=reason,
         actor_user_id=context.user.id,
+        is_ad_hoc=is_ad_hoc,
     )
     await db.commit()
 
@@ -210,19 +227,36 @@ async def list_results(
     context: AuthContext = Depends(get_auth_context),
     db: AsyncSession = Depends(get_db),
 ) -> list[ScannerResultResponse]:
-    """List scanner results, most recent run first by default, ranked by score."""
+    """List scanner results ranked by score — each instrument's latest by default.
+
+    Naming a `run_id` returns exactly that run. Without one the listing is
+    *every instrument's most recent result*, not the most recent run's results.
+
+    Those differ, and the second is what someone looking at a scanner wants. A
+    run covers a rotating slice of the catalogue, so "the latest run" is a few
+    hundred names chosen by where the sweep happened to be, and a stock rescanned
+    on its own would reduce the whole table to one row. Combining across runs is
+    sound here only because the scores are absolute rather than cohort-relative
+    — a 74 means the same thing whichever night it was computed. `scanned_at`
+    carries the age of each row so a stale score cannot pass for a fresh one.
+    """
     stmt = select(ScannerResult)
 
     if run_id is not None:
         stmt = stmt.where(ScannerResult.run_id == run_id)
     else:
-        # Default to the latest completed run.
-        latest = await db.execute(
-            select(ScannerRun.id).order_by(ScannerRun.started_at.desc()).limit(1)
-        )
-        latest_id = latest.scalar_one_or_none()
-        if latest_id is not None:
-            stmt = stmt.where(ScannerResult.run_id == latest_id)
+        newest_per_instrument = select(
+            ScannerResult.id,
+            func.row_number()
+            .over(
+                partition_by=ScannerResult.instrument_id,
+                order_by=ScannerResult.created_at.desc(),
+            )
+            .label("rank"),
+        ).subquery()
+        stmt = stmt.join(
+            newest_per_instrument, newest_per_instrument.c.id == ScannerResult.id
+        ).where(newest_per_instrument.c.rank == 1)
 
     if classification:
         stmt = stmt.where(ScannerResult.classification == classification)
@@ -473,6 +507,120 @@ async def add_to_watchlist(
         note=entry.note,
         added_at=entry.created_at,
         is_scannable=payload.instrument_id in scannable,
+    )
+
+
+class RefreshInstrumentResponse(BaseModel):
+    """Outcome of pulling fresh candles for one instrument and rescoring it."""
+
+    instrument_id: uuid.UUID
+    instrument_name: str | None = None
+    #: Daily bars written by the refresh. Zero is normal when the store was
+    #: already current; it does not mean the refresh failed.
+    candles_written: int = 0
+    #: The new score, or null when the instrument still cannot be scored.
+    result: ScannerResultResponse | None = None
+    #: Why there is no result — an unsupported venue, no data from the provider,
+    #: or too little history. Null when `result` is present.
+    reason: str | None = None
+
+
+@router.post("/instruments/{instrument_id}/refresh", response_model=RefreshInstrumentResponse)
+async def refresh_instrument(
+    instrument_id: uuid.UUID,
+    context: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_csrf),
+) -> RefreshInstrumentResponse:
+    """Fetch current candles for one instrument and score it immediately (§4, §6).
+
+    The rotation reaches most of the catalogue only over days, so a stock that
+    has just been pinned would otherwise sit there carrying whatever score it
+    last had — or none at all — until the sweep came round. That is precisely
+    when someone is looking at it, so this closes the gap: map the symbol if it
+    has never been mapped, pull its daily history, and rescore it now.
+
+    The scan is marked ad hoc. It records a score and nothing more; the nightly
+    ranking, and the strategy universe drawn from it, are untouched.
+    """
+    instrument_row = await db.execute(
+        select(Instrument)
+        .where(Instrument.id == instrument_id)
+        .options(selectinload(Instrument.exchange))
+    )
+    instrument = instrument_row.scalar_one_or_none()
+    if instrument is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Instrument not found")
+
+    provider = resolve_provider(ProviderKind.YFINANCE)
+    # `backfill` needs the concrete provider: it uses the batched download, which
+    # is not part of the generic interface.
+    assert isinstance(provider, YFinanceProvider)
+    try:
+        backfill = await BackfillService(db).backfill([instrument], provider)
+    finally:
+        await provider.close()
+
+    if backfill.skipped_unsupported:
+        await db.commit()
+        return RefreshInstrumentResponse(
+            instrument_id=instrument_id,
+            instrument_name=instrument.name,
+            reason=(
+                f"{instrument.name} trades on a venue this product cannot map to a "
+                f"market-data symbol, so it cannot be scored."
+            ),
+        )
+    if backfill.errors:
+        await db.commit()
+        return RefreshInstrumentResponse(
+            instrument_id=instrument_id,
+            instrument_name=instrument.name,
+            reason=f"Market data could not be fetched: {backfill.errors[0]}",
+        )
+
+    configuration = await _active_configuration(db)
+    summary = await ScannerEngine(db).run(
+        [instrument],
+        configuration=configuration,
+        selection_reason="on-demand refresh of a single instrument",
+        actor_user_id=context.user.id,
+        is_ad_hoc=True,
+    )
+
+    scored = (
+        await db.execute(
+            select(ScannerResult).where(
+                ScannerResult.run_id == summary.run_id,
+                ScannerResult.instrument_id == instrument_id,
+            )
+        )
+    ).scalar_one_or_none()
+    await db.commit()
+
+    if scored is None:
+        return RefreshInstrumentResponse(
+            instrument_id=instrument_id,
+            instrument_name=instrument.name,
+            candles_written=backfill.candles_written,
+            reason=(
+                f"{instrument.name} has fewer than {MIN_BARS_TO_SCORE} daily bars stored, "
+                f"which is too little history to score. The provider returned "
+                f"{backfill.candles_written} new bar(s)."
+            ),
+        )
+
+    response = ScannerResultResponse.model_validate(scored)
+    response.instrument_name = instrument.name
+    response.sector = instrument.sector
+    if instrument.exchange is not None:
+        response.exchange_name = instrument.exchange.name
+        response.exchange_mic = instrument.exchange.mic
+    return RefreshInstrumentResponse(
+        instrument_id=instrument_id,
+        instrument_name=instrument.name,
+        candles_written=backfill.candles_written,
+        result=response,
     )
 
 

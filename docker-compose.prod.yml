@@ -1,0 +1,181 @@
+# Production stack.
+#
+# A separate file rather than an override of `docker-compose.yml`, because the
+# development one differs in ways that are not tunable — it bind-mounts source
+# over the image, publishes the database to the host, and runs Celery beat
+# inside the worker. Each of those is correct locally and wrong here, and
+# expressing "wrong here" as a patch on top of "correct locally" is how a dev
+# setting reaches production unnoticed.
+#
+# Four differences worth naming:
+#
+#   1. **Beat is its own service, and there is exactly one.** Two schedulers
+#      means every job fires twice, and some of those jobs place orders.
+#   2. **Migrations are a one-shot service**, not part of the API's start
+#      command. Two API replicas both running `alembic upgrade head` race each
+#      other; a single ordered step cannot.
+#   3. **Postgres and Redis publish no ports.** They are reachable on the
+#      internal network and nowhere else.
+#   4. **No bind mounts.** What runs is what is in the image, which is what was
+#      tested.
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+
+name: trading-platform-prod
+
+x-api-env: &api-env
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/1
+  CELERY_RESULT_BACKEND: redis://redis:6379/2
+  ENVIRONMENT: production
+
+# Ship container logs somewhere bounded. The default json-file driver has no
+# limit, and a chatty worker will fill the disk out from under Postgres —
+# which fails as data loss, not as a logging problem.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    # No `ports:`. The database is reachable from the compose network only.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/backups:/backups
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *logging
+    # Persisted: Redis holds the per-minute provider budget counters, and losing
+    # them silently restores spend already made (§4).
+    command: redis-server --appendonly yes --save 60 1 --maxmemory-policy noeviction
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  # -- Schema ---------------------------------------------------------------
+  # Runs to completion, then exits. Everything that touches the database waits
+  # for it, so no service ever queries a schema that is mid-upgrade.
+  migrate:
+    image: ${IMAGE_REGISTRY:-stock-automate}/api:${IMAGE_TAG:-latest}
+    restart: "no"
+    logging: *logging
+    env_file: ${ENV_FILE:-.env.prod}
+    environment: *api-env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    image: ${IMAGE_REGISTRY:-stock-automate}/api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    env_file: ${ENV_FILE:-.env.prod}
+    environment: *api-env
+    # Migrations are the `migrate` service's job — see above. This overrides the
+    # image's default command, which bundles them for local convenience.
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    # Bound to loopback: the reverse proxy terminates TLS and is the only thing
+    # that should be able to reach the API directly.
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  worker:
+    image: ${IMAGE_REGISTRY:-stock-automate}/worker:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    env_file: ${ENV_FILE:-.env.prod}
+    environment: *api-env
+    # No `--beat`. The image's default command bundles the scheduler for local
+    # development; here it must not, or scaling the worker would multiply the
+    # scheduler with it.
+    command: ["celery", "-A", "worker.app", "worker", "--loglevel=info", "--concurrency=2"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  # -- The scheduler --------------------------------------------------------
+  # Exactly one, forever. `deploy.replicas` is stated explicitly so that scaling
+  # this service is a visible edit rather than an accident of `--scale`.
+  #
+  # If you take one thing from this file: duplicating this container duplicates
+  # every scheduled order.
+  beat:
+    image: ${IMAGE_REGISTRY:-stock-automate}/worker:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    env_file: ${ENV_FILE:-.env.prod}
+    environment: *api-env
+    command:
+      - celery
+      - -A
+      - worker.app
+      - beat
+      - --loglevel=info
+      - --schedule=/var/lib/celery/celerybeat-schedule
+    deploy:
+      replicas: 1
+    volumes:
+      # Beat records when each periodic task last fired. On a volume, because in
+      # the container filesystem a restart resets it and every job re-fires as
+      # though it had never run.
+      - beat_schedule:/var/lib/celery
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  web:
+    image: ${IMAGE_REGISTRY:-stock-automate}/web:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      NODE_ENV: production
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  redis_data:
+  beat_schedule:

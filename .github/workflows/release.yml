@@ -1,0 +1,141 @@
+name: Release
+
+# Builds the deployable images and pushes them to ECR.
+#
+# Two properties this is designed around:
+#
+# **No long-lived AWS credentials.** Authentication is OIDC — GitHub presents a
+# signed token, AWS exchanges it for short-lived role credentials. There is no
+# access key to leak, rotate, or find in a repo that can reach a broker account.
+#
+# **The architecture is pinned.** Local builds on an Apple Silicon machine
+# produce linux/arm64; ECS Fargate defaults to X86_64. Mixing them fails at
+# runtime with `exec format error`, which reads like a corrupt image rather than
+# a platform mismatch. CI is the only thing that builds deployable images, and
+# it always states the platform.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Which environment to build for
+        type: choice
+        options: [dev, prod]
+        default: dev
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # required for OIDC
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  # linux/amd64 for Fargate X86_64 or an x86 EC2 instance; linux/arm64 for
+  # Graviton (t4g/c7g) or Fargate ARM64. One repo variable, because getting it
+  # wrong is invisible until a container refuses to start.
+  PLATFORM: ${{ vars.BUILD_PLATFORM || 'linux/amd64' }}
+
+jobs:
+  images:
+    name: Build and push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A tag deploys to prod; a push to main deploys to dev. Stated once here
+      # so no later step has to re-derive it.
+      - name: Resolve target environment
+        id: target
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENVIRONMENT="${{ inputs.environment }}"
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            ENVIRONMENT=prod
+          else
+            ENVIRONMENT=dev
+          fi
+          echo "environment=$ENVIRONMENT" >> "$GITHUB_OUTPUT"
+          echo "tag=${ENVIRONMENT}-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+          echo "Building for $ENVIRONMENT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+
+      - uses: docker/setup-buildx-action@v3
+
+      # -- API and worker: built once, identical in every environment ---------
+      # These hold the trading logic. Whatever is validated in dev is byte-for-
+      # byte what reaches prod; configuration is injected at runtime, never
+      # compiled in.
+      - name: Build and push API
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infrastructure/docker/api.Dockerfile
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          provenance: false # ECS cannot pull an OCI index with attestations
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/stock-automate-api:${{ steps.target.outputs.tag }}
+            ${{ steps.ecr.outputs.registry }}/stock-automate-api:${{ steps.target.outputs.environment }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
+
+      - name: Build and push worker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infrastructure/docker/worker.Dockerfile
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/stock-automate-worker:${{ steps.target.outputs.tag }}
+            ${{ steps.ecr.outputs.registry }}/stock-automate-worker:${{ steps.target.outputs.environment }}
+          cache-from: type=gha,scope=worker
+          cache-to: type=gha,scope=worker,mode=max
+
+      # -- Web: built per environment ----------------------------------------
+      # `NEXT_PUBLIC_API_URL` is compiled into the browser bundle, so unlike the
+      # two above this image cannot be promoted between environments. It carries
+      # no trading logic, which is why that asymmetry is tolerable.
+      - name: Build and push web
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infrastructure/docker/web.Dockerfile
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          provenance: false
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ steps.target.outputs.environment == 'prod' && vars.PROD_API_URL || vars.DEV_API_URL }}
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/stock-automate-web:${{ steps.target.outputs.tag }}
+            ${{ steps.ecr.outputs.registry }}/stock-automate-web:${{ steps.target.outputs.environment }}
+          cache-from: type=gha,scope=web-${{ steps.target.outputs.environment }}
+          cache-to: type=gha,scope=web-${{ steps.target.outputs.environment }},mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### Pushed \`${{ steps.target.outputs.tag }}\`"
+            echo ""
+            echo "| image | platform |"
+            echo "|---|---|"
+            echo "| stock-automate-api | ${{ env.PLATFORM }} |"
+            echo "| stock-automate-worker | ${{ env.PLATFORM }} |"
+            echo "| stock-automate-web | ${{ env.PLATFORM }} |"
+            echo ""
+            echo "Environment: **${{ steps.target.outputs.environment }}**"
+          } >> "$GITHUB_STEP_SUMMARY"

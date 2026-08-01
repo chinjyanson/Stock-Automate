@@ -224,11 +224,20 @@ class HaltScope(StrEnum):
 
 
 class StrategyKind(StrEnum):
-    """The trading strategies (§8). Long-only in this phase."""
+    """The trading strategy (§8). Long-only.
 
-    SP500_MEAN_REVERSION = "sp500_mean_reversion"
-    TREND_FOLLOWING = "trend_following"
-    PIE_REBALANCE = "pie_rebalance"
+    One member, deliberately. Trend-following and pie-rebalancing were removed
+    once the product settled on a single approach — the scanner decides *what*
+    is worth owning and mean reversion decides *when*. Carrying two unused
+    strategies meant two sets of parameters that were never tuned, two paths
+    through the engine that were never exercised in anger, and a strategies
+    screen that implied a choice nobody was making.
+    """
+
+    #: Daily mean reversion over the scanner's top-ranked names. Renamed from
+    #: `sp500_mean_reversion`: the strategy is index-agnostic, and a kind naming
+    #: an index it must not trade is a trap for whoever reads it next.
+    MEAN_REVERSION = "mean_reversion"
 
 
 class StrategyRunStatus(StrEnum):

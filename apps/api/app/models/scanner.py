@@ -26,6 +26,8 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    desc,
+    false,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -156,6 +158,18 @@ class ScannerRun(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     #: How this slice was chosen (rotation, watchlist, explicit) — for the "why
     #: was this scanned" question the UI must answer (§6).
     selection_reason: Mapped[str | None] = mapped_column(String(200))
+    #: True when the slice was named explicitly rather than chosen by the
+    #: rotation — a one-off rescan of a single stock, say.
+    #:
+    #: This exists because the strategy's universe is synced from "the latest
+    #: run" (`worker.jobs.strategy.sync_strategy_universe`). Without the flag,
+    #: rescanning one instrument would make that run the latest, and the
+    #: mean-reversion universe would silently collapse to the one name someone
+    #: happened to look at. An ad-hoc run records a score; it never redefines
+    #: what the strategy watches.
+    is_ad_hoc: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
 
     configuration: Mapped[ScannerConfiguration | None] = relationship(back_populates="runs")
     results: Mapped[list[ScannerResult]] = relationship(
@@ -169,7 +183,12 @@ class ScannerResult(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "scanner_results"
     __table_args__ = (
         Index("ix_scanner_results_run_score", "run_id", "core_score"),
-        Index("ix_scanner_results_instrument", "instrument_id"),
+        #: "The newest result for each instrument" — asked by the results listing
+        #: and by the rotation's top-ranked tier, both on every use. Composite and
+        #: descending so the window's partition/order is satisfied by the index
+        #: rather than by sorting the whole table, which is a cost that grows with
+        #: every night of history. Subsumes a plain index on `instrument_id`.
+        Index("ix_scanner_results_instrument_recent", "instrument_id", desc("created_at")),
         Index("ix_scanner_results_classification", "classification"),
     )
 
@@ -201,6 +220,13 @@ class ScannerResult(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     #: three reuse fundamental_value_score / price_value_score / sector_score.
     reversal_score: Mapped[Any | None] = mapped_column(Ratio)
     quality_score: Mapped[Any | None] = mapped_column(Ratio)
+    #: Insider (SEC Form 4) activity, 0-100 with 50 neutral. Null when the
+    #: instrument had no qualifying filings in the window — the common case, and
+    #: distinct from 50, which would mean "filings exist and they net to nothing".
+    insider_score: Mapped[Any | None] = mapped_column(Ratio)
+    #: Fraction of the final score removed for insider selling (0..0.30). Stored
+    #: so a mark-down is explainable rather than an unexplained drop in rank.
+    insider_sell_penalty: Mapped[Any | None] = mapped_column(Ratio)
 
     #: Separate, optional. Never gates the core score (§6, acceptance 7).
     fundamental_score: Mapped[Any | None] = mapped_column(Ratio)

@@ -28,6 +28,7 @@ from app.models.instrument import Instrument
 from app.models.market_data import Candle
 from app.models.risk import RiskConfiguration, TradeIntent
 from app.risk.halts import HaltService
+from app.services.market_regime import MarketRegimeService
 
 log = structlog.get_logger(__name__)
 
@@ -136,7 +137,15 @@ class RiskEngine:
             equity = min(equity, equity_ceiling)
         if equity <= 0:
             return RiskDecision.reject("Account equity is not positive.")
-        risk_budget = equity * Decimal(str(config.risk_per_trade_pct))
+        # Market-wide risk posture scales the per-trade budget. Floored well
+        # above zero by construction (see MIN_RISK_FACTOR): a bad regime makes
+        # every position smaller, it never stops the strategy trading. Absent
+        # measurement means 1.0 — missing information must not masquerade as a
+        # risk-off signal.
+        regime = await MarketRegimeService(self._session).current_risk_factor()
+        regime_factor = Decimal(str(regime))
+        risk_budget = equity * Decimal(str(config.risk_per_trade_pct)) * regime_factor
+        applied_regime = f"market regime x{regime_factor}" if regime_factor < 1 else None
         raw_quantity = risk_budget / stop_distance
 
         # 4. Caps — smallest wins. -----------------------------------------
@@ -178,6 +187,8 @@ class RiskEngine:
         # Phase 4 refinement over the earlier approximation.
         correlation: float | None = None
         applied_caps = [binding_cap]
+        if applied_regime:
+            applied_caps.append(applied_regime)
         if benchmark_candles:
             correlation = self._correlation(series.close, benchmark_candles, config)
             if correlation is not None and correlation > float(config.correlation_threshold):

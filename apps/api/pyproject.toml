@@ -55,6 +55,10 @@ package = true
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# Vendored verbatim from the insider-trading-agent repo. Held to its upstream
+# form on purpose: reformatting it to this project's style would make the next
+# sync a merge conflict, and nothing here imports it.
+exclude = ["app/insider"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "RUF", "ASYNC"]
@@ -75,6 +79,8 @@ ignore = [
 [tool.mypy]
 python_version = "3.12"
 strict = true
+# See the ruff note above — vendored, untyped, and not imported by the app.
+exclude = ["app/insider/"]
 warn_return_any = true
 disallow_untyped_defs = true
 plugins = ["pydantic.mypy"]

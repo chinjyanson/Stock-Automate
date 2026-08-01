@@ -1,0 +1,121 @@
+# Overlay for a GCP e2-micro Always Free VM (1 GB RAM, shared core).
+#
+# Applied on top of the production file, never alone:
+#   docker compose -f docker-compose.prod.yml -f docker-compose.gcp.yml up -d
+#
+# An overlay rather than a third full file, because everything that matters —
+# beat isolated to one replica, migrations as an ordered step, no ports on the
+# database — is already correct in the production file and must not be restated
+# where it could drift.
+#
+# What actually changes on a 1 GB box:
+#
+#   * Postgres is tuned down from defaults sized for a real server.
+#   * The worker drops to one process. Two would double the fixed ~160 MB
+#     interpreter cost to run a job that is network-bound, not CPU-bound.
+#   * The web frontend is dropped. It is the one service with no reason to live
+#     here: it holds no trading logic and is served from a laptop during use.
+#   * Memory limits are declared, so a leak degrades one container instead of
+#     inviting the kernel to choose a victim — and the kernel's usual choice is
+#     Postgres, the only process here whose death costs data.
+#
+# Measured footprints that justify the numbers (see infrastructure/gcp/bootstrap.sh):
+#   worker peak 160 MB · scanner peak 148 MB · beat ~80 MB · postgres ~250 MB
+
+# Images are built on the VM rather than pulled.
+#
+# The production file names images from a registry, which is right when CI
+# publishes them. For a single box it would mean standing up a registry, an
+# auth path and a CI pipeline before anything can run once — so here the two
+# Python images are built in place and tagged with the same names, which
+# `migrate` and `beat` then resolve locally.
+#
+# A side benefit: this VM is x86, so building here produces x86 natively. Built
+# on an Apple Silicon laptop instead, the images would be arm64 and every
+# container would die with `exec format error`.
+#
+# `web` is not built. Next.js needs more memory than this box has, and the
+# frontend runs from your laptop anyway.
+x-api-build: &api-build
+  context: .
+  dockerfile: infrastructure/docker/api.Dockerfile
+
+x-worker-build: &worker-build
+  context: .
+  dockerfile: infrastructure/docker/worker.Dockerfile
+
+services:
+  postgres:
+    command:
+      - postgres
+      # Defaults assume a machine with memory to spare. These are sized for a
+      # ~1.5 GB database on a 1 GB host: enough cache to keep the working set
+      # warm, not so much that the OS and the worker are squeezed.
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - effective_cache_size=256MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=32MB
+      # One operator and a handful of containers. The default 100 reserves
+      # per-connection memory for connections that will never arrive.
+      - -c
+      - max_connections=25
+      # This is a single-instance deployment with real backups; the write-ahead
+      # log does not need to support replication.
+      - -c
+      - wal_level=minimal
+      - -c
+      - max_wal_senders=0
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+
+  redis:
+    # The broker queue and the provider budget counters are both small. Capping
+    # makes a runaway queue fail loudly here rather than starving Postgres.
+    #
+    # `noeviction` is inherited from the production file deliberately: silently
+    # discarding a budget counter would restore spend already made, and
+    # discarding a queued task would lose a scheduled job.
+    command: redis-server --appendonly yes --save 60 1 --maxmemory 96mb --maxmemory-policy noeviction
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  worker:
+    build: *worker-build
+    # One process. These jobs wait on yfinance far more than they compute, so
+    # concurrency buys little and costs a whole interpreter.
+    command: ["celery", "-A", "worker.app", "worker", "--loglevel=info", "--concurrency=1"]
+    deploy:
+      resources:
+        limits:
+          memory: 448M
+
+  # beat and migrate carry no `build:` — they run the images `worker` and `api`
+  # tag, so building those two covers all four services.
+  beat:
+    deploy:
+      resources:
+        limits:
+          memory: 192M
+
+  api:
+    build: *api-build
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # The frontend is not run here. `scale: 0` rather than deleting the service,
+  # so the production file stays the single definition of what the stack is and
+  # this file only records what is different.
+  web:
+    deploy:
+      replicas: 0
+    scale: 0

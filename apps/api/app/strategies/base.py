@@ -22,6 +22,20 @@ from app.models.strategy import StrategyConfiguration
 
 
 @dataclass(frozen=True, slots=True)
+class InsiderPressure:
+    """Insider selling on one instrument, and whether it has been priced in yet.
+
+    `move_atr` is the signed move since the filing, in ATR units. The sign is
+    what an exit decision turns on: already fallen means the market has acted
+    and selling now realises the loss at the bottom; flat or higher means the
+    move has not happened and there is still time to leave.
+    """
+
+    sell_penalty: float
+    move_atr: float | None
+
+
+@dataclass(frozen=True, slots=True)
 class StrategySignal:
     """One strategy's intent for one instrument.
 
@@ -52,11 +66,21 @@ class StrategyContext:
     store: CandleStore
     instruments: list[Instrument]
     positions: list[BrokerPosition]
+    #: Insider selling pressure per instrument, 0..0.40 — the same figure the
+    #: scanner uses as a score penalty. Resolved once by the engine and passed
+    #: in, exactly like `positions`, so a strategy still reads only what is
+    #: handed to it and stays testable against fixtures with no database.
+    #: Absent key means no qualifying selling.
+    insider_sell_pressure: dict[uuid.UUID, InsiderPressure] = field(default_factory=dict)
     #: Instruments `series()` could not serve, and why. Populated as a side
     #: effect so strategies stay branch-free about it; the engine drains this
     #: into SKIPPED decisions after the pass, which is what makes a data outage
     #: visible instead of looking like a run that found no setup.
     insufficient_history: dict[uuid.UUID, str] = field(default_factory=dict)
+
+    def sell_pressure(self, instrument_id: uuid.UUID) -> InsiderPressure | None:
+        """Insider selling on one instrument, or None when there is none."""
+        return self.insider_sell_pressure.get(instrument_id)
 
     def held_quantity(self, instrument_id: uuid.UUID) -> Decimal:
         """How much of `instrument_id` the paper venue currently holds."""

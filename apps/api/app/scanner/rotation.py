@@ -4,9 +4,14 @@ Free data budgets mean the whole catalogue cannot be scored every day, so the
 scanner rotates. The priority order is fixed by §6:
 
   1. Watchlist members
-  2. Previously high-ranking candidates
-  3. Instruments with newly refreshed data
-  4. The rest of the catalogue, oldest-scanned first
+  2. The current top `TOP_RANKED_ALWAYS_RESCANNED` by latest score (exploit)
+  3. The rest of the catalogue, oldest-scanned first (explore)
+
+Deliberately an explore/exploit split rather than one sweep. The scan covers a
+slice of a 15k catalogue per run, and the strategy draws its universe from the
+latest run only — so a highly-ranked stock that is not re-scanned tonight is not
+a candidate tonight, however good it was yesterday. Tier 2 guarantees the best
+band is always current; tier 3 spends what is left finding new ones.
 
 `last_scanned_at ASC NULLS FIRST` does most of the work: never-scanned and
 longest-unscanned instruments surface first, so over successive days the whole
@@ -27,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.enums import BrokerKind, Interval, LifecycleState
 from app.models.instrument import BrokerInstrument, Instrument
 from app.models.market_data import Candle
-from app.models.scanner import Classification, ScannerConfiguration, ScannerResult
+from app.models.scanner import ScannerConfiguration, ScannerResult
 from app.scanner.engine import MIN_BARS_TO_SCORE
 from app.scanner.watchlist import watchlisted_instrument_ids
 
@@ -35,6 +40,17 @@ from app.scanner.watchlist import watchlisted_instrument_ids
 #: per-scan instrument cap is applied. A safety bound on the query, not the
 #: scan size.
 _ROTATION_POOL_LIMIT = 2000
+
+#: How many of the best-scoring instruments are re-scored every single run,
+#: before any exploration happens.
+#:
+#: This is the *exploit* half of the rotation. The scan covers a slice of a
+#: 15k catalogue, and the strategy's universe is drawn from the latest run only
+#: — so without a guaranteed re-scan a highly-ranked stock drops out of
+#: consideration entirely on any night it is not swept, however good it is.
+#: Holding the top band steady also means today's ranking is built from today's
+#: prices for the names that matter, rather than a mix of dates.
+TOP_RANKED_ALWAYS_RESCANNED = 200
 
 
 async def select_instruments(
@@ -77,12 +93,16 @@ async def select_instruments(
     unscannable = [iid for iid in watchlisted if iid not in eligible_ids]
     watchlist_selected = len(ordered_ids)
 
-    # Tier 2: previously high-ranking candidates.
-    _extend(await _previous_candidate_ids(session))
-    # Tiers 3+4: the rotating sweep, oldest-scanned first. Restricted to the
-    # instruments that can actually be scored, so the sweep's cap and ordering
-    # operate within the scannable set rather than being saturated by the far
-    # larger pool of never-scanned instruments that have no stored history.
+    # Tier 2 — EXPLOIT: the current best, re-scored every run without exception.
+    # The strategy picks its universe from the latest run alone, so a top-ranked
+    # stock that is not re-scanned tonight is not a candidate tonight.
+    _extend(await _top_ranked_ids(session, TOP_RANKED_ALWAYS_RESCANNED))
+    exploit_count = len(ordered_ids)
+
+    # Tier 3 — EXPLORE: the rotating sweep, oldest-scanned first, filling
+    # whatever the cap leaves. Restricted to instruments that can actually be
+    # scored, so the sweep is not saturated by never-scanned rows with no stored
+    # history.
     _extend(await _rotation_ids(session, configuration, eligible_ids))
 
     chosen_ids = ordered_ids[:max_instruments]
@@ -91,8 +111,11 @@ async def select_instruments(
 
     instruments = await _load(session, chosen_ids)
 
+    exploit_selected = min(exploit_count, max_instruments)
     parts = [
-        f"rotation: {len(chosen_ids)} instruments (watchlist + prior candidates + oldest-scanned)"
+        f"rotation: {len(chosen_ids)} instruments "
+        f"({exploit_selected} top-ranked re-scored, "
+        f"{max(0, len(chosen_ids) - exploit_selected)} explored)"
     ]
     if watchlist_selected:
         parts.append(f"{min(watchlist_selected, max_instruments)} watchlisted")
@@ -119,29 +142,41 @@ def _max_instruments(config: ScannerConfiguration | None, limit: int | None) -> 
     return 200
 
 
-async def _previous_candidate_ids(session: AsyncSession) -> list[uuid.UUID]:
-    """Instruments that were screening/watchlist candidates in a recent result.
+async def _top_ranked_ids(session: AsyncSession, limit: int) -> list[uuid.UUID]:
+    """The best-scoring instruments, by each one's *most recent* score.
 
-    Ordered by score so the strongest prior candidates are re-verified first.
+    Two details this gets right that a naive "order every result by score" does
+    not, and both were wrong before:
+
+      * **Ranks by `primary_score`**, the fundamentals-first blend that actually
+        decides the ranking and the strategy's universe. The previous version
+        ordered by `core_score` — the momentum core — so the tier meant to
+        re-verify the best stocks was sorting them by a different number than
+        the one that makes them the best.
+
+      * **Uses each instrument's latest result only.** Ordering across all of
+        history and de-duplicating keeps the *highest* score an instrument ever
+        had, so a stock that scored 85 three weeks ago and 40 last night is
+        pulled back in on the stale 85 — indefinitely, since re-scanning it
+        cannot remove the old row.
     """
-    result = await session.execute(
-        select(ScannerResult.instrument_id)
-        .where(
-            ScannerResult.classification.in_(
-                [Classification.SCREENING_CANDIDATE, Classification.WATCHLIST_CANDIDATE]
-            )
+    ranked = select(
+        ScannerResult.instrument_id.label("instrument_id"),
+        ScannerResult.primary_score.label("primary_score"),
+        func.row_number()
+        .over(
+            partition_by=ScannerResult.instrument_id,
+            order_by=ScannerResult.created_at.desc(),
         )
-        .order_by(ScannerResult.core_score.desc())
-        .limit(500)
+        .label("recency_rank"),
+    ).subquery()
+    result = await session.execute(
+        select(ranked.c.instrument_id)
+        .where(ranked.c.recency_rank == 1)
+        .order_by(ranked.c.primary_score.desc())
+        .limit(limit)
     )
-    # Preserve order while de-duplicating (an instrument can appear in several runs).
-    seen: set[uuid.UUID] = set()
-    out: list[uuid.UUID] = []
-    for (iid,) in result.all():
-        if iid not in seen:
-            seen.add(iid)
-            out.append(iid)
-    return out
+    return [row[0] for row in result.all()]
 
 
 async def _rotation_ids(

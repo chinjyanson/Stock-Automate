@@ -13,7 +13,6 @@ successive throttle-friendly batches rather than one enormous run.
 
 from __future__ import annotations
 
-import asyncio
 import os
 from dataclasses import asdict
 from typing import Any
@@ -28,6 +27,7 @@ from app.services.backfill import BackfillService
 
 from worker.app import app
 from worker.locks import LockNotAcquiredError, distributed_lock
+from worker.runner import run_job
 
 log = structlog.get_logger(__name__)
 
@@ -64,7 +64,7 @@ def backfill_catalogue(  # type: ignore[no-untyped-def]
     size = batch_size or settings.backfill_ingest_batch_size
     try:
         with distributed_lock(_redis(), "backfill_catalogue", ttl_seconds=3600):
-            result = asyncio.run(_run(size))
+            result = run_job(_run(size))
             log.info(
                 "job.backfill_catalogue.completed",
                 round=round_num,

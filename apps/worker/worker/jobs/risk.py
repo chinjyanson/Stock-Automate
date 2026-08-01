@@ -14,7 +14,6 @@ reconciliation transitions are convergent; the EOD summary upserts per (broker, 
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
 import structlog
@@ -38,6 +37,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from worker.app import app
+from worker.runner import run_job
 
 log = structlog.get_logger(__name__)
 
@@ -59,7 +59,7 @@ async def _monitor_stops() -> dict[str, Any]:
 def monitor_stops(self) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     """Trigger, trail and time-stop open positions on the active venue (§9)."""
     try:
-        result = asyncio.run(_monitor_stops())
+        result = run_job(_monitor_stops())
         if any(v for v in result.values() if isinstance(v, int)):
             log.info("job.monitor_stops.completed", **result)
         return result
@@ -89,7 +89,7 @@ async def _reconcile() -> dict[str, Any]:
 def reconcile_broker(self) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     """Reconcile the active venue; halt on divergence, resolve on clean (§10)."""
     try:
-        result = asyncio.run(_reconcile())
+        result = run_job(_reconcile())
         log.info("job.reconcile_broker.completed", **result)
         return result
     except _NOT_CONFIGURED as exc:
@@ -184,7 +184,7 @@ async def _generate_eod() -> dict[str, Any]:
 def generate_eod_summary(self) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     """Persist the end-of-day account summary for the active venue (§16)."""
     try:
-        result = asyncio.run(_generate_eod())
+        result = run_job(_generate_eod())
         log.info("job.generate_eod_summary.completed", **result)
         return result
     except _NOT_CONFIGURED as exc:
@@ -211,7 +211,7 @@ def live_guard(self) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     everywhere and is a no-op when nothing is armed.
     """
     try:
-        result = asyncio.run(_live_guard())
+        result = run_job(_live_guard())
         if result.get("breached"):
             log.warning("job.live_guard.breached", **result)
         return result
@@ -234,7 +234,7 @@ async def _reconcile_live() -> dict[str, Any]:
 def reconcile_live(self) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     """Reconcile the live broker; halt on divergence (§10). No-op without live creds."""
     try:
-        result = asyncio.run(_reconcile_live())
+        result = run_job(_reconcile_live())
         log.info("job.reconcile_live.completed", **result)
         return result
     except (LiveTradingDisabledError, BrokerNotConfiguredError) as exc:

@@ -17,6 +17,7 @@ import pytest
 from sqlalchemy import select
 
 from app.broker.internal_paper import InternalPaperBroker
+from app.broker.types import BrokerOrderRequest
 from app.data.store import CandleStore
 from app.data.types import Candle as CandleDTO
 from app.models.enums import (
@@ -24,6 +25,8 @@ from app.models.enums import (
     HaltScope,
     InstrumentKind,
     Interval,
+    OrderSide,
+    OrderType,
     PriceUnit,
     ProviderKind,
     StrategyDecisionOutcome,
@@ -33,6 +36,7 @@ from app.models.instrument import Exchange, Instrument
 from app.models.risk import RiskConfiguration
 from app.models.strategy import StrategyConfiguration, StrategyDecision
 from app.risk.halts import HaltService
+from app.strategies.base import InsiderPressure
 from app.strategies.engine import StrategyEngine
 
 pytestmark = pytest.mark.asyncio
@@ -100,22 +104,48 @@ async def _risk_config(db: object) -> None:
     await db.flush()  # type: ignore[attr-defined]
 
 
-class TestTrend:
-    async def test_uptrend_is_entered(self, db: object) -> None:
-        await _risk_config(db)
-        instrument = await _instrument(db, "GOLD")
-        # A clean 130-day uptrend: price above its SMA100, rising, positive return.
-        await _upsert(db, instrument, Interval.D1, [80 + i * 0.5 for i in range(130)])
+#: A stable, oscillating base then a sharp sell-off — the dislocation this
+#: strategy exists to catch. A *gradual* decline does not work as a fixture and
+#: that is not an accident: the bands follow a trend down, so price never breaks
+#: its own lower band. Only a sudden move outruns them.
+_STABLE_BASE = [100 + (2 if i % 2 else -2) for i in range(45)]
+_SELLOFF = [*_STABLE_BASE, 95.0, 90.0, 86.0]
+_RECOVERED = [*_STABLE_BASE, 95.0, 90.0, 86.0, 92.0, 97.0, 100.0]
 
-        config = StrategyConfiguration(
-            kind=StrategyKind.TREND_FOLLOWING,
-            name="trend",
-            is_active=True,
-            interval=Interval.D1,
-            auto_execute=True,
-            params={"sma_period": 100, "slope_window": 21, "return_lookback": 60},
-            universe={"instrument_ids": [str(instrument.id)]},
-        )
+#: The sell-off above lands RSI at ~38.7. Pinned in the fixture rather than
+#: relying on the configured default, so retuning the strategy cannot silently
+#: change what these tests prove.
+_ENTRY_PARAMS = {
+    "bb_period": 20,
+    "bb_std": 2.0,
+    "rsi_period": 14,
+    "rsi_oversold": 40.0,
+    "atr_period": 14,
+    "min_atr_pct": 0.02,
+}
+
+
+def _config(instrument: Instrument, name: str, **overrides: object) -> StrategyConfiguration:
+    params = {**_ENTRY_PARAMS, **overrides}
+    return StrategyConfiguration(
+        kind=StrategyKind.MEAN_REVERSION,
+        name=name,
+        is_active=True,
+        interval=Interval.D1,
+        auto_execute=True,
+        params=params,
+        universe={"instrument_ids": [str(instrument.id)]},
+    )
+
+
+class TestMeanReversion:
+    """Entry needs all three indicators to agree; each is tested for its own veto."""
+
+    async def test_band_break_with_oversold_rsi_is_entered(self, db: object) -> None:
+        await _risk_config(db)
+        instrument = await _instrument(db, "RISKY")
+        await _upsert(db, instrument, Interval.D1, _SELLOFF)
+        config = _config(instrument, "meanrev")
         db.add(config)  # type: ignore[attr-defined]
         await db.flush()  # type: ignore[attr-defined]
 
@@ -130,18 +160,17 @@ class TestTrend:
         positions = await InternalPaperBroker(db).get_positions()  # type: ignore[arg-type]
         assert any(p.broker_ticker == str(instrument.id) for p in positions)
 
-    async def test_no_signal_without_a_trend(self, db: object) -> None:
+    async def test_rsi_can_veto_a_band_break(self, db: object) -> None:
+        """Price below the band is not enough — momentum must be washed out too.
+
+        This is the "cheap and still falling" case a band break alone cannot
+        distinguish from a snapback candidate.
+        """
         await _risk_config(db)
-        instrument = await _instrument(db, "FLAT")
-        await _upsert(db, instrument, Interval.D1, [100.0] * 130)
-        config = StrategyConfiguration(
-            kind=StrategyKind.TREND_FOLLOWING,
-            name="trend",
-            is_active=True,
-            interval=Interval.D1,
-            params={"sma_period": 100},
-            universe={"instrument_ids": [str(instrument.id)]},
-        )
+        instrument = await _instrument(db, "FALLING")
+        await _upsert(db, instrument, Interval.D1, _SELLOFF)
+        # Same bars, but demanding a far more oversold RSI than this move produced.
+        config = _config(instrument, "meanrev-rsi-veto", rsi_oversold=20.0)
         db.add(config)  # type: ignore[attr-defined]
         await db.flush()  # type: ignore[attr-defined]
 
@@ -152,32 +181,16 @@ class TestTrend:
         await db.commit()  # type: ignore[attr-defined]
         assert summary.signals == 0
 
+    async def test_atr_can_veto_a_band_break(self, db: object) -> None:
+        """A stock too quiet to be worth trading is filtered out by ATR.
 
-class TestMeanReversion:
-    async def test_oversold_below_mean_is_entered(self, db: object) -> None:
+        The band and RSI both agree here; only the volatility floor refuses, which
+        is what keeps the strategy on names with a snapback worth capturing.
+        """
         await _risk_config(db)
-        instrument = await _instrument(db, "SPY")
-        # Daily bars for sizing the stop, plus an intraday series that ends
-        # stretched below its mean and oversold.
-        await _upsert(db, instrument, Interval.D1, [100.0] * 60)
-        intraday = [100.0] * 185 + [98, 96, 94, 92, 90, 88, 86, 84, 82, 80, 78, 76, 74, 72, 70]
-        await _upsert(db, instrument, Interval.M15, intraday)
-
-        config = StrategyConfiguration(
-            kind=StrategyKind.SP500_MEAN_REVERSION,
-            name="meanrev",
-            is_active=True,
-            interval=Interval.M15,
-            auto_execute=True,
-            params={
-                "sma_period": 20,
-                "zscore_entry": -1.0,
-                "rsi_period": 14,
-                "rsi_oversold": 45.0,
-                "zscore_exit": 0.0,
-            },
-            universe={"instrument_ids": [str(instrument.id)]},
-        )
+        instrument = await _instrument(db, "QUIET")
+        await _upsert(db, instrument, Interval.D1, _SELLOFF)
+        config = _config(instrument, "meanrev-atr-veto", min_atr_pct=0.50)
         db.add(config)  # type: ignore[attr-defined]
         await db.flush()  # type: ignore[attr-defined]
 
@@ -185,38 +198,47 @@ class TestMeanReversion:
             db,  # type: ignore[arg-type]
             broker=InternalPaperBroker(db),  # type: ignore[arg-type]
         ).run(config)
+        await db.commit()  # type: ignore[attr-defined]
+        assert summary.signals == 0
+
+    async def test_recovery_to_the_middle_band_exits(self, db: object) -> None:
+        """The other half of the round trip: reverted to the mean, so take it."""
+        await _risk_config(db)
+        instrument = await _instrument(db, "RECOVER")
+        await _upsert(db, instrument, Interval.D1, _RECOVERED)
+        broker = InternalPaperBroker(db)  # type: ignore[arg-type]
+        await broker.place_order(
+            BrokerOrderRequest(
+                broker_ticker=str(instrument.id),
+                side=OrderSide.BUY,
+                quantity=Decimal("10"),
+                order_type=OrderType.MARKET,
+            )
+        )
+        config = _config(instrument, "meanrev-exit")
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        summary = await StrategyEngine(db, broker=broker).run(config)  # type: ignore[arg-type]
         await db.commit()  # type: ignore[attr-defined]
 
         assert summary.signals == 1
         assert summary.executed == 1
-
-    async def test_stale_intraday_bars_block_the_entry(self, db: object) -> None:
-        """Freshness is judged on the bars traded, not on daily ones.
-
-        The daily series here is current, so a gate hardcoded to `Interval.D1`
-        would wave this through — and fill on 15-minute prices three hours old.
-        """
-        await _risk_config(db)
-        instrument = await _instrument(db, "SPY")
-        await _upsert(db, instrument, Interval.D1, [100.0] * 60)
-        intraday = [100.0] * 185 + [98, 96, 94, 92, 90, 88, 86, 84, 82, 80, 78, 76, 74, 72, 70]
-        await _upsert(db, instrument, Interval.M15, intraday, age=timedelta(hours=3))
-
-        config = StrategyConfiguration(
-            kind=StrategyKind.SP500_MEAN_REVERSION,
-            name="meanrev-stale",
-            is_active=True,
-            interval=Interval.M15,
-            auto_execute=True,
-            params={
-                "sma_period": 20,
-                "zscore_entry": -1.0,
-                "rsi_period": 14,
-                "rsi_oversold": 45.0,
-                "zscore_exit": 0.0,
-            },
-            universe={"instrument_ids": [str(instrument.id)]},
+        decision = (
+            (await db.execute(select(StrategyDecision)))  # type: ignore[attr-defined]
+            .scalars()
+            .one()
         )
+        assert decision.side is OrderSide.SELL
+        assert "recovered to the middle band" in decision.reason
+        assert await InternalPaperBroker(db).get_positions() == []  # type: ignore[arg-type]
+
+    async def test_stale_bars_block_the_entry(self, db: object) -> None:
+        """A valid setup on old bars is signalled, then refused at the gate."""
+        await _risk_config(db)
+        instrument = await _instrument(db, "STALE")
+        await _upsert(db, instrument, Interval.D1, _SELLOFF, age=timedelta(days=10))
+        config = _config(instrument, "meanrev-stale")
         db.add(config)  # type: ignore[attr-defined]
         await db.flush()  # type: ignore[attr-defined]
 
@@ -226,7 +248,6 @@ class TestMeanReversion:
         ).run(config)
         await db.commit()  # type: ignore[attr-defined]
 
-        # The setup was seen and signalled, then refused at the gate.
         assert summary.signals == 1
         assert summary.executed == 0
         assert summary.rejected == 1
@@ -236,8 +257,72 @@ class TestMeanReversion:
             .one()
         )
         assert decision.outcome is StrategyDecisionOutcome.REJECTED_BY_RISK
-        assert "stale 15m data" in decision.reason
+        assert "stale 1d data" in decision.reason
         assert await InternalPaperBroker(db).get_positions() == []  # type: ignore[arg-type]
+
+
+class TestStaleReporting:
+    """A quiet run on old bars must not look like a quiet run on fresh ones."""
+
+    def _config(self, instrument: Instrument, name: str) -> StrategyConfiguration:
+        return StrategyConfiguration(
+            kind=StrategyKind.MEAN_REVERSION,
+            name=name,
+            is_active=True,
+            interval=Interval.M15,
+            auto_execute=True,
+            params={"sma_period": 20},
+            universe={"instrument_ids": [str(instrument.id)]},
+        )
+
+    async def test_stale_bars_are_counted_even_with_no_signal(self, db: object) -> None:
+        """The freshness gate only fires on an entry, so a no-signal run bypasses it.
+
+        This is the case that reads as "nothing happened": the strategy evaluated
+        fine, found no setup, and reported zero of everything — while looking at
+        prices three days old.
+        """
+        await _risk_config(db)
+        instrument = await _instrument(db, "OLD")
+        # Flat and plentiful, so no signal, and deliberately days out of date.
+        await _upsert(
+            db,
+            instrument,
+            Interval.M15,
+            [100.0 + (i % 3) * 0.1 for i in range(120)],
+            age=timedelta(days=3),
+        )
+        config = self._config(instrument, "meanrev-stale-count")
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        summary = await StrategyEngine(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).run(config)
+        await db.commit()  # type: ignore[attr-defined]
+
+        assert summary.signals == 0
+        assert summary.skipped == 0  # it had plenty of history — just old history
+        assert summary.stale == 1
+
+    async def test_fresh_bars_report_no_staleness(self, db: object) -> None:
+        """The counterpart, so `stale` cannot be a constant that happens to pass."""
+        await _risk_config(db)
+        instrument = await _instrument(db, "FRESH")
+        await _upsert(db, instrument, Interval.M15, [100.0 + (i % 3) * 0.1 for i in range(120)])
+        config = self._config(instrument, "meanrev-fresh-count")
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        summary = await StrategyEngine(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).run(config)
+        await db.commit()  # type: ignore[attr-defined]
+
+        assert summary.signals == 0
+        assert summary.stale == 0
 
 
 class TestInsufficientHistory:
@@ -253,7 +338,7 @@ class TestInsufficientHistory:
         await _upsert(db, instrument, Interval.M15, [100.0] * 10)
 
         config = StrategyConfiguration(
-            kind=StrategyKind.SP500_MEAN_REVERSION,
+            kind=StrategyKind.MEAN_REVERSION,
             name="meanrev-thin",
             is_active=True,
             interval=Interval.M15,
@@ -281,7 +366,7 @@ class TestInsufficientHistory:
         # Nothing was decided, so there is no side to record.
         assert decision.side is None
         assert decision.instrument_id == instrument.id
-        assert "10 closed 15m bars available, needs 21" in decision.reason
+        assert "10 closed 15m bars available, needs 20" in decision.reason
 
     async def test_sufficient_history_records_no_skip(self, db: object) -> None:
         """The counterpart: a real evaluation that declines leaves no skip behind."""
@@ -291,7 +376,7 @@ class TestInsufficientHistory:
         await _upsert(db, instrument, Interval.M15, [100.0 + (i % 3) * 0.1 for i in range(120)])
 
         config = StrategyConfiguration(
-            kind=StrategyKind.SP500_MEAN_REVERSION,
+            kind=StrategyKind.MEAN_REVERSION,
             name="meanrev-calm",
             is_active=True,
             interval=Interval.M15,
@@ -318,59 +403,17 @@ class TestInsufficientHistory:
         )
 
 
-class TestPie:
-    async def test_rebalance_buys_toward_target_weights(self, db: object) -> None:
-        await _risk_config(db)
-        a = await _instrument(db, "AAA")
-        b = await _instrument(db, "BBB")
-        await _upsert(db, a, Interval.D1, [100.0] * 30)
-        await _upsert(db, b, Interval.D1, [50.0] * 30)
-
-        config = StrategyConfiguration(
-            kind=StrategyKind.PIE_REBALANCE,
-            name="pie",
-            is_active=True,
-            interval=Interval.D1,
-            auto_execute=True,
-            params={"drift_band": 0.05},
-            universe={"weights": {str(a.id): 0.5, str(b.id): 0.5}},
-            account_equity=Decimal("10000"),
-        )
-        db.add(config)  # type: ignore[attr-defined]
-        await db.flush()  # type: ignore[attr-defined]
-
-        summary = await StrategyEngine(
-            db,  # type: ignore[arg-type]
-            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
-        ).run(config)
-        await db.commit()  # type: ignore[attr-defined]
-
-        assert summary.executed == 2
-        positions = {
-            p.broker_ticker: p.quantity
-            for p in await InternalPaperBroker(db).get_positions()  # type: ignore[arg-type]
-        }
-        # 50% of 10k = 5k each: 50 units of AAA @100, 100 units of BBB @50.
-        assert positions[str(a.id)] == Decimal("50")
-        assert positions[str(b.id)] == Decimal("100")
-
-
 class TestRiskGate:
     async def test_a_halt_turns_an_entry_into_a_recorded_refusal(self, db: object) -> None:
         await _risk_config(db)
-        instrument = await _instrument(db, "GOLD")
-        await _upsert(db, instrument, Interval.D1, [80 + i * 0.5 for i in range(130)])
+        instrument = await _instrument(db, "RISKY")
+        # The same sell-off that `TestMeanReversion` proves is entered, so a
+        # refusal here can only be the halt and not an absent signal.
+        await _upsert(db, instrument, Interval.D1, _SELLOFF)
         await HaltService(db).activate(  # type: ignore[arg-type]
             HaltKind.KILL_SWITCH, "halted", scope=HaltScope.GLOBAL
         )
-        config = StrategyConfiguration(
-            kind=StrategyKind.TREND_FOLLOWING,
-            name="trend",
-            is_active=True,
-            interval=Interval.D1,
-            params={"sma_period": 100},
-            universe={"instrument_ids": [str(instrument.id)]},
-        )
+        config = _config(instrument, "halted-entry")
         db.add(config)  # type: ignore[attr-defined]
         await db.flush()  # type: ignore[attr-defined]
 
@@ -391,3 +434,130 @@ class TestRiskGate:
         )
         assert decision.outcome is StrategyDecisionOutcome.REJECTED_BY_RISK
         assert await InternalPaperBroker(db).get_positions() == []  # type: ignore[arg-type]
+
+
+class TestInsiderExit:
+    """Insider selling closes a position — but only before the market reacts."""
+
+    def _config(self, instrument: Instrument, name: str) -> StrategyConfiguration:
+        return StrategyConfiguration(
+            kind=StrategyKind.MEAN_REVERSION,
+            name=name,
+            is_active=True,
+            interval=Interval.D1,
+            auto_execute=True,
+            params={
+                **_ENTRY_PARAMS,
+                "insider_sell_veto": 0.10,
+                "insider_exit_max_drop_atr": 1.0,
+            },
+            universe={"instrument_ids": [str(instrument.id)]},
+        )
+
+    async def _hold(self, db: object, instrument: Instrument) -> InternalPaperBroker:
+        broker = InternalPaperBroker(db)  # type: ignore[arg-type]
+        await broker.place_order(
+            BrokerOrderRequest(
+                broker_ticker=str(instrument.id),
+                side=OrderSide.BUY,
+                quantity=Decimal("10"),
+                order_type=OrderType.MARKET,
+            )
+        )
+        return broker
+
+    async def _run(
+        self,
+        db: object,
+        config: StrategyConfiguration,
+        broker: InternalPaperBroker,
+        penalty: float,
+        move_atr: float | None,
+    ) -> object:
+        engine = StrategyEngine(db, broker=broker)  # type: ignore[arg-type]
+        engine._insider_pressure = _fixed_pressure(penalty, move_atr)  # type: ignore[method-assign]
+        summary = await engine.run(config)
+        await db.commit()  # type: ignore[attr-defined]
+        return summary
+
+    async def test_exits_when_the_drop_has_not_happened_yet(self, db: object) -> None:
+        """Flat since the filing — the whole point, get out before the fall."""
+        await _risk_config(db)
+        instrument = await _instrument(db, "LEAVING")
+        await _upsert(db, instrument, Interval.D1, _SELLOFF)
+        broker = await self._hold(db, instrument)
+        config = self._config(instrument, "insider-exit-flat")
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        summary = await self._run(db, config, broker, penalty=0.30, move_atr=0.0)
+        assert summary.signals == 1  # type: ignore[attr-defined]
+        assert summary.executed == 1  # type: ignore[attr-defined]
+        decision = (
+            (await db.execute(select(StrategyDecision)))  # type: ignore[attr-defined]
+            .scalars()
+            .one()
+        )
+        assert decision.side is OrderSide.SELL
+        assert "Insider exit" in decision.reason
+        assert await InternalPaperBroker(db).get_positions() == []  # type: ignore[arg-type]
+
+    async def test_holds_when_the_stock_has_already_fallen(self, db: object) -> None:
+        """Priced in. Selling here realises the loss at the bottom, which is the
+        one outcome this rule exists to avoid."""
+        await _risk_config(db)
+        instrument = await _instrument(db, "ALREADYDOWN")
+        await _upsert(db, instrument, Interval.D1, _SELLOFF)
+        broker = await self._hold(db, instrument)
+        config = self._config(instrument, "insider-exit-priced-in")
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        # Same selling pressure, but the stock is already 2 ATR down.
+        summary = await self._run(db, config, broker, penalty=0.30, move_atr=-2.0)
+        assert summary.signals == 0  # type: ignore[attr-defined]
+        assert await InternalPaperBroker(db).get_positions() != []  # type: ignore[arg-type]
+
+    async def test_exits_when_the_stock_has_risen_since_the_filing(self, db: object) -> None:
+        """A rise is the best moment to leave, not a reason to damp the signal.
+
+        Guards against using the magnitude of the move rather than its sign —
+        an easy mistake, since the *ranking* damping is deliberately symmetric.
+        """
+        await _risk_config(db)
+        instrument = await _instrument(db, "ROSE")
+        await _upsert(db, instrument, Interval.D1, _SELLOFF)
+        broker = await self._hold(db, instrument)
+        config = self._config(instrument, "insider-exit-risen")
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        summary = await self._run(db, config, broker, penalty=0.30, move_atr=+2.0)
+        assert summary.signals == 1  # type: ignore[attr-defined]
+        assert summary.executed == 1  # type: ignore[attr-defined]
+
+    async def test_entries_are_not_vetoed(self, db: object) -> None:
+        """No entry check: the scanner's 40% penalty already drops such a stock
+        out of the ranked universe, so a second gate would duplicate it."""
+        await _risk_config(db)
+        instrument = await _instrument(db, "STILLBUYS")
+        await _upsert(db, instrument, Interval.D1, _SELLOFF)
+        config = self._config(instrument, "insider-no-entry-veto")
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        broker = InternalPaperBroker(db)  # type: ignore[arg-type]
+        summary = await self._run(db, config, broker, penalty=0.30, move_atr=0.0)
+        assert summary.signals == 1  # type: ignore[attr-defined]
+        assert summary.executed == 1  # type: ignore[attr-defined]
+
+
+def _fixed_pressure(penalty: float, move_atr: float | None):  # type: ignore[no-untyped-def]
+    """Stub for the engine's insider lookup, so tests need no EDGAR data."""
+
+    async def _pressure(instruments: list[Instrument]) -> dict[uuid.UUID, InsiderPressure]:
+        if penalty <= 0:
+            return {}
+        return {i.id: InsiderPressure(sell_penalty=penalty, move_atr=move_atr) for i in instruments}
+
+    return _pressure

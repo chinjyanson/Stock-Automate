@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Secrets / env
+.env
+.env.*
+!.env.example
+
+# Firecrawl monitor webhook config with real secret (keep only the template)
+firecrawl/webhook.json
+firecrawl/webhook.local.json
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build / output artifacts
+dist/
+build/
+*.pdf
+out/

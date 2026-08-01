@@ -92,6 +92,51 @@ _SUFFIX_TO_MIC = {
 _MIC_TO_SUFFIX = {mic: suffix for suffix, mic in _SUFFIX_TO_MIC.items()}
 
 
+#: Broker notations that mark a warrant rather than a share. Yahoo does not
+#: carry these usefully — a spot check returned a single bar for one and nothing
+#: for the rest — and a warrant is not something this system should be ranking
+#: or holding anyway. Excluded at the symbol stage so they never acquire a
+#: mapping, rather than being mapped and then failing to fetch forever.
+_WARRANT_MARKERS = ("_WAR", "_RTS", "_RGT")
+
+
+def normalise_yfinance_ticker(ticker: str) -> str | None:
+    """A broker's exchange ticker in Yahoo's notation, or None if unusable.
+
+    Brokers and Yahoo disagree about how to write a share class. Trading 212
+    says `BRK/A` and `BRK_B`; Yahoo wants `BRK-A` and `BRK-B`. Left untranslated
+    the symbol fetches nothing, which is indistinguishable from a delisted
+    company — so the instrument sits in the catalogue forever with no candles
+    and no explanation.
+
+    Three rules, each verified against the live API rather than assumed:
+
+      * ``BRK/A`` → ``BRK-A``   (confirmed for BRK, HEI, GEF, MKC, PBR)
+      * ``BRK_B`` → ``BRK-B``
+      * ``AVAV_`` → ``AVAV``    (a trailing separator with no class after it)
+
+    Returns None for warrants, which have no dependable Yahoo equivalent.
+
+    What this deliberately does *not* do is chase renames. `JW/A` normalises to
+    `JW-A`, which returns nothing, because John Wiley now trades as `WLY`. No
+    string rule can know that; it needs a symbol-resolution pass against the
+    provider. Normalisation fixes notation, and notation only.
+    """
+    cleaned = ticker.strip().upper()
+    if not cleaned:
+        return None
+    if any(marker in cleaned for marker in _WARRANT_MARKERS):
+        return None
+
+    # A trailing separator carries no class — it is broker padding.
+    cleaned = cleaned.rstrip("_/-")
+    if not cleaned:
+        return None
+
+    # Everything remaining is a class separator in Yahoo's dialect.
+    return cleaned.replace("/", "-").replace("_", "-")
+
+
 def _to_decimal(value: Any) -> Decimal | None:
     """pandas floats → Decimal, rejecting NaN/inf.
 
@@ -401,13 +446,19 @@ class YFinanceProvider(MarketDataProvider):
                 continue
 
             for symbol in chunk:
-                try:
-                    # A single-symbol download returns a flat frame; a
-                    # multi-symbol one is column-multi-indexed by ticker.
-                    sub = frame[symbol] if len(chunk) > 1 else frame
-                except KeyError:
-                    results[symbol] = []
-                    continue
+                # Which shape came back is decided by the frame, not by how many
+                # symbols were asked for. With `group_by="ticker"` yfinance
+                # multi-indexes the columns even for a chunk of one, so keying
+                # off `len(chunk)` silently produced no candles whenever a chunk
+                # held a single symbol — the last chunk of a sweep, and every
+                # on-demand refresh of one instrument.
+                if isinstance(frame.columns, pd.MultiIndex):
+                    if symbol not in frame.columns.get_level_values(0):
+                        results[symbol] = []
+                        continue
+                    sub = frame[symbol]
+                else:
+                    sub = frame
                 if sub is None or sub.empty:
                     results[symbol] = []
                     continue

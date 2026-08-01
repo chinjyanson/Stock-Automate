@@ -96,6 +96,10 @@ pnpm worker:dev      # background jobs + scheduler — daily scan, EOD email, st
 > Each of the three `dev` commands runs in the foreground — use a separate
 > terminal (or tab) for each. The worker is optional for clicking around, but
 > **nothing scheduled runs without it** (see [Background jobs](#background-jobs-worker--scheduler)).
+>
+> For anything beyond development the worker should run on an always-on machine
+> rather than here — a sleeping laptop misses the nightly jobs silently. See
+> [Where the worker should actually run](#where-the-worker-should-actually-run).
 
 > **Do not run `pnpm build` / `next build` while `pnpm dev` is running.** Both
 > write to `apps/web/.next`. A production build overwrites the dev server's
@@ -149,23 +153,51 @@ reconciliation, and the strategy evaluations. Without it running, none of those
 fire: the app still works for anything you trigger by hand (a manual scan, an
 approval), it just isn't *automated*.
 
-One process runs both the worker and the `beat` scheduler. It needs Postgres and
-Redis up (the broker).
+### Where the worker should actually run
 
-**Dev**
+**Not on your laptop.** The jobs fire at 21:30 and 22:00 UTC; a laptop that
+sleeps, or a terminal that gets closed, means they simply do not run — and they
+fail silently, because nothing is there to report it. A missed night is a night
+the candle refresh does not happen and the strategy evaluates yesterday's
+prices.
+
+The worker belongs on a machine that is always on. The free option that fits is
+a **GCP `e2-micro` Always Free VM**, which runs the whole backend — Postgres,
+Redis, worker and beat — at no cost. Measured footprint is ~640 MB of its 1 GB.
+
+**→ [`docs/gcp-setup.md`](docs/gcp-setup.md)** walks it through from an empty
+account, including the three settings that decide whether the VM is actually
+free. [`docs/deployment.md`](docs/deployment.md) covers the reasoning and the
+alternatives.
+
+```bash
+# On the VM, once:
+bash infrastructure/gcp/bootstrap.sh
+docker compose -f docker-compose.prod.yml -f docker-compose.gcp.yml up -d
+
+# From your laptop, whenever you want the UI — nothing is exposed publicly:
+ssh -L 8000:localhost:8000 stock-automate
+pnpm --filter web dev
+```
+
+Once the worker runs remotely, **that machine's database is the real one**.
+Your local Postgres becomes a scratch copy, and "run a scan locally to check
+something" stops meaning what it used to.
+
+### Running it locally anyway
+
+Still the right thing while developing a job — you want to see it fail fast, not
+wait for 21:30. One process runs both the worker and `beat`; it needs Postgres
+and Redis up.
 
 ```bash
 docker compose up -d postgres redis   # broker + DB the worker connects to
 pnpm worker:dev                        # celery worker + beat — leave it running
 ```
 
-**Prod** — the `worker` service in `docker-compose.yml` runs it for you
-(`restart: unless-stopped`, `--concurrency=2`), so the scheduler comes up with
-the rest of the stack:
-
-```bash
-docker compose up -d                   # postgres, redis, api, worker, web
-```
+`docker compose up -d` brings the same thing up in a container instead
+(`restart: unless-stopped`), which survives a Docker restart but still not a
+laptop that sleeps.
 
 > **⚠️ Celery does not hot-reload.** Unlike `pnpm api:dev` / `pnpm dev`, the
 > worker loads your code once at startup. After changing anything the jobs import
@@ -229,8 +261,13 @@ pnpm db:revision -- "message"    # autogenerate a migration
 pnpm db:seed
 
 # Worker  (see "Background jobs" above — restart after code changes)
-pnpm worker:dev                  # celery worker + beat (dev)
-docker compose restart worker    # reload the worker after a change (prod)
+pnpm worker:dev                  # celery worker + beat (local, for development)
+docker compose restart worker    # reload a containerised local worker
+
+# Deployed worker (GCP) — see docs/deployment.md
+ssh stock-automate 'cd /opt/stock-automate && \
+  docker compose -f docker-compose.prod.yml -f docker-compose.gcp.yml \
+  restart worker beat'
 ```
 
 The integration tests require PostgreSQL, deliberately: the schema depends on

@@ -30,7 +30,11 @@ from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data.store import CandleStore
-from app.data.yfinance_provider import _MIC_TO_SUFFIX, YFinanceProvider
+from app.data.yfinance_provider import (
+    _MIC_TO_SUFFIX,
+    YFinanceProvider,
+    normalise_yfinance_ticker,
+)
 from app.models.enums import BrokerKind, DataSeriesType, Interval, ProviderKind
 from app.models.instrument import BrokerInstrument, Exchange, Instrument, MarketDataMapping
 from app.models.market_data import Candle
@@ -82,13 +86,20 @@ def _yfinance_symbol(instrument: Instrument, exchange: Exchange | None) -> str |
     """
     if not instrument.exchange_ticker or exchange is None:
         return None
+    # Notation first: the broker's `BRK/A` is Yahoo's `BRK-A`, and a warrant has
+    # no Yahoo equivalent at all. Without this the symbol fetches nothing, which
+    # looks exactly like a delisted company and leaves the instrument in the
+    # catalogue with no candles and no explanation.
+    ticker = normalise_yfinance_ticker(instrument.exchange_ticker)
+    if ticker is None:
+        return None
     mic = exchange.mic
     if mic in {"XNAS", "XNYS", "ARCX", "BATS"}:
-        return instrument.exchange_ticker
+        return ticker
     suffix = _MIC_TO_SUFFIX.get(mic)
     if suffix is None:
         return None
-    return f"{instrument.exchange_ticker}{suffix}"
+    return f"{ticker}{suffix}"
 
 
 class BackfillService:

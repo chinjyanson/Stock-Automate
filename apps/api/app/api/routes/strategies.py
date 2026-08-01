@@ -77,6 +77,11 @@ class StrategyRunResponse(BaseModel):
     proposals: int
     executed: int
     rejected: int
+    #: Instruments with too little history to evaluate at all.
+    skipped: int = 0
+    #: Instruments evaluated against bars older than the freshness threshold.
+    #: Non-zero means a quiet result was computed from old prices.
+    stale: int = 0
 
 
 # -- Config -----------------------------------------------------------------
@@ -166,4 +171,6 @@ async def run_strategy(
         proposals=summary.proposals,
         executed=summary.executed,
         rejected=summary.rejected,
+        skipped=summary.skipped,
+        stale=summary.stale,
     )

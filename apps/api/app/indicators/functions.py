@@ -306,6 +306,48 @@ def average_true_range(
     return float(np.mean(tr[-period:]))
 
 
+def bollinger_bands(
+    closes: FloatArray, period: int = 20, num_std: float = 2.0
+) -> tuple[float, float, float] | None:
+    """(lower, middle, upper) bands over `period`, `num_std` deviations wide.
+
+    The middle band is the simple moving average; the outer bands sit a multiple
+    of the *population* standard deviation either side. Population rather than
+    sample (ddof=0) to match the convention Bollinger defined and every charting
+    package implements — ddof=1 would widen the bands slightly and quietly
+    disagree with any chart the operator compares against.
+
+    None when there is not enough history, or when the window is perfectly flat:
+    a zero-width band would place price exactly on both edges at once, which
+    reads as "maximally oversold and maximally overbought" rather than "nothing
+    is happening".
+    """
+    closes = _clean(closes)
+    if closes.size < period or period <= 0:
+        return None
+    window = closes[-period:]
+    middle = float(np.mean(window))
+    std = float(np.std(window))
+    if std <= 0:
+        return None
+    return middle - num_std * std, middle, middle + num_std * std
+
+
+def bollinger_position(closes: FloatArray, period: int = 20, num_std: float = 2.0) -> float | None:
+    """Where price sits across the bands: 0.0 at the lower, 1.0 at the upper.
+
+    Values outside [0, 1] mean price has closed beyond a band — which is exactly
+    the mean-reversion entry condition, so the range is deliberately not clamped.
+    """
+    bands = bollinger_bands(closes, period, num_std)
+    if bands is None:
+        return None
+    lower, _, upper = bands
+    if upper <= lower:
+        return None
+    return (float(closes[-1]) - lower) / (upper - lower)
+
+
 def relative_momentum(
     closes: FloatArray, benchmark_closes: FloatArray, lookback_days: int
 ) -> float | None:

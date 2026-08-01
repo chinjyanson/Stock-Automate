@@ -151,6 +151,59 @@ class TestATR:
         assert atr is not None and atr > 1.0
 
 
+class TestBollingerBands:
+    def test_known_answer_on_a_hand_computable_series(self) -> None:
+        # Four values, mean 10, population sd = sqrt(((2)^2+(1)^2+(1)^2+(2)^2)/4)
+        # = sqrt(10/4) = 1.5811. Bands at 2 sd: 10 +/- 3.1623.
+        closes = np.array([8.0, 9.0, 11.0, 12.0])
+        bands = ind.bollinger_bands(closes, period=4, num_std=2.0)
+        assert bands is not None
+        lower, middle, upper = bands
+        assert middle == pytest.approx(10.0)
+        assert lower == pytest.approx(10.0 - 3.16227766, rel=1e-6)
+        assert upper == pytest.approx(10.0 + 3.16227766, rel=1e-6)
+
+    def test_uses_population_not_sample_deviation(self) -> None:
+        """ddof=0, matching Bollinger's definition and every charting package.
+
+        Sample deviation (ddof=1) would widen these bands by ~15% on a 4-bar
+        window and disagree with any chart the operator compares against.
+        """
+        closes = np.array([8.0, 9.0, 11.0, 12.0])
+        bands = ind.bollinger_bands(closes, period=4, num_std=1.0)
+        assert bands is not None
+        lower, _, _ = bands
+        assert lower == pytest.approx(10.0 - float(np.std(closes)), rel=1e-9)
+        assert lower != pytest.approx(10.0 - float(np.std(closes, ddof=1)), rel=1e-9)
+
+    def test_none_when_history_is_short(self) -> None:
+        assert ind.bollinger_bands(np.array([1.0, 2.0]), period=20) is None
+
+    def test_none_on_a_flat_window(self) -> None:
+        """Zero width would put price on both edges at once — no opinion, not
+        'maximally oversold and overbought simultaneously'."""
+        assert ind.bollinger_bands(np.array([5.0] * 30), period=20) is None
+
+    def test_position_maps_the_bands_to_zero_and_one(self) -> None:
+        """0.0 sits on the lower band, 1.0 on the upper, 0.5 on the mean."""
+        closes = np.array([8.0, 9.0, 11.0, 12.0])
+        bands = ind.bollinger_bands(closes, period=4, num_std=2.0)
+        assert bands is not None
+        lower, middle, upper = bands
+        pos = ind.bollinger_position(closes, period=4, num_std=2.0)
+        assert pos is not None
+        expected = (float(closes[-1]) - lower) / (upper - lower)
+        assert pos == pytest.approx(expected)
+        # The mean is the midpoint of a symmetric band by construction.
+        assert (middle - lower) / (upper - lower) == pytest.approx(0.5)
+
+    def test_position_exceeds_one_when_price_breaks_out(self) -> None:
+        """Deliberately unclamped: a close beyond the band is the signal."""
+        closes = np.array([*[10.0, 11.0, 9.0, 10.0] * 5, 40.0])
+        pos = ind.bollinger_position(closes, period=20, num_std=2.0)
+        assert pos is not None and pos > 1.0
+
+
 class TestRelativeMomentum:
     def test_zero_when_matching_the_benchmark(self) -> None:
         closes = np.array([100.0, 110, 120])

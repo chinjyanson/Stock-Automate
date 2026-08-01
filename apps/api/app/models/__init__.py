@@ -30,6 +30,7 @@ from app.models.enums import (
     StrategyRunStatus,
     TradeIntentStatus,
 )
+from app.models.insider import InsiderTransaction
 from app.models.instrument import (
     BrokerInstrument,
     Exchange,
@@ -47,6 +48,7 @@ from app.models.market_data import (
     ProviderHealth,
     ProviderUsage,
 )
+from app.models.market_regime import MarketRegimeSnapshot
 from app.models.paper import (
     PaperBrokerAccount,
     PaperBrokerOrder,
@@ -100,12 +102,14 @@ __all__ = [
     "FundamentalSnapshot",
     "HaltKind",
     "HaltScope",
+    "InsiderTransaction",
     "Instrument",
     "InstrumentKind",
     "Interval",
     "LifecycleState",
     "LiveArmingSession",
     "MarketDataMapping",
+    "MarketRegimeSnapshot",
     "Money",
     "OperatingMode",
     "OrderSide",

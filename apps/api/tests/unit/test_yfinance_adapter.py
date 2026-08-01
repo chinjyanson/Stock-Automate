@@ -20,6 +20,7 @@ from app.data.yfinance_provider import (
     _index_to_utc,
     _is_bar_closed,
     _to_decimal,
+    normalise_yfinance_ticker,
 )
 from app.models.enums import Interval, PriceUnit, ProviderKind
 
@@ -237,6 +238,130 @@ class TestFrameToCandles:
         candles = provider._frame_to_candles(frame, "VUAG.L", Interval.D1, PriceUnit.GBP)
         timestamps = [c.timestamp for c in candles]
         assert timestamps == sorted(timestamps)
+
+
+class TestTickerNormalisation:
+    """Broker notation → Yahoo notation.
+
+    Every mapping below was checked against the live API before being written
+    down. The failure this prevents is silent: an untranslated `BRK/A` fetches
+    nothing, which looks exactly like a delisted company, so the instrument sits
+    in the catalogue with no candles and nothing to explain why.
+    """
+
+    @pytest.mark.parametrize(
+        ("broker", "yahoo"),
+        [
+            ("BRK/A", "BRK-A"),
+            ("HEI/A", "HEI-A"),
+            ("GEF/B", "GEF-B"),
+            ("MKC/V", "MKC-V"),
+            ("PBR/A", "PBR-A"),
+            ("BRK_B", "BRK-B"),
+            ("AVAV_", "AVAV"),
+            ("AAPL", "AAPL"),
+        ],
+    )
+    def test_share_class_separators_become_hyphens(self, broker: str, yahoo: str) -> None:
+        assert normalise_yfinance_ticker(broker) == yahoo
+
+    @pytest.mark.parametrize("ticker", ["GME_WAR", "ASPS2_WAR", "CORZW_WAR", "XRXDW_WAR"])
+    def test_warrants_are_refused_rather_than_guessed(self, ticker: str) -> None:
+        """Yahoo has no dependable warrant symbol, and this system should not hold one.
+
+        Refusing at the symbol stage means they never acquire a mapping, rather
+        than acquiring one that fails to fetch on every sweep forever.
+        """
+        assert normalise_yfinance_ticker(ticker) is None
+
+    def test_empty_and_separator_only_tickers_are_refused(self) -> None:
+        assert normalise_yfinance_ticker("") is None
+        assert normalise_yfinance_ticker("   ") is None
+        assert normalise_yfinance_ticker("__") is None
+
+    def test_normalisation_is_idempotent(self) -> None:
+        """Already-correct symbols must survive a second pass unchanged.
+
+        The migration rewrites stored symbols, and a rerun must not corrupt what
+        the first run fixed.
+        """
+        once = normalise_yfinance_ticker("BRK/A")
+        assert once is not None
+        assert normalise_yfinance_ticker(once) == once
+
+    def test_a_rename_is_not_a_notation_problem(self) -> None:
+        """`JW/A` normalises cleanly and still fetches nothing — John Wiley is now WLY.
+
+        Pinned so nobody later "fixes" the normaliser to special-case it. No
+        string rule can know about a rename; that needs a resolution pass
+        against the provider, and conflating the two would hide the difference.
+        """
+        assert normalise_yfinance_ticker("JW/A") == "JW-A"
+
+
+class TestBatchDownloadShapes:
+    """The batch reader must key off the frame's shape, not the request size.
+
+    `yf.download(group_by="ticker")` column-multi-indexes by ticker *even for a
+    single symbol*. Deciding the shape from `len(chunk)` therefore read a
+    MultiIndex frame as a flat one and produced no candles at all — invisibly,
+    since an empty result is indistinguishable from a symbol with no data. It
+    hit the last chunk of every sweep and every on-demand refresh of one
+    instrument.
+    """
+
+    @pytest.fixture
+    def provider(self) -> YFinanceProvider:
+        return YFinanceProvider(max_retries=1)
+
+    def _multi_frame(self, symbols: list[str]) -> pd.DataFrame:
+        index = pd.DatetimeIndex(
+            ["2026-07-15 00:00:00", "2026-07-16 00:00:00"], tz="America/New_York", name="Date"
+        )
+        columns = pd.MultiIndex.from_product(
+            [symbols, ["Open", "High", "Low", "Close", "Adj Close", "Volume"]]
+        )
+        rows = [[100.0, 102.0, 99.0, 101.0, 101.0, 1000.0] * len(symbols)] * 2
+        return pd.DataFrame(rows, index=index, columns=columns)
+
+    @pytest.mark.asyncio
+    async def test_single_symbol_multiindex_frame_yields_candles(
+        self, provider: YFinanceProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        frame = self._multi_frame(["AAPL"])
+        assert isinstance(frame.columns, pd.MultiIndex), "fixture must reproduce the real shape"
+
+        async def _fake_run_blocking(fn: object) -> pd.DataFrame:
+            return frame
+
+        monkeypatch.setattr(provider, "_run_blocking", _fake_run_blocking)
+        out = await provider.get_batch_daily_candles(
+            ["AAPL"],
+            datetime(2026, 7, 1, tzinfo=UTC),
+            datetime(2026, 7, 17, tzinfo=UTC),
+            unit_by_symbol={"AAPL": PriceUnit.USD},
+        )
+        assert len(out["AAPL"]) == 2
+        assert out["AAPL"][0].close == Decimal("101")
+
+    @pytest.mark.asyncio
+    async def test_symbol_absent_from_the_frame_yields_no_candles(
+        self, provider: YFinanceProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A delisted name in a chunk returns nothing without taking the chunk down."""
+
+        async def _fake_run_blocking(fn: object) -> pd.DataFrame:
+            return self._multi_frame(["AAPL"])
+
+        monkeypatch.setattr(provider, "_run_blocking", _fake_run_blocking)
+        out = await provider.get_batch_daily_candles(
+            ["AAPL", "DEAD"],
+            datetime(2026, 7, 1, tzinfo=UTC),
+            datetime(2026, 7, 17, tzinfo=UTC),
+            unit_by_symbol={"AAPL": PriceUnit.USD, "DEAD": PriceUnit.USD},
+        )
+        assert len(out["AAPL"]) == 2
+        assert out["DEAD"] == []
 
 
 class TestCandleDTO:

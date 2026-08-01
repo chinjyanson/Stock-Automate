@@ -130,6 +130,12 @@ class Settings(BaseSettings):
     # -- Market data: EODHD -------------------------------------------------
     eodhd_api_key: SecretStr | None = None
     eodhd_base_url: str = "https://eodhd.com/api"
+
+    #: Contact address sent in the User-Agent to SEC EDGAR. Not a credential —
+    #: EDGAR is free and unauthenticated — but it is mandatory: requests without
+    #: a contact are refused, and it is how the SEC reaches an operator before
+    #: rate-limiting them. Unset means the insider ingest simply does not run.
+    edgar_contact_email: str | None = None
     eodhd_daily_operational_limit: int = 18
     eodhd_daily_emergency_reserve: int = 2
 

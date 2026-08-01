@@ -8,7 +8,6 @@ once.
 
 from __future__ import annotations
 
-import asyncio
 import os
 from typing import Any
 
@@ -24,6 +23,7 @@ from sqlalchemy import select
 
 from worker.app import app
 from worker.locks import LockNotAcquiredError, distributed_lock
+from worker.runner import run_job
 
 log = structlog.get_logger(__name__)
 
@@ -71,7 +71,7 @@ def rotate_scan(self, limit: int | None = None) -> dict[str, Any]:  # type: igno
     """
     try:
         with distributed_lock(_redis(), "scanner_rotation", ttl_seconds=1800):
-            result = asyncio.run(_run_rotation(limit))
+            result = run_job(_run_rotation(limit))
             log.info("job.scanner_rotation.completed", **result)
             return result
     except LockNotAcquiredError:
@@ -94,7 +94,7 @@ def expire_approvals(self) -> dict[str, Any]:  # type: ignore[no-untyped-def]
     No lock: `expire_stale` only transitions PENDING→EXPIRED, which is
     idempotent, and running it twice is harmless.
     """
-    expired = asyncio.run(_expire_proposals())
+    expired = run_job(_expire_proposals())
     if expired:
         log.info("job.expire_approvals.completed", expired=expired)
     return {"expired": expired}

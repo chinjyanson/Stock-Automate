@@ -50,16 +50,41 @@ DEFAULT_THRESHOLDS: dict[str, float] = {"screening": 75.0, "watchlist": 60.0}
 # with price cheapness and the reversal/quality/sector signals in support. Sum to
 # 1.0; a missing factor drops out and the rest re-normalise (see combine_final_score).
 DEFAULT_FACTOR_WEIGHTS: dict[str, float] = {
-    "fundamental_value": 0.35,
-    "price_cheapness": 0.20,
-    "reversal": 0.20,
-    "quality": 0.15,
-    "sector": 0.10,
+    "fundamental_value": 0.30,
+    # Raised from 0.17 at the expense of `reversal`. This is the factor that
+    # rewards being *at* a low, which is what the mean-reversion entry needs.
+    "price_cheapness": 0.29,
+    # Cut from 0.17. `reversal` rewards "RSI rising" and "reclaimed the 20-day
+    # average" — and that average *is* the Bollinger middle band the strategy
+    # sells at. At 0.17 the ranking was actively selecting for stocks sitting in
+    # the strategy's exit zone: of a top 20, eleven were at or above the middle
+    # band and none below the lower one. Kept non-zero because a stock turning
+    # up is still real information for a human reading the table; it just should
+    # not drive the ranking a dip-buyer depends on.
+    "reversal": 0.05,
+    "quality": 0.12,
+    "sector": 0.09,
+    # Insider *buying* only; selling is a penalty, not a factor (see
+    # DEFAULT_INSIDER_SELL_PENALTY). Held to 0.15 because this is the one factor
+    # absent for most instruments — Form 4 has no UK equivalent, so ~60% of a
+    # Trading 212 universe can never carry it — and raising it further would let
+    # a single buy signal lift an otherwise ordinary company over a better one
+    # that simply files in the wrong jurisdiction. The other five were shaved
+    # proportionally, so their balance relative to each other is unchanged.
+    "insider": 0.15,
 }
 
 #: A stock with no fundamentals at all loses this fraction of its final score — a
 #: mild, deliberate disadvantage (we cannot confirm the value is real), not a cliff.
 DEFAULT_FUNDAMENTALS_PENALTY = 0.10
+
+#: Ceiling on the insider-selling penalty. Expressed as a penalty rather than as
+#: a negative factor deliberately: a penalty only ever subtracts, so it can be
+#: this aggressive without disadvantaging the majority of the catalogue that SEC
+#: Form 4 does not cover. Applies only to discretionary chief-officer selling —
+#: the one cohort a 686-event backtest found a real effect for (-6.28% excess at
+#: one month, t = -2.43). See app.services.insider.
+DEFAULT_INSIDER_SELL_PENALTY = 0.40
 
 #: Preferred minimum history (§6). Scoring proceeds below this with reduced
 #: confidence rather than refusing — a shorter series is still informative,
@@ -143,6 +168,15 @@ class ScoreResult:
     reversal: float | None = None  # turning up from a decline
     quality: float | None = None  # fundamentals soundness + low-risk + liquidity
     sector_factor: float | None = None  # sector-ETF health, 0-100
+    #: Insider buying/selling, 0-100 with 50 neutral. None when the instrument
+    #: has no Form 4 filings in the window — which is the common case, and why
+    #: it must be None rather than 50: a neutral value would dilute every other
+    #: factor with a non-observation.
+    insider: float | None = None
+    #: Fraction of the final score to remove for insider selling (0..0.30).
+    #: Separate from `insider` because buying and selling act through different
+    #: mechanisms: buying lifts a weighted factor, selling discounts the total.
+    insider_sell_penalty: float = 0.0
 
 
 def _category_points(signals: list[SubSignal], max_points: float, name: str) -> CategoryScore:
@@ -299,14 +333,15 @@ def combine_final_score(
 ) -> float:
     """The absolute 0-100 ranking score: a fundamentals-first weighted blend.
 
-    Weighted average of the five factors, over *available* factors only (a
+    Weighted average of the six factors, over *available* factors only (a
     missing factor drops out and the remainder re-normalise), so the result is
     always a clean 0-100 and absence is neutral — not zero. Because the factors
     are different axes (intrinsic value / price level / turn / soundness /
     sector) rather than inverses, the blend reinforces instead of cancelling.
 
-    A stock with no fundamentals at all (its Fundamental Value factor is None)
-    additionally loses `fundamentals_penalty` of its score: a deliberate, mild
+    Two multiplicative penalties apply after the blend. A stock with no
+    fundamentals at all (its Fundamental Value factor is None) loses
+    `fundamentals_penalty` of its score: a deliberate, mild
     disadvantage since its value cannot be confirmed. The score is *absolute* —
     it does not depend on the rest of the scanned batch — so it is comparable run
     to run.
@@ -318,6 +353,7 @@ def combine_final_score(
         "reversal": result.reversal,
         "quality": result.quality,
         "sector": result.sector_factor,
+        "insider": result.insider,
     }
 
     weighted = 0.0
@@ -334,6 +370,10 @@ def combine_final_score(
     final = weighted / total_weight
     if result.fundamental_value is None:
         final *= 1.0 - fundamentals_penalty
+    # Insider selling discounts the whole score rather than competing as a
+    # factor. A stock with no filings has a penalty of 0.0 and is untouched.
+    if result.insider_sell_penalty:
+        final *= 1.0 - min(max(result.insider_sell_penalty, 0.0), 1.0)
     return round(_clamp01(final / 100.0) * 100.0, 2)
 
 

@@ -1,0 +1,13 @@
+{
+  "webhook": {
+    "url": "REPLACE_WITH_CLAUDE_CODE_ROUTINES_TRIGGER_URL",
+    "headers": {
+      "Authorization": "Bearer REPLACE_WITH_ROUTINES_SECRET"
+    },
+    "metadata": {
+      "source": "firecrawl-monitor",
+      "monitor": "secform4-insider-sales"
+    },
+    "events": ["monitor.page", "monitor.check.completed"]
+  }
+}

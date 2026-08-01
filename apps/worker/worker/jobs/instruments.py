@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 from typing import Any
 
@@ -16,6 +15,7 @@ from app.services.instrument_sync import InstrumentSyncService
 
 from worker.app import app
 from worker.locks import LockNotAcquiredError, distributed_lock
+from worker.runner import run_job
 
 log = structlog.get_logger(__name__)
 
@@ -59,7 +59,7 @@ def sync_instruments(self, broker: str | None = None) -> dict[str, Any]:  # type
 
     try:
         with distributed_lock(_redis(), "sync_instruments", ttl_seconds=900):
-            result = asyncio.run(_sync(kind))
+            result = run_job(_sync(kind))
             log.info("job.sync_instruments.completed", **result)
             return result
     except LockNotAcquiredError:

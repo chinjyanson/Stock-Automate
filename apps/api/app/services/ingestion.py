@@ -38,6 +38,7 @@ from app.models.enums import (
     DataQualityEventKind,
     DataSeriesType,
     Interval,
+    PriceUnit,
     ProviderKind,
     QualityStatus,
 )
@@ -55,6 +56,41 @@ DEFAULT_OVERLAP_BARS = 10
 #: Intraday history is short-lived and provider-budgeted, so a fresh intraday
 #: series gets days, not the years a daily series gets.
 DEFAULT_INTRADAY_BACKFILL_DAYS = 30
+
+#: Symbols per batched request during a refresh. Matches the yfinance adapter's
+#: own default; larger batches return frames big enough that parsing, not the
+#: network, becomes the limit.
+DEFAULT_REFRESH_CHUNK = 50
+
+#: Consecutive empty fetches before a symbol stops being asked every rotation.
+#: Three tolerates a provider hiccup and a genuinely quiet week without writing
+#: off a live security.
+EMPTY_FETCHES_BEFORE_BACKOFF = 3
+
+#: How long a symbol rests after that. Long enough that ~2,600 dead tickers stop
+#: dominating a sweep, short enough that a relisting is picked up within a month
+#: rather than never.
+EMPTY_FETCH_BACKOFF = timedelta(days=30)
+
+
+def _record_empty_fetch(mapping: MarketDataMapping, now: datetime) -> None:
+    """Count an empty result and, past the threshold, rest the symbol.
+
+    Called for "the provider answered, with nothing" — not for errors. A failed
+    request says something about the network; an empty one says something about
+    the security.
+    """
+    mapping.consecutive_empty_fetches += 1
+    if mapping.consecutive_empty_fetches >= EMPTY_FETCHES_BEFORE_BACKOFF:
+        mapping.retry_after = now + EMPTY_FETCH_BACKOFF
+
+
+def _record_successful_fetch(mapping: MarketDataMapping, now: datetime) -> None:
+    """Clear the empty-fetch state. One good candle is enough to be alive again."""
+    mapping.consecutive_empty_fetches = 0
+    mapping.retry_after = None
+    mapping.last_verified_at = now
+    mapping.last_error = None
 
 
 @dataclass
@@ -154,6 +190,7 @@ class IngestionService:
 
         if not candles:
             result.skipped_reason = "Provider returned no candles for the requested window"
+            _record_empty_fetch(mapping, datetime.now(UTC))
             return result
 
         validated = await self._validate(instrument, candles, result)
@@ -163,8 +200,7 @@ class IngestionService:
         result.candles_written = await self._store.upsert_candles(
             instrument.id, validated, series_type=DataSeriesType.RAW
         )
-        mapping.last_verified_at = datetime.now(UTC)
-        mapping.last_error = None
+        _record_successful_fetch(mapping, datetime.now(UTC))
 
         log.info(
             "ingestion.completed",
@@ -362,6 +398,200 @@ class IngestionService:
                     )
                 )
         return results
+
+    async def refresh_many_batched(
+        self,
+        instruments: list[Instrument],
+        provider: MarketDataProvider,
+        *,
+        backfill_days: int = DEFAULT_BACKFILL_DAYS,
+        overlap_bars: int = DEFAULT_OVERLAP_BARS,
+        chunk_size: int = DEFAULT_REFRESH_CHUNK,
+    ) -> list[IngestionResult]:
+        """Refresh many instruments using the provider's batched fetch.
+
+        Same contract as `ingest_many` — one `IngestionResult` per instrument,
+        same validation, same quality events — but a different cost. That method
+        issues one request per instrument, which is why the nightly refresh was
+        capped at ~100 names and took months to work through the catalogue. Here
+        a chunk of `chunk_size` symbols is one request, so the same request
+        budget covers roughly `chunk_size` times as many instruments.
+
+        **The window is shared across a chunk**, because a batched fetch takes
+        one date range for every symbol in it. Taking the earliest start any
+        member needs means nobody is under-fetched; the ones that needed less
+        simply receive bars they already have, and the upsert is idempotent.
+
+        **Which is why chunks are grouped by how much history each instrument
+        needs, not by the caller's order.** A single never-ingested name in a
+        chunk of fifty drags all fifty to a two-year window — measured, that was
+        38,000 candles fetched and re-written to refresh 100 instruments that
+        between them needed a few hundred. Worse, it would recur nightly:
+        delisted tickers never acquire candles, so they would inflate whichever
+        chunk they landed in forever. Grouping confines the deep fetch to the
+        instruments that actually need it.
+
+        Priority is preserved *within* each group, and the cheap group runs
+        first. The nightly job puts Bot Universe names first precisely so a run
+        cut short still refreshed the names a strategy reads tomorrow — and
+        those, being refreshed nightly, are always in the cheap group.
+        """
+        if not instruments:
+            return []
+
+        mappings = await self._signal_mappings({i.id for i in instruments}, provider.kind)
+
+        results: list[IngestionResult] = []
+        pending: list[Instrument] = []
+        for instrument in instruments:
+            result = IngestionResult(
+                instrument_id=instrument.id, interval=Interval.D1, provider=provider.kind
+            )
+            if instrument.id not in mappings:
+                # Unmapped is a state to surface, not an error (§7).
+                result.skipped_reason = (
+                    f"No active {provider.kind} mapping; resolve the symbol before ingesting"
+                )
+                results.append(result)
+                continue
+            pending.append(instrument)
+
+        now = datetime.now(UTC)
+        floor = now - timedelta(days=backfill_days)
+        # One query for every instrument's newest bar, rather than one each.
+        newest = await self._store.latest_timestamps({i.id for i in pending}, Interval.D1)
+        step = timedelta(days=1) * overlap_bars
+
+        windows: dict[uuid.UUID, datetime] = {}
+        for instrument in pending:
+            latest = newest.get(instrument.id)
+            windows[instrument.id] = floor if latest is None else max(latest - step, floor)
+
+        # Group by window start so each chunk fetches only what its members
+        # need. Sorted newest-first, with the caller's order broken only within
+        # a group, so the cheap tail refreshes run before the deep ones.
+        ordered = sorted(pending, key=lambda i: windows[i.id], reverse=True)
+
+        for start_index in range(0, len(ordered), chunk_size):
+            chunk = ordered[start_index : start_index + chunk_size]
+            try:
+                results.extend(
+                    await self._refresh_chunk(chunk, mappings, provider, windows, floor, now)
+                )
+            except ProviderQuotaExceededError:
+                # The budget is gone. Every remaining instrument is deliberately
+                # left out of the results: the caller stamps its cursor from what
+                # it got back, so omitting them keeps them at the front of the
+                # queue instead of marking them attempted.
+                log.warning(
+                    "ingestion.batch_halted_on_quota",
+                    remaining=len(ordered) - start_index,
+                )
+                break
+        return results
+
+    async def _refresh_chunk(
+        self,
+        chunk: list[Instrument],
+        mappings: dict[uuid.UUID, MarketDataMapping],
+        provider: MarketDataProvider,
+        windows: dict[uuid.UUID, datetime],
+        floor: datetime,
+        now: datetime,
+    ) -> list[IngestionResult]:
+        """Fetch and persist one chunk. Raises on quota exhaustion."""
+        # The earliest start any member needs. Bounded below by the caller's
+        # floor so a never-ingested instrument cannot request a decade.
+        window_start = max(min(windows[i.id] for i in chunk), floor)
+
+        by_symbol: dict[str, list[Instrument]] = {}
+        unit_by_symbol: dict[str, PriceUnit] = {}
+        for instrument in chunk:
+            symbol = mappings[instrument.id].provider_symbol
+            # Two instruments can legitimately share a provider symbol (the same
+            # listing mapped twice). Grouping means the symbol is requested once
+            # and both receive the bars.
+            by_symbol.setdefault(symbol, []).append(instrument)
+            unit_by_symbol[symbol] = instrument.price_unit
+
+        fetched = await provider.get_batch_daily_candles(
+            list(by_symbol), window_start, now, unit_by_symbol=unit_by_symbol
+        )
+
+        results: list[IngestionResult] = []
+        for symbol, members in by_symbol.items():
+            candles = fetched.get(symbol, [])
+            for instrument in members:
+                mapping = mappings[instrument.id]
+                result = IngestionResult(
+                    instrument_id=instrument.id,
+                    interval=Interval.D1,
+                    provider=provider.kind,
+                    window_start=window_start,
+                    window_end=now,
+                    was_backfill=windows[instrument.id] <= floor,
+                )
+                if not candles:
+                    result.skipped_reason = "Provider returned no candles for the requested window"
+                    # The provider answered; this symbol has nothing. Counted so
+                    # a permanently dead ticker stops consuming a slot in every
+                    # rotation — see `_record_empty_fetch`.
+                    _record_empty_fetch(mapping, now)
+                    results.append(result)
+                    continue
+
+                validated = await self._validate(instrument, candles, result)
+                if not validated:
+                    results.append(result)
+                    continue
+
+                result.candles_written = await self._store.upsert_candles(
+                    instrument.id, validated, series_type=DataSeriesType.RAW
+                )
+                _record_successful_fetch(mapping, now)
+                results.append(result)
+
+        log.info(
+            "ingestion.chunk_completed",
+            symbols=len(by_symbol),
+            instruments=len(chunk),
+            written=sum(r.candles_written for r in results),
+            window_days=(now - window_start).days,
+        )
+        return results
+
+    async def _signal_mappings(
+        self, instrument_ids: set[uuid.UUID], provider: ProviderKind
+    ) -> dict[uuid.UUID, MarketDataMapping]:
+        """Active mappings for many instruments, in one query.
+
+        The per-instrument path issues one of these per name. At a hundred
+        instruments that is invisible; at several thousand it is the second
+        bottleneck after the fetch itself.
+        """
+        if not instrument_ids:
+            return {}
+        rows = (
+            (
+                await self._session.execute(
+                    select(MarketDataMapping)
+                    .where(
+                        MarketDataMapping.instrument_id.in_(instrument_ids),
+                        MarketDataMapping.provider == provider,
+                        MarketDataMapping.is_active.is_(True),
+                    )
+                    .order_by(MarketDataMapping.priority.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        # Ascending priority with first-write-wins gives the same mapping the
+        # single-instrument path picks with `.first()`.
+        out: dict[uuid.UUID, MarketDataMapping] = {}
+        for row in rows:
+            out.setdefault(row.instrument_id, row)
+        return out
 
     async def has_sufficient_history(self, instrument_id: uuid.UUID, *, minimum_days: int) -> bool:
         """Enough closed daily bars to compute the long indicators?"""

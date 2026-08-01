@@ -218,8 +218,22 @@ class TestFundamentalsFirstScoring:
         )
         final = scoring.combine_final_score(r)
         assert 0.0 <= final <= 100.0
-        # Weighted average of the factors (fundamentals lead at 0.35).
-        assert abs(final - (0.35 * 80 + 0.20 * 60 + 0.20 * 70 + 0.15 * 55 + 0.10 * 50)) < 0.01
+        # A weighted average over the *available* factors, renormalised. Derived
+        # from the live weights rather than hardcoded: this fixture has no
+        # insider data, so the insider weight must drop out and the remaining
+        # five must re-normalise to 1.0. Hardcoding the numbers made this test
+        # fail for the wrong reason the moment a sixth factor was added.
+        w = scoring.DEFAULT_FACTOR_WEIGHTS
+        factors = {
+            "fundamental_value": 80,
+            "price_cheapness": 60,
+            "reversal": 70,
+            "quality": 55,
+            "sector": 50,
+        }
+        available_weight = sum(w[name] for name in factors)
+        expected = sum(w[name] * value for name, value in factors.items()) / available_weight
+        assert abs(final - expected) < 0.01
 
     def test_missing_fundamentals_is_penalised_but_not_buried(self) -> None:
         with_f = self._result(

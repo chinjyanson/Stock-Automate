@@ -280,6 +280,18 @@ export const scannerResultSchema = z.object({
   confidence: z.string(),
   candles_used: z.number(),
   is_trading212_tradable: z.boolean(),
+  // When this score was computed. The default listing is each instrument's
+  // latest result across runs, so rows carry different dates and the table has
+  // to be able to say how old each one is.
+  scanned_at: z.string(),
+});
+
+export const refreshInstrumentSchema = z.object({
+  instrument_id: z.string(),
+  instrument_name: z.string().nullable(),
+  candles_written: z.number(),
+  result: scannerResultSchema.nullable(),
+  reason: z.string().nullable(),
 });
 
 export const scannerResultDetailSchema = scannerResultSchema.extend({
@@ -437,6 +449,11 @@ export const strategyRunSchema = z.object({
   proposals: z.number(),
   executed: z.number(),
   rejected: z.number(),
+  // Instruments with too little history to evaluate at all.
+  skipped: z.number().default(0),
+  // Instruments evaluated against bars past their freshness threshold. A quiet
+  // result with stale > 0 was computed from old prices.
+  stale: z.number().default(0),
 });
 
 export const liveStatusSchema = z.object({
@@ -480,6 +497,7 @@ export type ScannerResult = z.infer<typeof scannerResultSchema>;
 export type ScannerResultDetail = z.infer<typeof scannerResultDetailSchema>;
 export type ScannerRun = z.infer<typeof scannerRunSchema>;
 export type WatchlistEntry = z.infer<typeof watchlistEntrySchema>;
+export type RefreshInstrumentResult = z.infer<typeof refreshInstrumentSchema>;
 
 /* -- Endpoints ------------------------------------------------------------ */
 
@@ -527,9 +545,15 @@ export const api = {
 
   positions: () => request("/positions", z.array(positionSchema)),
 
-  instruments: (params: { search?: string; limit?: number; offset?: number } = {}) => {
+  instruments: (
+    params: { search?: string; ids?: string[]; limit?: number; offset?: number } = {},
+  ) => {
     const query = new URLSearchParams();
     if (params.search) query.set("search", params.search);
+    // Resolve an exact set by id. Paging cannot do this: a strategy universe is
+    // scattered through a 16k catalogue, so any single page mostly misses it and
+    // the caller ends up rendering raw UUIDs.
+    if (params.ids?.length) query.set("ids", params.ids.join(","));
     query.set("limit", String(params.limit ?? 25));
     query.set("offset", String(params.offset ?? 0));
     return request(`/instruments?${query}`, instrumentListSchema);
@@ -585,6 +609,20 @@ export const api = {
 
   removeFromWatchlist: (instrumentId: string) =>
     request(`/scanner/watchlist/${instrumentId}`, z.undefined(), { method: "DELETE" }),
+
+  /**
+   * Pull current candles for one instrument and rescore it immediately.
+   *
+   * Used right after a stock is pinned from the search box: the rotation would
+   * otherwise not reach it for days, leaving a freshly pinned name showing a
+   * stale score or none at all. Goes to the network for market data, so it is
+   * given a longer timeout than the default request.
+   */
+  refreshInstrument: (instrumentId: string) =>
+    request(`/scanner/instruments/${instrumentId}/refresh`, refreshInstrumentSchema, {
+      method: "POST",
+      signal: AbortSignal.timeout(60_000),
+    }),
 
   scannerSettings: () =>
     request("/scanner/settings", z.object({ auto_run_enabled: z.boolean() })),

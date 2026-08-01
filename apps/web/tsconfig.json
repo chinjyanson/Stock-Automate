@@ -35,9 +35,10 @@
   "include": [
     "**/*.ts",
     "**/*.tsx",
+    ".next-verify/types/**/*.ts",
     ".next/types/**/*.ts",
     "next-env.d.ts",
-    ".next-verify/types/**/*.ts"
+    "/Users/chinjyanson/.claude/jobs/3bb6fbc4/tmp/next-verify/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"

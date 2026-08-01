@@ -47,7 +47,7 @@ from app.strategies.engine import StrategyEngine
 
 pytestmark = pytest.mark.asyncio
 
-_LIVE_TICKER = "GOLD_LIVE"
+_LIVE_TICKER = "RISKY_LIVE"
 
 
 class FakeLiveBroker(Broker):
@@ -96,7 +96,15 @@ class FakeLiveBroker(Broker):
         )
 
 
-async def _trend_instrument(db: object) -> Instrument:
+#: A stable, oscillating base then a sharp sell-off — the dislocation the
+#: strategy exists to catch, and the only shape that produces a guaranteed
+#: entry. A *gradual* decline does not work: the bands follow a trend down, so
+#: price never breaks its own lower band.
+_STABLE_BASE = [100 + (2 if i % 2 else -2) for i in range(45)]
+_SELLOFF = [*_STABLE_BASE, 95.0, 90.0, 86.0]
+
+
+async def _entry_instrument(db: object) -> Instrument:
     exchange = (
         await db.execute(select(Exchange).where(Exchange.mic == "XNAS"))  # type: ignore[attr-defined]
     ).scalar_one_or_none()
@@ -107,8 +115,8 @@ async def _trend_instrument(db: object) -> Instrument:
     instrument = Instrument(
         id=uuid.uuid4(),
         exchange_id=exchange.id,
-        exchange_ticker="GOLD",
-        name="Gold ETC",
+        exchange_ticker="RISKY",
+        name="Risky Inc.",
         kind=InstrumentKind.STOCK,
         currency="USD",
         price_unit=PriceUnit.USD,
@@ -117,10 +125,10 @@ async def _trend_instrument(db: object) -> Instrument:
     await db.flush()  # type: ignore[attr-defined]
 
     now = datetime.now(UTC).replace(second=0, microsecond=0)
-    closes = [80 + i * 0.5 for i in range(130)]  # clean uptrend
+    closes = _SELLOFF
     candles = [
         CandleDTO(
-            symbol="GOLD",
+            symbol="RISKY",
             interval=Interval.D1,
             timestamp=now - timedelta(days=len(closes) - 1 - i),
             open=Decimal(str(c)),
@@ -151,15 +159,25 @@ async def _set(db: object, key: str, value: bool) -> None:
     await db.flush()  # type: ignore[attr-defined]
 
 
-async def _trend_config(db: object, instrument: Instrument) -> StrategyConfiguration:
+async def _entry_config(db: object, instrument: Instrument) -> StrategyConfiguration:
     db.add(RiskConfiguration(name="default", is_active=True))  # type: ignore[attr-defined]
     config = StrategyConfiguration(
-        kind=StrategyKind.TREND_FOLLOWING,
-        name="trend",
+        kind=StrategyKind.MEAN_REVERSION,
+        name="meanrev",
         is_active=True,
         interval=Interval.D1,
         auto_execute=True,
-        params={"sma_period": 100, "slope_window": 21, "return_lookback": 60},
+        # RSI is pinned at 40 rather than taken from the configured default so
+        # that retuning the strategy cannot silently stop these tests producing
+        # the entry whose *routing* is what they are about.
+        params={
+            "bb_period": 20,
+            "bb_std": 2.0,
+            "rsi_period": 14,
+            "rsi_oversold": 40.0,
+            "atr_period": 14,
+            "min_atr_pct": 0.02,
+        },
         universe={"instrument_ids": [str(instrument.id)]},
     )
     db.add(config)  # type: ignore[attr-defined]
@@ -175,7 +193,7 @@ class TestAutonomous:
             "app.risk.execution.get_settings",
             lambda: __import__("types").SimpleNamespace(live_trading_enabled=True),
         )
-        instrument = await _trend_instrument(db)
+        instrument = await _entry_instrument(db)
         db.add(  # type: ignore[attr-defined]
             BrokerInstrument(
                 instrument_id=instrument.id,
@@ -184,7 +202,7 @@ class TestAutonomous:
                 is_currently_available=True,
             )
         )
-        config = await _trend_config(db, instrument)
+        config = await _entry_config(db, instrument)
         # Live venue + autonomous permitted: strategies fill without a human.
         await _set(db, TRADING_LIVE_MODE_KEY, True)
         await _set(db, AUTONOMOUS_LIVE_KEY, True)
@@ -201,8 +219,8 @@ class TestApprovalRequired:
     async def test_live_without_autonomous_only_proposes(
         self, db: object, approver: uuid.UUID
     ) -> None:
-        instrument = await _trend_instrument(db)
-        config = await _trend_config(db, instrument)
+        instrument = await _entry_instrument(db)
+        config = await _entry_config(db, instrument)
         # Live venue, autonomous NOT permitted: strategies may only propose.
         await _set(db, TRADING_LIVE_MODE_KEY, True)
 
