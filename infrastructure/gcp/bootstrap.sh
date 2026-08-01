@@ -27,29 +27,74 @@
 set -Eeuo pipefail
 
 log() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+die() { printf '\n\033[1;31mFATAL:\033[0m %s\n\n' "$*" >&2; exit 1; }
 
 log "Checking this is the machine you think it is"
+
+# Cloud Shell is the easy mistake: you open it to run `gcloud`, forget to SSH
+# onward, and run this here instead. It looks like it is working — Debian,
+# apt, docker — right up until nothing you installed is on the VM. Refuse
+# rather than warn, because the failure is otherwise invisible for several
+# steps.
+if [[ -n "${DEVSHELL_PROJECT_ID:-}" ]] || [[ "$(hostname)" == cs-* ]]; then
+  die "This is Cloud Shell, not the VM.
+
+  Cloud Shell is a container: it has no swap, its /proc/meminfo reports the
+  host's memory, and anything installed here vanishes. SSH to the instance
+  first, then run this again:
+
+      gcloud compute ssh stock-automate --zone=us-central1-a
+
+  or use the SSH button beside the instance in the Console."
+fi
+
 if ! grep -qi debian /etc/os-release 2>/dev/null; then
   echo "Expected Debian (the GCP e2-micro default image). Continuing anyway." >&2
 fi
+
+INSTANCE=$(curl -s -m 2 -H "Metadata-Flavor: Google" \
+  http://metadata.google.internal/computeMetadata/v1/instance/name 2>/dev/null || true)
+[[ -n "$INSTANCE" ]] && echo "Instance: ${INSTANCE}"
+
 TOTAL_MB=$(awk '/MemTotal/ {printf "%.0f", $2/1024}' /proc/meminfo)
 echo "RAM: ${TOTAL_MB} MB"
+# An e2-micro reports ~970 MB. Substantially more means a machine type that is
+# not in the free tier — worth stopping over, because the difference between
+# e2-micro and e2-standard-4 is roughly £0 and £75 a month.
+if [[ "$TOTAL_MB" -gt 4000 ]]; then
+  echo
+  echo "  WARNING: ${TOTAL_MB} MB is far more than an e2-micro's ~970 MB." >&2
+  echo "  Only e2-micro is Always Free. Check with:" >&2
+  echo "    gcloud compute instances list --format='table(name,machineType.basename())'" >&2
+  echo
+  read -r -p "  Continue anyway? [y/N] " reply
+  [[ "$reply" == [yY]* ]] || die "Stopped. Recreate the instance as e2-micro."
+fi
 
 log "Swap"
 # On a 1 GB box the stack fits with headroom, but a swap file turns a
 # transient spike from an OOM kill into a slow minute. An OOM kill here would
 # most likely take Postgres, which is the one process whose death costs data.
-if ! swapon --show | grep -q '/swapfile'; then
-  sudo fallocate -l 2G /swapfile
-  sudo chmod 600 /swapfile
-  sudo mkswap /swapfile
-  sudo swapon /swapfile
-  echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
-  # Prefer reclaiming cache over swapping a running process: this box is
-  # latency-insensitive but should not thrash during a nightly sweep.
-  echo 'vm.swappiness=10' | sudo tee /etc/sysctl.d/99-swap.conf >/dev/null
-  sudo sysctl -p /etc/sysctl.d/99-swap.conf >/dev/null
-  echo "2 GB swap enabled"
+#
+# Not fatal if it fails: swap is insurance, and the measured footprint (~640 MB
+# of 1 GB) does not depend on it. Some filesystems and virtualised environments
+# refuse swap files outright.
+if ! swapon --show 2>/dev/null | grep -q '/swapfile'; then
+  if sudo fallocate -l 2G /swapfile 2>/dev/null \
+    && sudo chmod 600 /swapfile \
+    && sudo mkswap /swapfile >/dev/null \
+    && sudo swapon /swapfile 2>/dev/null; then
+    echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+    # Prefer reclaiming cache over swapping a running process: this box is
+    # latency-insensitive but should not thrash during a nightly sweep.
+    echo 'vm.swappiness=10' | sudo tee /etc/sysctl.d/99-swap.conf >/dev/null
+    sudo sysctl -p /etc/sysctl.d/99-swap.conf >/dev/null
+    echo "2 GB swap enabled"
+  else
+    sudo rm -f /swapfile
+    echo "WARNING: could not enable swap; continuing without it." >&2
+    echo "  The stack fits in 1 GB without swap, but has less margin." >&2
+  fi
 else
   echo "swap already configured"
 fi
