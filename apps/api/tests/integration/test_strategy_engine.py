@@ -112,6 +112,13 @@ _STABLE_BASE = [100 + (2 if i % 2 else -2) for i in range(45)]
 _SELLOFF = [*_STABLE_BASE, 95.0, 90.0, 86.0]
 _RECOVERED = [*_STABLE_BASE, 95.0, 90.0, 86.0, 92.0, 97.0, 100.0]
 
+#: A sell-off that has already bounced off its low. All three of band, RSI and
+#: ATR still say "enter" — but the last close (69) sits above the average price
+#: paid since the trough (67), which is precisely the case anchored VWAP exists
+#: to decline. Margins are deliberately wide (band +5.9, RSI +7.9) so the
+#: fixture proves the AVWAP gate rather than accidentally tripping another one.
+_BOUNCED = [*_STABLE_BASE, 95.0, 84.0, 65.0, 69.0]
+
 #: The sell-off above lands RSI at ~38.7. Pinned in the fixture rather than
 #: relying on the configured default, so retuning the strategy cannot silently
 #: change what these tests prove.
@@ -159,6 +166,68 @@ class TestMeanReversion:
         assert summary.executed == 1
         positions = await InternalPaperBroker(db).get_positions()  # type: ignore[arg-type]
         assert any(p.broker_ticker == str(instrument.id) for p in positions)
+
+    async def test_anchored_vwap_is_off_by_default(self, db: object) -> None:
+        """The default path must be exactly what it was before the gate existed.
+
+        A bounced sell-off still enters, because with the gate off nothing looks
+        at where the price sits relative to what buyers since the low have paid.
+        """
+        await _risk_config(db)
+        instrument = await _instrument(db, "BOUNCED")
+        await _upsert(db, instrument, Interval.D1, _BOUNCED)
+        config = _config(instrument, "meanrev-avwap-default")
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        summary = await StrategyEngine(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).run(config)
+        await db.commit()  # type: ignore[attr-defined]
+        assert summary.signals == 1
+
+    async def test_anchored_vwap_can_veto_a_band_break(self, db: object) -> None:
+        """Enabled, it declines a dip that has already been bought.
+
+        Band, RSI and ATR all still agree here. The only thing that changed is
+        that price is now above the average paid since the trough — buying at
+        the top of the recovering crowd's range rather than below it.
+        """
+        await _risk_config(db)
+        instrument = await _instrument(db, "BOUNCEDVW")
+        await _upsert(db, instrument, Interval.D1, _BOUNCED)
+        config = _config(instrument, "meanrev-avwap-on", avwap_enabled=True)
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        summary = await StrategyEngine(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).run(config)
+        await db.commit()  # type: ignore[attr-defined]
+        assert summary.signals == 0
+
+    async def test_anchored_vwap_still_admits_a_stock_making_new_lows(self, db: object) -> None:
+        """The boundary case, stated so it is not mistaken for a bug.
+
+        A stock whose latest close *is* its low is by definition at or below the
+        average paid since that low, so the gate never blocks the freshest
+        dislocations — which are the ones this strategy most wants.
+        """
+        await _risk_config(db)
+        instrument = await _instrument(db, "NEWLOW")
+        await _upsert(db, instrument, Interval.D1, _SELLOFF)
+        config = _config(instrument, "meanrev-avwap-newlow", avwap_enabled=True)
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        summary = await StrategyEngine(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).run(config)
+        await db.commit()  # type: ignore[attr-defined]
+        assert summary.signals == 1
 
     async def test_rsi_can_veto_a_band_break(self, db: object) -> None:
         """Price below the band is not enough — momentum must be washed out too.

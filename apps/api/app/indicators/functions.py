@@ -380,6 +380,54 @@ def rolling_correlation(returns_a: FloatArray, returns_b: FloatArray, period: in
     return float(np.corrcoef(a, b)[0, 1])
 
 
+def lowest_close_index(closes: FloatArray, period: int = TRADING_DAYS_PER_YEAR) -> int | None:
+    """Index of the lowest close within the last `period` bars.
+
+    The anchor a mean-reversion reading wants: the swing low is the point from
+    which the current move began, so it is where "what have buyers since this
+    bottom actually paid?" starts being a meaningful question.
+
+    Returns an index into the *whole* array, not the window, so it can be passed
+    straight to `anchored_vwap`. None on empty input.
+    """
+    closes = _clean(closes)
+    if closes.size == 0 or period <= 0:
+        return None
+    window = closes[-period:] if closes.size > period else closes
+    offset = closes.size - window.size
+    return int(offset + int(np.argmin(window)))
+
+
+def anchored_vwap(
+    highs: FloatArray,
+    lows: FloatArray,
+    closes: FloatArray,
+    volumes: FloatArray,
+    anchor_index: int,
+) -> float | None:
+    """Volume-weighted average price from `anchor_index` to the latest bar.
+
+    The average price everyone who traded since the anchor actually paid, which
+    is why it acts as support or resistance in a way a simple moving average
+    does not: a moving average weights a day of frantic trading and a dead one
+    equally, and this does not.
+
+    Uses the typical price `(high + low + close) / 3` per bar. None when the
+    anchor is out of range or the window carries no volume — with nothing
+    traded there is no average price paid, and 0.0 would be a lie.
+    """
+    highs, lows, closes, volumes = (_clean(a) for a in (highs, lows, closes, volumes))
+    n = min(highs.size, lows.size, closes.size, volumes.size)
+    if n == 0 or not 0 <= anchor_index < n:
+        return None
+    typical = (highs[anchor_index:n] + lows[anchor_index:n] + closes[anchor_index:n]) / 3.0
+    window_volume = volumes[anchor_index:n]
+    total_volume = float(np.sum(window_volume))
+    if total_volume <= 0:
+        return None
+    return float(np.sum(typical * window_volume) / total_volume)
+
+
 def beta(returns_a: FloatArray, returns_b: FloatArray, period: int) -> float | None:
     """Sensitivity of A's returns to B's over the last `period` bars (CAPM beta).
 

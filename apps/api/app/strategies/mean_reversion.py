@@ -18,6 +18,13 @@ Three indicators, each with a distinct job — none of them redundant:
     has no snapback worth trading, and its band width is noise. The entry
     therefore requires a minimum ATR as a fraction of price.
 
+  * **Anchored VWAP** is an optional fourth condition, off by default. Anchored
+    to the last year's lowest close, it is the average price paid by everyone
+    who has bought since the bottom — entering below it means buying cheaper
+    than the crowd already committed to this recovery. It is a hard gate rather
+    than a weighting because conviction never reaches sizing, so it can only
+    make entries rarer; that is a real behavioural change, hence the flag.
+
 ATR does double duty: the risk engine downstream also sizes the position and
 places the stop from it (`app.risk.engine`), so a wider-ranging stock
 automatically gets a smaller position and a wider stop. That is why this file
@@ -68,6 +75,15 @@ class MeanReversionStrategy(Strategy):
         # ...but only while the drop has not already happened. Measured in ATR
         # so it means the same on a calm stock and a wild one.
         insider_exit_max_drop = float(self.param("insider_exit_max_drop_atr", 1.0))
+        # Anchored VWAP as a fourth entry condition, shipped **off**. It is a
+        # gate rather than a conviction adjustment because conviction never
+        # reaches sizing — the risk engine sizes from ATR and equity alone — so a
+        # conviction-based version would change nothing that happens. Being a
+        # gate, it can only ever make entries rarer, which is a real change to
+        # the strategy's behaviour and belongs behind a flag that can be turned
+        # on and measured rather than assumed.
+        avwap_enabled = bool(self.param("avwap_enabled", False))
+        avwap_anchor_period = int(self.param("avwap_anchor_period", ind.TRADING_DAYS_PER_YEAR))
 
         signals: list[StrategySignal] = []
         for instrument in ctx.instruments:
@@ -98,6 +114,21 @@ class MeanReversionStrategy(Strategy):
             held = ctx.held_quantity(instrument.id)
             pressure = ctx.sell_pressure(instrument.id)
 
+            # Anchored to the lowest close of the last year: the average price
+            # paid by everyone who has bought since the bottom. Entering below it
+            # means buying cheaper than the crowd that already committed to this
+            # recovery, rather than at the top of their range.
+            avwap: float | None = None
+            if avwap_enabled:
+                anchor = ind.lowest_close_index(series.close, avwap_anchor_period)
+                if anchor is not None:
+                    avwap = ind.anchored_vwap(
+                        series.high, series.low, series.close, series.volume, anchor
+                    )
+            # Unavailable reads as satisfied, the same discipline as everywhere
+            # else here: a missing measurement must not silently block trading.
+            avwap_ok = avwap is None or last <= avwap
+
             metrics = {
                 "bb_lower": lower,
                 "bb_middle": middle,
@@ -107,6 +138,8 @@ class MeanReversionStrategy(Strategy):
                 "atr_pct": atr_pct,
                 "close": last,
             }
+            if avwap is not None:
+                metrics["anchored_vwap"] = avwap
 
             # Leave *before* the fall, or not at all. A chief officer choosing
             # to sell precedes about -6.28% excess return over the following
@@ -151,12 +184,13 @@ class MeanReversionStrategy(Strategy):
                     )
                 )
             elif held <= 0:
-                if last <= lower and rsi <= rsi_oversold and atr_pct >= min_atr_pct:
+                if last <= lower and rsi <= rsi_oversold and atr_pct >= min_atr_pct and avwap_ok:
                     # Conviction from how far below the band it closed, measured
                     # in band-widths so it stays comparable across instruments.
                     band_width = upper - lower
                     overshoot = (lower - last) / band_width if band_width > 0 else 0.0
                     conviction = min(1.0, 0.5 + overshoot)
+                    avwap_note = f", below anchored VWAP {avwap:.2f}" if avwap is not None else ""
                     signals.append(
                         StrategySignal(
                             instrument_id=instrument.id,
@@ -166,6 +200,7 @@ class MeanReversionStrategy(Strategy):
                                 f"Mean reversion: close {last:.2f} <= lower band "
                                 f"{lower:.2f}, RSI {rsi:.0f} (<= {rsi_oversold:.0f}), "
                                 f"ATR {atr_pct:.1%} of price (>= {min_atr_pct:.1%})"
+                                f"{avwap_note}"
                             ),
                             metrics=metrics,
                         )
