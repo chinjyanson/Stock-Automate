@@ -132,6 +132,20 @@ def _render(reading: RegimeReading, changes: list[str]) -> str:
       {row("World index trend", "up" if reading.world_uptrend else "DOWN")}
       {
         row(
+            "Realised volatility (20d)",
+            f"{reading.sp500_realised_vol:.0%}"
+            if reading.sp500_realised_vol is not None
+            else "—",
+        )
+    }
+      {
+        row(
+            "High-yield spread",
+            f"{reading.credit_spread:.2f}%" if reading.credit_spread is not None else "—",
+        )
+    }
+      {
+        row(
             "Yield curve 10y-2y",
             f"{reading.yield_curve_10y2y:+.2f}" if reading.yield_curve_10y2y is not None else "—",
         )
