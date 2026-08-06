@@ -90,8 +90,20 @@ class ExecutionService:
         self._broker_kind: BrokerKind = self._configured_kind or BrokerKind.TRADING212_DEMO
 
     async def execute_approved(
-        self, proposal: TradeProposal, *, actor_user_id: uuid.UUID | None = None
+        self,
+        proposal: TradeProposal,
+        *,
+        actor_user_id: uuid.UUID | None = None,
+        capital_ceiling: Decimal | None = None,
     ) -> TradeProposal:
+        """Size and fill an approved proposal.
+
+        `capital_ceiling` bounds the equity this order sizes against — the
+        calling strategy's share of the account when the capital is split
+        between sleeves. It composes with the live ceiling rather than replacing
+        it: the smaller of the two wins, so a sleeve limit can never widen what
+        live trading permits.
+        """
         # Idempotency comes first: a proposal that already has a live intent has
         # been acted on (possibly reaching EXECUTED), so a retry must return what
         # exists rather than tripping the status check or submitting again.
@@ -139,7 +151,7 @@ class ExecutionService:
 
         broker = self._injected_broker or resolve_broker(self._broker_kind, session=self._session)
         try:
-            return await self._execute(proposal, instrument, broker, actor_user_id)
+            return await self._execute(proposal, instrument, broker, actor_user_id, capital_ceiling)
         finally:
             if self._injected_broker is None:
                 await broker.close()
@@ -150,6 +162,7 @@ class ExecutionService:
         instrument: Instrument,
         broker: Broker,
         actor_user_id: uuid.UUID | None,
+        capital_ceiling: Decimal | None = None,
     ) -> TradeProposal:
         # The venue's real ticker: the instrument id for paper, the broker's own
         # spelling (via BrokerInstrument) for Trading 212. A real broker will not
@@ -168,7 +181,13 @@ class ExecutionService:
         rates = await self._reference_candles(config.rate_proxy_symbol) if config else None
 
         # For live, the affirmed capital ceiling bounds sizing for this session.
+        # A sleeve allocation bounds it further; the smaller of the two wins so
+        # neither can widen the other.
         equity_ceiling = await self._live_equity_ceiling()
+        if capital_ceiling is not None:
+            equity_ceiling = (
+                capital_ceiling if equity_ceiling is None else min(equity_ceiling, capital_ceiling)
+            )
 
         decision = await self._engine.evaluate(
             instrument=instrument,

@@ -239,6 +239,14 @@ class StrategyKind(StrEnum):
     #: an index it must not trade is a trap for whoever reads it next.
     MEAN_REVERSION = "mean_reversion"
 
+    #: Timed exposure to an S&P 500 tracker, driven by index-level options
+    #: signals rather than the tracker's own price. A second kind, after the
+    #: docstring above argued against carrying unused ones — the difference is
+    #: that this one answers a question mean reversion cannot: "is this cheap
+    #: relative to its own range?" is meaningless for an index fund, whose
+    #: price falling *is* the market falling rather than a dislocation in it.
+    INDEX_TIMING = "index_timing"
+
 
 class StrategyRunStatus(StrEnum):
     RUNNING = "running"

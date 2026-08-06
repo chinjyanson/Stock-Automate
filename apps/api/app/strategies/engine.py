@@ -52,9 +52,16 @@ from app.models.strategy import StrategyConfiguration, StrategyDecision, Strateg
 from app.risk.execution import ExecutionError, ExecutionService
 from app.risk.halts import HaltService
 from app.scanner.proposals import ProposalError, ProposalInputs, ProposalService
+from app.services.index_options import IndexOptionsService
 from app.services.insider import InsiderIngestionService
+from app.services.market_regime import MarketRegimeService
 from app.services.system_settings import active_broker_kind, autonomous_live_enabled
-from app.strategies.base import InsiderPressure, StrategyContext, StrategySignal
+from app.strategies.base import (
+    IndexConditions,
+    InsiderPressure,
+    StrategyContext,
+    StrategySignal,
+)
 from app.strategies.registry import build_strategy
 
 log = structlog.get_logger(__name__)
@@ -163,6 +170,11 @@ class StrategyEngine:
         equity = (
             Decimal(config.account_equity) if config.account_equity is not None else account.total
         )
+        # The strategy's share of capital. Two sleeves — active stock picking
+        # and timed index exposure — size against their own allocation rather
+        # than the whole account, so one cannot quietly spend the other's room.
+        if config.capital_allocation_pct is not None:
+            equity = equity * Decimal(str(config.capital_allocation_pct))
 
         strategy = build_strategy(config)
 
@@ -188,6 +200,7 @@ class StrategyEngine:
             instruments=instruments,
             positions=positions,
             insider_sell_pressure=await self._insider_pressure(instruments),
+            index_conditions=await self._index_conditions(),
         )
         try:
             signals = await strategy.evaluate(ctx)
@@ -353,7 +366,14 @@ class StrategyEngine:
         await self._session.flush()
         execution = ExecutionService(self._session, broker=broker)
         try:
-            executed = await execution.execute_approved(proposal, actor_user_id=None)
+            # The sleeve's capital bounds the sizing, not just the proposal.
+            # Without this the risk engine would size against the whole broker
+            # account and the split would be decorative.
+            executed = await execution.execute_approved(
+                proposal,
+                actor_user_id=None,
+                capital_ceiling=equity if config.capital_allocation_pct is not None else None,
+            )
         except ExecutionError as exc:
             decision.outcome = StrategyDecisionOutcome.REJECTED_BY_RISK
             decision.reason = f"{signal.reason} — execution refused: {exc}"
@@ -476,6 +496,39 @@ class StrategyEngine:
         if bi is None or not bi.is_currently_available:
             return None
         return bi.broker_ticker
+
+    async def _index_conditions(self) -> IndexConditions:
+        """Market-wide state, resolved once per run.
+
+        Same contract as `_insider_pressure`: looked up here so `evaluate` reads
+        only what it is handed. Failures degrade to "no options reading", which
+        the index strategy treats as "no opinion" rather than as a sell — a
+        provider outage must not liquidate a position.
+        """
+        regime = 1.0
+        try:
+            regime = await MarketRegimeService(self._session).current_risk_factor()
+        except Exception as exc:
+            log.warning("strategy.regime_failed", error=str(exc))
+        try:
+            snapshot = await IndexOptionsService(self._session).latest()
+        except Exception as exc:
+            log.warning("strategy.index_options_failed", error=str(exc))
+            snapshot = None
+        if snapshot is None:
+            return IndexConditions(regime_factor=regime)
+
+        def _f(value: object) -> float | None:
+            return None if value is None else float(value)  # type: ignore[arg-type]
+
+        return IndexConditions(
+            regime_factor=regime,
+            gamma_exposure=_f(snapshot.gamma_exposure),
+            skew_25delta=_f(snapshot.skew_25delta),
+            atm_iv=_f(snapshot.atm_iv),
+            contracts_used=int(snapshot.contracts_used or 0),
+            options_available=True,
+        )
 
     async def _insider_pressure(
         self, instruments: list[Instrument]

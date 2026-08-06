@@ -229,6 +229,7 @@ def score_series(
     benchmark: PriceSeries | None = None,
     sector: PriceSeries | None = None,
     rates: PriceSeries | None = None,
+    pead: float | None = None,
     fundamentals: dict[str, Decimal | None] | None = None,
 ) -> ScoreResult:
     """Score one instrument's series. Pure — no I/O, fully deterministic.
@@ -251,7 +252,7 @@ def score_series(
     metrics: dict[str, Any] = {}
 
     trend = _score_trend(series, closes, metrics)
-    momentum = _score_momentum(closes, benchmark, sector, metrics)
+    momentum = _score_momentum(closes, benchmark, sector, pead, metrics)
     risk = _score_risk(closes, rates, metrics)
     liquidity = _score_liquidity(closes, volumes, metrics)
     positioning = _score_positioning(closes, metrics)
@@ -496,6 +497,7 @@ def _score_momentum(
     closes: Any,
     benchmark: PriceSeries | None,
     sector: PriceSeries | None,
+    pead: float | None,
     metrics: dict[str, Any],
 ) -> list[SubSignal]:
     windows = {
@@ -573,6 +575,29 @@ def _score_momentum(
             )
     else:
         signals.append(SubSignal("relative_momentum_vs_sector", False))
+
+    # Post-earnings announcement drift. A momentum signal, but an event-driven
+    # one: the other measures here read a trailing window of price, whereas this
+    # reads how the market reacted to a specific piece of news and bets the
+    # repricing is not finished. Computed outside `score_series` (it needs the
+    # earnings table) and passed in already scored 0-100.
+    metrics["pead_score"] = pead
+    if pead is None:
+        # No report inside the drift window, or no coverage for this listing —
+        # Form-10-style earnings dates are thin outside the US. Drops out of the
+        # category average rather than marking the stock down for a data gap.
+        signals.append(SubSignal("earnings_drift", False))
+    else:
+        strength = _clamp01(pead / 100.0)
+        signals.append(
+            SubSignal(
+                "earnings_drift",
+                True,
+                strength,
+                f"post-earnings drift score {pead:.0f}",
+                positive=pead >= 50.0,
+            )
+        )
 
     return signals
 

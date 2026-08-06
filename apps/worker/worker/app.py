@@ -40,6 +40,8 @@ app = Celery(
         "worker.jobs.strategy",
         "worker.jobs.backfill",
         "worker.jobs.market_regime",
+        "worker.jobs.index_options",
+        "worker.jobs.earnings",
     ],
 )
 
@@ -79,6 +81,23 @@ app.conf.beat_schedule = {
     "refresh-daily-candles": {
         "task": "worker.jobs.market_data.refresh_daily_candles",
         "schedule": crontab(hour=21, minute=30),
+        "options": {"expires": 7200},
+    },
+    # Before the regime measurement, so the day's index picture — dealer gamma,
+    # skew, at-the-money implied vol — is complete before anything sizes against
+    # it. An option chain carries no history, so this row is the only record
+    # there will ever be of what today was pricing.
+    "measure-index-options": {
+        "task": "worker.jobs.index_options.measure_index_options",
+        "schedule": crontab(hour=21, minute=40),
+        "options": {"expires": 3600},
+    },
+    # Weekly: report dates move on a quarterly cycle, so asking daily would
+    # spend a provider call per instrument to learn nothing. Sunday morning,
+    # well clear of the trading week.
+    "sync-earnings-dates": {
+        "task": "worker.jobs.earnings.sync_earnings_dates",
+        "schedule": crontab(hour=6, minute=30, day_of_week=0),
         "options": {"expires": 7200},
     },
     # Before the scan, so the day's risk posture is measured from fresh candles

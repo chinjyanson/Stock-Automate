@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.audit.service import AuditService
 from app.data.store import CandleStore
+from app.indicators import functions as ind
 from app.indicators.series import PriceSeries, candles_to_series
 from app.models.enums import ActorKind, AuditEventKind, Interval
 from app.models.instrument import Instrument, MarketDataMapping
@@ -36,6 +37,8 @@ from app.models.scanner import (
 )
 from app.scanner import scoring
 from app.services.insider import InsiderIngestionService
+from app.services.pead import REACTION_BARS as PEAD_REACTION_BARS
+from app.services.pead import PeadService
 
 log = structlog.get_logger(__name__)
 
@@ -222,6 +225,7 @@ class ScannerEngine:
             benchmark=benchmark,
             sector=sector_series,
             rates=rates,
+            pead=await self._pead_score(instrument.id, benchmark),
             fundamentals=fundamentals,
         )
 
@@ -364,6 +368,29 @@ class ScannerEngine:
         if score is None:
             return None, 0.0
         return score.score, score.sell_penalty
+
+    async def _pead_score(
+        self, instrument_id: uuid.UUID, benchmark: PriceSeries | None
+    ) -> float | None:
+        """Post-earnings drift as a 0-100 reading, or None when there is no event.
+
+        Wrapped for the same reason as `_insider_factor`: an optional signal
+        covering a minority of the catalogue must never take down the scoring of
+        an instrument whose other signals are fine.
+
+        The benchmark's move over the same window makes the surprise *abnormal*
+        rather than raw — without it, a report that landed on a day the whole
+        market fell would read as a bad reaction to the company's own news.
+        """
+        benchmark_move = None
+        if benchmark is not None:
+            benchmark_move = ind.trailing_return(benchmark.preferred_close, PEAD_REACTION_BARS)
+        try:
+            score = await PeadService(self._session).score_instrument(instrument_id, benchmark_move)
+        except Exception as exc:
+            log.warning("scanner.pead_failed", instrument_id=str(instrument_id), error=str(exc))
+            return None
+        return score.score if score is not None else None
 
     async def _load_fundamentals(
         self, instrument_id: uuid.UUID

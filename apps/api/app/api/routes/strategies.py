@@ -43,6 +43,8 @@ class StrategyConfigResponse(ORMModel):
     params: dict[str, Any] | None
     universe: dict[str, Any] | None
     account_equity: SerializedDecimal | None
+    #: This strategy's share of the account, 0..1. Null = the whole of it.
+    capital_allocation_pct: SerializedDecimal | None
 
 
 class StrategyConfigUpdate(BaseModel):
@@ -52,6 +54,7 @@ class StrategyConfigUpdate(BaseModel):
     params: dict[str, Any] | None = None
     universe: dict[str, Any] | None = None
     account_equity: SerializedDecimal | None = None
+    capital_allocation_pct: SerializedDecimal | None = None
 
 
 class StrategyDecisionResponse(ORMModel):

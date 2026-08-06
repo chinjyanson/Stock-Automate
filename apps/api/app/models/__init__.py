@@ -7,6 +7,7 @@ list silently produces an empty migration.
 
 from app.models.audit import GENESIS_HASH, AuditEvent
 from app.models.base import Base, Money, Price, Quantity, Ratio
+from app.models.earnings import EarningsEvent
 from app.models.enums import (
     ActorKind,
     AuditEventKind,
@@ -30,6 +31,7 @@ from app.models.enums import (
     StrategyRunStatus,
     TradeIntentStatus,
 )
+from app.models.index_options import IndexOptionsSnapshot
 from app.models.insider import InsiderTransaction
 from app.models.instrument import (
     BrokerInstrument,
@@ -98,10 +100,12 @@ __all__ = [
     "DataQualityEvent",
     "DataQualityEventKind",
     "DataSeriesType",
+    "EarningsEvent",
     "Exchange",
     "FundamentalSnapshot",
     "HaltKind",
     "HaltScope",
+    "IndexOptionsSnapshot",
     "InsiderTransaction",
     "Instrument",
     "InstrumentKind",

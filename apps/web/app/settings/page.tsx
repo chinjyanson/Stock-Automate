@@ -10,6 +10,7 @@ import {
   type DailySummary,
   type LiveStatus,
   type RiskConfig,
+  type StrategyConfig,
   type User,
   api,
   formatMoney,
@@ -21,6 +22,7 @@ type SectionId =
   | "account"
   | "trading"
   | "risk"
+  | "allocation"
   | "scanner"
   | "notifications"
   | "audit";
@@ -29,6 +31,7 @@ const SECTIONS: { id: SectionId; label: string }[] = [
   { id: "account", label: "Account" },
   { id: "trading", label: "Trading venue" },
   { id: "risk", label: "Risk" },
+  { id: "allocation", label: "Capital allocation" },
   { id: "scanner", label: "Scanner" },
   { id: "notifications", label: "Notifications" },
   { id: "audit", label: "Audit log" },
@@ -43,6 +46,7 @@ export default function SettingsPage() {
   const [account, setAccount] = useState<Account | null>(null);
   const [live, setLive] = useState<LiveStatus | null>(null);
   const [risk, setRisk] = useState<RiskConfig | null>(null);
+  const [strategies, setStrategies] = useState<StrategyConfig[]>([]);
   const [scanAuto, setScanAuto] = useState<boolean | null>(null);
   const [eodDigest, setEodDigest] = useState<boolean | null>(null);
   const [summaries, setSummaries] = useState<DailySummary[]>([]);
@@ -63,17 +67,19 @@ export default function SettingsPage() {
           return;
         }
       }
-      const [accountR, liveR, riskR, scanR, digestR, summariesR, auditR] =
+      const [accountR, liveR, riskR, strategiesR, scanR, digestR, summariesR, auditR] =
         await Promise.allSettled([
           api.activeAccount(),
           api.liveStatus(),
           api.riskConfig(),
+          api.strategies(),
           api.scannerSettings(),
           api.notificationSettings(),
           api.activeSummaries(14),
           api.audit(25),
         ]);
       if (accountR.status === "fulfilled") setAccount(accountR.value);
+      if (strategiesR.status === "fulfilled") setStrategies(strategiesR.value);
       if (liveR.status === "fulfilled") setLive(liveR.value);
       if (riskR.status === "fulfilled") setRisk(riskR.value);
       if (scanR.status === "fulfilled") setScanAuto(scanR.value.auto_run_enabled);
@@ -181,6 +187,9 @@ export default function SettingsPage() {
             <LiveSection live={live} isAdmin={isAdmin} withReauth={withReauth} />
           )}
           {section === "risk" && <RiskSection risk={risk} onSaved={load} />}
+          {section === "allocation" && (
+            <AllocationSection strategies={strategies} onSaved={load} />
+          )}
           {section === "scanner" && <ScannerSection enabled={scanAuto} onChange={load} />}
           {section === "notifications" && (
             <NotificationsSection enabled={eodDigest} summaries={summaries} onChange={load} />
@@ -463,6 +472,130 @@ function AuditSection({ events }: { events: AuditEvent[] }) {
 }
 
 /* -- Scanner ------------------------------------------------------------- */
+
+/* -- Capital allocation -------------------------------------------------- */
+
+const MEAN_REVERSION_KIND = "mean_reversion";
+const INDEX_TIMING_KIND = "index_timing";
+
+function AllocationSection({
+  strategies,
+  onSaved,
+}: {
+  strategies: StrategyConfig[];
+  onSaved: () => Promise<void>;
+}) {
+  const toast = useToast();
+  const meanReversion = strategies.find((s) => s.kind === MEAN_REVERSION_KIND);
+  const indexTiming = strategies.find((s) => s.kind === INDEX_TIMING_KIND);
+
+  const initial = meanReversion?.capital_allocation_pct
+    ? Math.round(Number(meanReversion.capital_allocation_pct) * 100)
+    : 100;
+  const [pct, setPct] = useState(initial);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setPct(initial);
+  }, [initial]);
+
+  async function save() {
+    if (!meanReversion) return;
+    setBusy(true);
+    try {
+      await api.updateStrategy(meanReversion.id, {
+        capital_allocation_pct: (pct / 100).toFixed(6),
+      });
+      if (indexTiming) {
+        await api.updateStrategy(indexTiming.id, {
+          capital_allocation_pct: ((100 - pct) / 100).toFixed(6),
+        });
+      }
+      toast.success(`Split saved: ${pct}% stocks, ${100 - pct}% index.`);
+      await onSaved();
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : "Could not save the allocation");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!meanReversion) {
+    return (
+      <section className="space-y-3">
+        <h2 className="text-lg font-medium">Capital allocation</h2>
+        <p className="text-sm text-[var(--color-ink-muted)]">
+          No strategies are configured yet, so there is nothing to split between.
+        </p>
+      </section>
+    );
+  }
+
+  return (
+    <section className="space-y-4">
+      <h2 className="text-lg font-medium">Capital allocation</h2>
+      <p className="text-sm text-[var(--color-ink-muted)]">
+        How the account divides between the two sleeves. Each sizes against its own
+        share, so every risk limit below — risk per trade, position size, total open
+        risk — is a percentage of that sleeve rather than of the whole account.
+      </p>
+
+      <div className="rounded-lg border border-[var(--color-border-subtle)] px-4 py-4 space-y-4">
+        <div className="flex items-baseline justify-between gap-4">
+          <div>
+            <p className="font-medium">Mean reversion (individual stocks)</p>
+            <p className="text-sm text-[var(--color-ink-muted)]">
+              Scanner-ranked names, bought on a dislocation.
+            </p>
+          </div>
+          <span className="text-2xl font-medium tabular-nums">{pct}%</span>
+        </div>
+
+        <input
+          type="range"
+          min={0}
+          max={100}
+          step={5}
+          value={pct}
+          onChange={(e) => setPct(Number(e.target.value))}
+          className="w-full"
+          aria-label="Percentage of capital allocated to mean reversion"
+        />
+
+        <div className="flex items-baseline justify-between gap-4">
+          <div>
+            <p className="font-medium">Index timing (S&amp;P 500 tracker)</p>
+            <p className="text-sm text-[var(--color-ink-muted)]">
+              {indexTiming
+                ? "Timed exposure driven by dealer gamma, skew and market regime."
+                : "No index-timing strategy is configured; this share stays uninvested."}
+            </p>
+          </div>
+          <span className="text-2xl font-medium tabular-nums">{100 - pct}%</span>
+        </div>
+
+        <div className="flex items-center gap-3">
+          <button
+            onClick={save}
+            disabled={busy || pct === initial}
+            className="rounded-md border border-[var(--color-border-subtle)] px-3 py-1.5 text-sm disabled:opacity-50"
+          >
+            {busy ? "Saving…" : "Save split"}
+          </button>
+          {pct !== initial && (
+            <span className="text-sm text-[var(--color-ink-muted)]">Unsaved change</span>
+          )}
+        </div>
+      </div>
+
+      <p className="text-sm text-[var(--color-ink-muted)]">
+        Changing the split does not buy or sell anything by itself. Each sleeve simply
+        sizes new positions against its new share; existing holdings are left alone
+        until their own strategy decides to exit.
+      </p>
+    </section>
+  );
+}
 
 function ScannerSection({
   enabled,

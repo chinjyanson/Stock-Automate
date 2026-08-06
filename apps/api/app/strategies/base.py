@@ -58,6 +58,25 @@ class StrategySignal:
 _MIN_SERIES_BARS = 20
 
 
+@dataclass(frozen=True)
+class IndexConditions:
+    """Index-level market state, resolved once per run by the engine.
+
+    Everything here describes the market rather than any instrument in it, so it
+    is read once and shared. `options_available` is separate from the fields
+    being None because "no usable chain today" and "a chain that priced no
+    skew" are different situations: the first means a strategy has nothing to
+    act on, the second is a real reading that happens to be partial.
+    """
+
+    regime_factor: float = 1.0
+    gamma_exposure: float | None = None
+    skew_25delta: float | None = None
+    atm_iv: float | None = None
+    contracts_used: int = 0
+    options_available: bool = False
+
+
 @dataclass
 class StrategyContext:
     """Everything a strategy pass needs, resolved once by the engine."""
@@ -66,6 +85,11 @@ class StrategyContext:
     store: CandleStore
     instruments: list[Instrument]
     positions: list[BrokerPosition]
+    #: Index-level conditions (market regime, dealer gamma, skew). Resolved by
+    #: the engine and passed in for the same reason as `insider_sell_pressure`:
+    #: a strategy reads only what it is handed, so it stays testable against
+    #: fixtures with no database behind them.
+    index_conditions: IndexConditions = field(default_factory=IndexConditions)
     #: Insider selling pressure per instrument, 0..0.40 — the same figure the
     #: scanner uses as a score penalty. Resolved once by the engine and passed
     #: in, exactly like `positions`, so a strategy still reads only what is

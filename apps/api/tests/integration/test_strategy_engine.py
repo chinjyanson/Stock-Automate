@@ -145,6 +145,65 @@ def _config(instrument: Instrument, name: str, **overrides: object) -> StrategyC
     )
 
 
+class TestCapitalAllocation:
+    """A sleeve sizes against its own share, not the whole account.
+
+    This is what stops the two strategies competing for the same capital: every
+    percentage limit below the split — risk per trade, position size, total open
+    risk — becomes a percentage of the sleeve.
+    """
+
+    async def test_a_smaller_sleeve_takes_a_smaller_position(self, db: object) -> None:
+        await _risk_config(db)
+        full = await _instrument(db, "FULL")
+        await _upsert(db, full, Interval.D1, _SELLOFF)
+        quarter = await _instrument(db, "QUARTER")
+        await _upsert(db, quarter, Interval.D1, _SELLOFF)
+
+        whole = _config(full, "sleeve-whole")
+        db.add(whole)  # type: ignore[attr-defined]
+        part = _config(quarter, "sleeve-quarter")
+        part.capital_allocation_pct = Decimal("0.25")
+        db.add(part)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        broker = InternalPaperBroker(db)  # type: ignore[arg-type]
+        await StrategyEngine(db, broker=broker).run(whole)  # type: ignore[arg-type]
+        await db.commit()  # type: ignore[attr-defined]
+        positions = {p.broker_ticker: p.quantity for p in await broker.get_positions()}
+        whole_qty = positions[str(full.id)]
+
+        await StrategyEngine(db, broker=InternalPaperBroker(db)).run(part)  # type: ignore[arg-type]
+        await db.commit()  # type: ignore[attr-defined]
+        positions = {
+            p.broker_ticker: p.quantity
+            for p in await InternalPaperBroker(db).get_positions()  # type: ignore[arg-type]
+        }
+        quarter_qty = positions[str(quarter.id)]
+
+        # A quarter of the capital cannot buy as much as all of it. The exact
+        # ratio depends on which cap binds, so the property tested is the
+        # direction and that the sleeve genuinely bounds it.
+        assert quarter_qty < whole_qty
+
+    async def test_no_allocation_means_the_whole_account(self, db: object) -> None:
+        """Existing configurations must behave exactly as they did before."""
+        await _risk_config(db)
+        instrument = await _instrument(db, "UNSPLIT")
+        await _upsert(db, instrument, Interval.D1, _SELLOFF)
+        config = _config(instrument, "sleeve-none")
+        assert config.capital_allocation_pct is None
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        summary = await StrategyEngine(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).run(config)
+        await db.commit()  # type: ignore[attr-defined]
+        assert summary.executed == 1
+
+
 class TestMeanReversion:
     """Entry needs all three indicators to agree; each is tested for its own veto."""
 

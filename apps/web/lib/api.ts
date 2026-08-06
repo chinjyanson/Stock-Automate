@@ -424,6 +424,7 @@ export const strategyConfigSchema = z.object({
   params: z.record(z.string(), z.unknown()).nullable(),
   universe: z.record(z.string(), z.unknown()).nullable(),
   account_equity: z.string().nullable(),
+  capital_allocation_pct: z.string().nullable(),
 });
 
 export const strategyDecisionSchema = z.object({
@@ -492,6 +493,7 @@ export type StrategyConfigUpdate = Partial<{
   params: Record<string, unknown>;
   universe: Record<string, unknown>;
   account_equity: string | null;
+  capital_allocation_pct: string | null;
 }>;
 export type ScannerResult = z.infer<typeof scannerResultSchema>;
 export type ScannerResultDetail = z.infer<typeof scannerResultDetailSchema>;

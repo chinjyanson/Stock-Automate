@@ -85,6 +85,15 @@ class StrategyConfiguration(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     universe: Mapped[dict[str, Any] | None] = mapped_column()
     #: Capital the strategy sizes against. Null = use the broker account equity.
     account_equity: Mapped[Any | None] = mapped_column(Money)
+    #: This strategy's share of that capital, 0..1. Null = the whole of it.
+    #:
+    #: How the account is split between sleeves — active stock picking and timed
+    #: index exposure. Applied before any risk cap, so every percentage limit
+    #: below it (risk per trade, position size, total open risk) is a percentage
+    #: of *this sleeve*, not of the account. A 1% risk-per-trade in a 40% sleeve
+    #: risks 1% of that 40%, which is what keeps one sleeve from quietly
+    #: spending the other's room.
+    capital_allocation_pct: Mapped[Any | None] = mapped_column(Ratio)
 
     runs: Mapped[list[StrategyRun]] = relationship(back_populates="configuration")
 
