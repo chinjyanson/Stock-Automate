@@ -37,6 +37,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import (
     Base,
+    JSONBOrJSON,
     Money,
     Price,
     Quantity,
@@ -229,6 +230,13 @@ class TradeIntent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     exit_price: Mapped[Any | None] = mapped_column(Price)
     exit_reason: Mapped[str | None] = mapped_column(String(32))
+
+    #: The risk engine's full verdict at the moment this intent was sized —
+    #: which cap bound it, and the correlation, stress and regime readings that
+    #: applied. The decision itself is transient, so without this there is no
+    #: evidence left for tuning the limits or for answering "why was this
+    #: position small?" after the fact. See `RiskDecision.as_record`.
+    risk_evaluation: Mapped[dict[str, Any] | None] = mapped_column(JSONBOrJSON)
 
     note: Mapped[str | None] = mapped_column(Text)
 

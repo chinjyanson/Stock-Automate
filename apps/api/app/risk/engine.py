@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
+from typing import Any
 
 import numpy as np
 import structlog
@@ -83,6 +84,30 @@ class RiskDecision:
     #: Simulated 20-day tail loss of the whole book with this position added,
     #: as a positive fraction. None when it could not be measured.
     stress_loss_pct: float | None = None
+    #: The market-regime multiplier that scaled the risk budget.
+    regime_factor: float | None = None
+
+    def as_record(self) -> dict[str, Any]:
+        """The verdict as a JSON-safe dict, for the audit trail.
+
+        Which cap bound a trade, and what the correlation and stress readings
+        were when it did, is the only evidence available for tuning these limits
+        later — or for answering "why was this position small?" months after the
+        fact. A reason string cannot carry it, so it is recorded structurally.
+        """
+        return {
+            "approved_quantity": str(self.approved_quantity),
+            "entry_price": str(self.entry_price),
+            "stop_price": str(self.stop_price) if self.stop_price is not None else None,
+            "risk_amount": str(self.risk_amount),
+            "rejected": self.rejected,
+            "reason": self.reason,
+            "applied_caps": list(self.applied_caps),
+            "correlation": self.correlation,
+            "rate_correlation": self.rate_correlation,
+            "stress_loss_pct": self.stress_loss_pct,
+            "regime_factor": self.regime_factor,
+        }
 
     @classmethod
     def reject(cls, reason: str) -> RiskDecision:
@@ -289,6 +314,7 @@ class RiskEngine:
             correlation=correlation,
             rate_correlation=rate_correlation,
             stress_loss_pct=stress_loss_pct,
+            regime_factor=regime,
         )
 
     # -- Helpers -----------------------------------------------------------

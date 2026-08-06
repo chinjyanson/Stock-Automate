@@ -190,7 +190,10 @@ class ExecutionService:
                 actor_kind=ActorKind.RISK_ENGINE,
                 subject_type="trade_proposal",
                 subject_id=str(proposal.id),
-                payload={"reason": decision.reason},
+                # The full verdict, not just the reason string. A rejection
+                # writes no TradeIntent, so the audit log is the only place the
+                # sizing evidence can survive.
+                payload=decision.as_record(),
             )
             log.info("execution.rejected_by_risk", proposal_id=str(proposal.id))
             return proposal
@@ -204,6 +207,7 @@ class ExecutionService:
             side=OrderSide.BUY,
             quantity=decision.approved_quantity,
             stop_price=decision.stop_price,
+            risk_evaluation=decision.as_record(),
         )
         self._session.add(intent)
         await self._session.flush()
