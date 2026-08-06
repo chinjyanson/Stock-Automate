@@ -57,6 +57,7 @@ class RiskDecision:
     reason: str | None = None
     applied_caps: list[str] = field(default_factory=list)
     correlation: float | None = None
+    rate_correlation: float | None = None
 
     @classmethod
     def reject(cls, reason: str) -> RiskDecision:
@@ -85,6 +86,7 @@ class RiskEngine:
         positions: list[BrokerPosition],
         candles: list[Candle],
         benchmark_candles: list[Candle] | None = None,
+        rates_candles: list[Candle] | None = None,
         broker: BrokerKind = BrokerKind.INTERNAL_PAPER,
         equity_ceiling: Decimal | None = None,
     ) -> RiskDecision:
@@ -185,19 +187,45 @@ class RiskEngine:
         # the size. Exposure is measured position-by-position (each holding's own
         # correlation to the benchmark), not by gross invested — that is the
         # Phase 4 refinement over the earlier approximation.
+        #
+        # Rate sensitivity is the same shape of mistake against a different
+        # reference: a book of REITs, utilities and long-duration growth is one
+        # bet on yields however uncorrelated those names look to each other.
+        # Measured on magnitude, so a strongly *negatively* rate-correlated book
+        # counts too — that is still a rates bet, just the other way round.
         correlation: float | None = None
+        rate_correlation: float | None = None
         applied_caps = [binding_cap]
         if applied_regime:
             applied_caps.append(applied_regime)
+
+        reductions: list[str] = []
         if benchmark_candles:
             correlation = self._correlation(series.close, benchmark_candles, config)
             if correlation is not None and correlation > float(config.correlation_threshold):
-                exposure = await self._benchmark_correlated_exposure(
+                exposure = await self._correlated_exposure(
                     positions, benchmark_candles, config, equity
                 )
                 if exposure > Decimal(str(config.max_portfolio_sp500_pct)):
-                    quantity = quantity * CORRELATION_REDUCTION
-                    applied_caps.append("correlation_reduction")
+                    reductions.append("correlation_reduction")
+        if rates_candles:
+            rate_correlation = self._correlation(series.close, rates_candles, config)
+            if rate_correlation is not None and abs(rate_correlation) > float(
+                config.correlation_threshold
+            ):
+                exposure = await self._correlated_exposure(
+                    positions, rates_candles, config, equity, use_abs=True
+                )
+                if exposure > Decimal(str(config.max_portfolio_rate_sensitive_pct)):
+                    reductions.append("rate_correlation_reduction")
+        if reductions:
+            # At most one cut, however many gates fired. Two independent x0.5
+            # multipliers would give x0.25, which neither rule intends — being
+            # concentrated in two ways is not twice as bad as being concentrated
+            # in one. Every gate that fired is still named, so the audit trail
+            # shows the full reason.
+            quantity = quantity * CORRELATION_REDUCTION
+            applied_caps.extend(reductions)
 
         # 6. Round down to step; reject a position that rounds to nothing. --
         quantity = quantity.quantize(QUANTITY_STEP, rounding=ROUND_DOWN)
@@ -214,6 +242,7 @@ class RiskEngine:
             risk_amount=risk_amount,
             applied_caps=applied_caps,
             correlation=correlation,
+            rate_correlation=rate_correlation,
         )
 
     # -- Helpers -----------------------------------------------------------
@@ -221,10 +250,10 @@ class RiskEngine:
     def _correlation(
         self,
         closes: object,
-        benchmark_candles: list[Candle],
+        reference_candles: list[Candle],
         config: RiskConfiguration,
     ) -> float | None:
-        bench = candles_to_series(benchmark_candles)
+        bench = candles_to_series(reference_candles)
         window = int(config.correlation_window_short)
         if bench.length < window + 1:
             return None
@@ -232,23 +261,32 @@ class RiskEngine:
         bench_returns = ind.daily_returns(bench.close)
         return ind.rolling_correlation(own_returns, bench_returns, window)
 
-    async def _benchmark_correlated_exposure(
+    async def _correlated_exposure(
         self,
         positions: list[BrokerPosition],
-        benchmark_candles: list[Candle],
+        reference_candles: list[Candle],
         config: RiskConfiguration,
         equity: Decimal,
+        *,
+        use_abs: bool = False,
     ) -> Decimal:
-        """Fraction of equity held in positions that track the benchmark.
+        """Fraction of equity held in positions that track `reference_candles`.
 
         For each open position, correlate its own daily returns against the
-        benchmark; sum the value of those above the threshold. This is the real
-        "how much of the book is one S&P bet" measure the sizing reduction acts
+        reference series; sum the value of those above the threshold. This is the
+        real "how much of the book is one bet" measure the sizing reduction acts
         on, replacing the earlier gross-invested approximation.
+
+        The reference is the S&P benchmark for the market-beta check and the
+        rates proxy for the rate-sensitivity check. `use_abs` compares on
+        magnitude, which is what rates need: moving hard *against* yields is as
+        much a rates position as moving with them, whereas a holding that is
+        strongly negatively correlated to the market is genuine diversification
+        and must not be counted as concentration.
         """
-        if not benchmark_candles or equity <= 0:
+        if not reference_candles or equity <= 0:
             return Decimal(0)
-        bench = candles_to_series(benchmark_candles)
+        bench = candles_to_series(reference_candles)
         window = int(config.correlation_window_short)
         if bench.length < window + 1:
             return Decimal(0)
@@ -270,7 +308,7 @@ class RiskEngine:
                 continue
             series = candles_to_series(candles)
             corr = ind.rolling_correlation(ind.daily_returns(series.close), bench_returns, window)
-            if corr is not None and corr > threshold:
+            if corr is not None and (abs(corr) if use_abs else corr) > threshold:
                 price = position.current_price or position.average_price
                 correlated_value += position.quantity * price
         return correlated_value / equity

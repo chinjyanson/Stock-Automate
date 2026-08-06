@@ -57,6 +57,8 @@ class RiskConfigResponse(ORMModel):
     correlation_window_long: int
     correlation_threshold: SerializedDecimal
     max_portfolio_sp500_pct: SerializedDecimal
+    rate_proxy_symbol: str
+    max_portfolio_rate_sensitive_pct: SerializedDecimal
     trailing_stop_enabled: bool
     max_holding_days: int
     #: Persistent live ceilings (replacing the old per-session arming values).
@@ -84,6 +86,8 @@ class RiskConfigUpdate(BaseModel):
     correlation_window_long: int | None = None
     correlation_threshold: SerializedDecimal | None = None
     max_portfolio_sp500_pct: SerializedDecimal | None = None
+    rate_proxy_symbol: str | None = None
+    max_portfolio_rate_sensitive_pct: SerializedDecimal | None = None
     trailing_stop_enabled: bool | None = None
     max_holding_days: int | None = None
     max_live_capital: SerializedDecimal | None = None

@@ -116,6 +116,19 @@ class RiskConfiguration(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     #: portfolio, a new correlated position is reduced or rejected.
     max_portfolio_sp500_pct: Mapped[Any] = mapped_column(Ratio, nullable=False, default=0.50)
 
+    # -- Rate sensitivity ---------------------------------------------------
+    #: Bond *price* proxy for the rate-sensitivity check. Must not be a yield
+    #: series (^TNX and friends): yields move inversely to prices, so one would
+    #: invert every correlation's meaning without erroring.
+    rate_proxy_symbol: Mapped[str] = mapped_column(String(32), nullable=False, default="IEF")
+    #: When rate-sensitive exposure already exceeds this fraction of the
+    #: portfolio, a new rate-sensitive position is reduced. Measured on the
+    #: magnitude of the correlation — moving hard against yields is still a
+    #: rates bet.
+    max_portfolio_rate_sensitive_pct: Mapped[Any] = mapped_column(
+        Ratio, nullable=False, default=0.50
+    )
+
     #: Freeform extras so a limit can be added without a migration.
     extra: Mapped[dict[str, Any] | None] = mapped_column()
 

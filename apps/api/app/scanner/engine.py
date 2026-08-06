@@ -61,6 +61,12 @@ _SECTOR_ETF: dict[str, str] = {
     "Communication Services": "XLC",
 }
 
+#: Rate-sensitivity proxy: a 7-10 year Treasury *price* series. Deliberately an
+#: ETF and not a yield index like ^TNX — yields move inversely to bond prices, so
+#: a yield series would silently flip the sign of every correlation without
+#: erroring. Loaded once per run and shared by every instrument, like SPY.
+RATES_PROXY_SYMBOL = "IEF"
+
 
 @dataclass
 class ScanSummary:
@@ -123,6 +129,9 @@ class ScannerEngine:
             if run_config.benchmark_symbol
             else None
         )
+        # One load per run, shared by every instrument — the rate-sensitivity
+        # signal is a correlation against a series that is the same for all of them.
+        rates_series = await self._load_benchmark(RATES_PROXY_SYMBOL)
         # Each sector ETF is loaded at most once per run and reused across every
         # instrument in that sector (≤11 loads, not one per stock).
         sector_cache: dict[str, PriceSeries | None] = {}
@@ -130,7 +139,7 @@ class ScannerEngine:
         for instrument in instruments:
             try:
                 scored = await self._score_one(
-                    run, instrument, run_config, benchmark_series, sector_cache
+                    run, instrument, run_config, benchmark_series, rates_series, sector_cache
                 )
             except Exception as exc:
                 log.exception("scanner.instrument_failed", instrument_id=str(instrument.id))
@@ -191,6 +200,7 @@ class ScannerEngine:
         instrument: Instrument,
         run_config: RunConfig,
         benchmark: PriceSeries | None,
+        rates: PriceSeries | None,
         sector_cache: dict[str, PriceSeries | None],
     ) -> Classification | None:
         candles = await self._store.get_candles(
@@ -211,6 +221,7 @@ class ScannerEngine:
             thresholds=run_config.thresholds,
             benchmark=benchmark,
             sector=sector_series,
+            rates=rates,
             fundamentals=fundamentals,
         )
 

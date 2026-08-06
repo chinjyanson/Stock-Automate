@@ -46,6 +46,16 @@ DEFAULT_WEIGHTS: dict[str, float] = {
 
 DEFAULT_THRESHOLDS: dict[str, float] = {"screening": 75.0, "watchlist": 60.0}
 
+#: Window for the rate-sensitivity and beta reads. Matches the risk engine's
+#: `correlation_window_short` default so the scanner and the sizing stage are
+#: talking about the same period.
+RATE_CORRELATION_WINDOW = 60
+
+#: Absolute rate correlation at which the rate-sensitivity signal scores zero.
+#: Set at the risk engine's `correlation_threshold` default: past this point a
+#: holding is more a bet on bond yields than on the company.
+RATE_CORRELATION_BAD_AT = 0.80
+
 # -- Final-score factor weights. Fundamentals-first: intrinsic value + P/E lead,
 # with price cheapness and the reversal/quality/sector signals in support. Sum to
 # 1.0; a missing factor drops out and the rest re-normalise (see combine_final_score).
@@ -218,6 +228,7 @@ def score_series(
     thresholds: dict[str, float] | None = None,
     benchmark: PriceSeries | None = None,
     sector: PriceSeries | None = None,
+    rates: PriceSeries | None = None,
     fundamentals: dict[str, Decimal | None] | None = None,
 ) -> ScoreResult:
     """Score one instrument's series. Pure — no I/O, fully deterministic.
@@ -227,6 +238,11 @@ def score_series(
     signal, and a dedicated `sector` category measuring the industry's own
     health. Absent (untagged instrument, or a sector with no proxy) it drops out
     with no penalty, exactly like `benchmark`.
+
+    `rates` is the bond-price proxy for the rate-sensitivity risk signal. It
+    must be a *price* series, not a yield series — yields move inversely to
+    prices, so passing one would silently invert the correlation's meaning.
+    Absent, the signal drops out with no penalty like the rest.
     """
     weights = weights or DEFAULT_WEIGHTS
     thresholds = thresholds or DEFAULT_THRESHOLDS
@@ -236,7 +252,7 @@ def score_series(
 
     trend = _score_trend(series, closes, metrics)
     momentum = _score_momentum(closes, benchmark, sector, metrics)
-    risk = _score_risk(closes, metrics)
+    risk = _score_risk(closes, rates, metrics)
     liquidity = _score_liquidity(closes, volumes, metrics)
     positioning = _score_positioning(closes, metrics)
     sector_signals = _score_sector(closes, sector, metrics)
@@ -508,6 +524,14 @@ def _score_momentum(
         )
 
     if benchmark is not None:
+        # CAPM beta against the market benchmark. Reported, never scored: a high
+        # beta is not by itself good or bad, and the risk engine already sizes
+        # against volatility directly. It earns a signal only if it proves out.
+        metrics["beta_vs_benchmark"] = ind.beta(
+            ind.daily_returns(closes),
+            ind.daily_returns(benchmark.preferred_close),
+            RATE_CORRELATION_WINDOW,
+        )
         rel = ind.relative_momentum(closes, benchmark.preferred_close, ind.TRADING_DAYS_PER_YEAR)
         metrics["relative_momentum_12m"] = rel
         if rel is None:
@@ -553,7 +577,7 @@ def _score_momentum(
     return signals
 
 
-def _score_risk(closes: Any, metrics: dict[str, Any]) -> list[SubSignal]:
+def _score_risk(closes: Any, rates: PriceSeries | None, metrics: dict[str, Any]) -> list[SubSignal]:
     vol20 = ind.annualised_volatility(closes, 20)
     vol60 = ind.annualised_volatility(closes, 60)
     dd = ind.max_drawdown(closes, ind.TRADING_DAYS_PER_YEAR)
@@ -590,6 +614,40 @@ def _score_risk(closes: Any, metrics: dict[str, Any]) -> list[SubSignal]:
     signals.append(_inverse("max_drawdown_1y", dd, 0.50, "1-year max drawdown"))
     signals.append(_inverse("downside_deviation_60d", downside, 0.40, "downside deviation"))
     signals.append(_inverse("largest_daily_loss_1y", worst, 0.20, "largest 1-day loss"))
+
+    # Rate sensitivity. Scored in the *risk* category because a holding that
+    # tracks bond yields carries a macro exposure the other risk measures cannot
+    # see — a low-volatility REIT and a low-volatility staples name look alike on
+    # drawdown and deviation, and behave nothing alike when yields move.
+    #
+    # Magnitude, not direction: a strongly *negatively* rate-correlated holding
+    # is just as much a bet on rates as a positively correlated one, so the
+    # signal is symmetric around zero. Independence from rates scores high.
+    rate_corr = (
+        ind.rolling_correlation(
+            ind.daily_returns(closes),
+            ind.daily_returns(rates.preferred_close),
+            RATE_CORRELATION_WINDOW,
+        )
+        if rates is not None
+        else None
+    )
+    metrics["rate_correlation_60d"] = rate_corr
+    if rate_corr is None:
+        # No rates proxy ingested yet, or too little history to correlate. Drops
+        # out of the category average rather than scoring zero.
+        signals.append(SubSignal("rate_sensitivity", False))
+    else:
+        strength = _clamp01(1.0 - abs(rate_corr) / RATE_CORRELATION_BAD_AT)
+        signals.append(
+            SubSignal(
+                "rate_sensitivity",
+                True,
+                strength,
+                f"60-day correlation to rates is {rate_corr:+.2f}",
+                positive=strength >= 0.5,
+            )
+        )
     return signals
 
 

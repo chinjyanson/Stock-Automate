@@ -40,6 +40,24 @@ def _falling_series(n: int = 300, start: float = 100.0, daily: float = -0.002) -
     return _series_from_closes(closes)
 
 
+def _series_from_returns(pattern: list[float], n: int, start: float = 100.0) -> PriceSeries:
+    """A series whose daily returns cycle through `pattern`.
+
+    Lets a test state a correlation exactly rather than approximately: two
+    repeating patterns over a whole number of cycles correlate to a known value.
+    """
+    closes = [start]
+    for i in range(n):
+        closes.append(closes[-1] * (1 + pattern[i % len(pattern)]))
+    return _series_from_closes(closes)
+
+
+def _rate_signal(closes: np.ndarray, rates: PriceSeries) -> scoring.SubSignal:
+    """The `rate_sensitivity` sub-signal alone, out of the risk category."""
+    signals = scoring._score_risk(closes, rates, {})
+    return next(s for s in signals if s.name == "rate_sensitivity")
+
+
 class TestScoreRange:
     def test_score_is_within_zero_to_one_hundred(self) -> None:
         result = scoring.score_series(_rising_series())
@@ -134,6 +152,57 @@ class TestMissingDataDoesNotPenalise:
         )
         assert result.fundamental_score is not None
         assert result.fundamental_score > 0
+
+
+class TestRateSensitivity:
+    """Rate sensitivity is a *risk* signal measured on magnitude, not direction.
+
+    A holding that moves hard against yields is as much a bet on rates as one
+    that moves with them, so the signal has to be symmetric about zero. Getting
+    that wrong would let a book load up on one side of the trade unchallenged.
+    """
+
+    def test_absent_rates_leave_the_risk_category_untouched(self) -> None:
+        """The regression guard on the existing tuning.
+
+        Adding a sub-signal must not move the category when its data is missing
+        — `_category_points` averages over *available* signals, so the new slot
+        has to drop out entirely rather than score zero.
+        """
+        closes = _rising_series().preferred_close
+        with_slot = scoring._score_risk(closes, None, {})
+        without_slot = [s for s in with_slot if s.name != "rate_sensitivity"]
+        assert scoring._category_points(with_slot, 15.0, "risk").points == pytest.approx(
+            scoring._category_points(without_slot, 15.0, "risk").points
+        )
+
+    def test_absent_rates_marks_the_signal_unavailable(self) -> None:
+        result = scoring.score_series(_rising_series())
+        assert "rate_sensitivity" in result.missing_information
+
+    def test_a_rate_tracking_stock_scores_zero_strength(self) -> None:
+        rates = _series_from_returns([0.01, 0.01, -0.01, -0.01], n=80)
+        signal = _rate_signal(rates.preferred_close, rates)
+        assert signal.available
+        assert signal.value == pytest.approx(0.0)
+
+    def test_moving_against_rates_is_penalised_the_same_as_moving_with_them(self) -> None:
+        """Symmetry. An inverse rates bet is still a rates bet."""
+        rates = _series_from_returns([0.01, 0.01, -0.01, -0.01], n=80)
+        mirror = _series_from_returns([-0.01, -0.01, 0.01, 0.01], n=80)
+        with_rates = _rate_signal(rates.preferred_close, rates)
+        against_rates = _rate_signal(mirror.preferred_close, rates)
+        assert against_rates.value == pytest.approx(with_rates.value)
+
+    def test_an_uncorrelated_stock_scores_full_strength(self) -> None:
+        # Orthogonal repeating patterns: over any whole number of 4-bar cycles
+        # the correlation is exactly zero.
+        rates = _series_from_returns([0.01, 0.01, -0.01, -0.01], n=80)
+        stock = _series_from_returns([0.01, -0.01, 0.01, -0.01], n=80)
+        signal = _rate_signal(stock.preferred_close, rates)
+        assert signal.available
+        assert signal.value == pytest.approx(1.0)
+        assert signal.positive
 
 
 class TestConfidenceAndCompleteness:

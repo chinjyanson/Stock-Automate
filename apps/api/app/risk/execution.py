@@ -163,8 +163,9 @@ class ExecutionService:
             instrument.id, Interval.D1, limit=250, closed_only=True
         )
         benchmark = (
-            await self._benchmark_candles(config.correlation_benchmark_symbol) if config else None
+            await self._reference_candles(config.correlation_benchmark_symbol) if config else None
         )
+        rates = await self._reference_candles(config.rate_proxy_symbol) if config else None
 
         # For live, the affirmed capital ceiling bounds sizing for this session.
         equity_ceiling = await self._live_equity_ceiling()
@@ -176,6 +177,7 @@ class ExecutionService:
             positions=positions,
             candles=candles,
             benchmark_candles=benchmark,
+            rates_candles=rates,
             broker=self._broker_kind,
             equity_ceiling=equity_ceiling,
         )
@@ -359,12 +361,13 @@ class ExecutionService:
             .first()
         )
 
-    async def _benchmark_candles(self, symbol: str) -> list[Candle] | None:
-        """Best-effort benchmark candles for the correlation filter.
+    async def _reference_candles(self, symbol: str) -> list[Candle] | None:
+        """Best-effort candles for a correlation reference series.
 
-        Resolved by exchange ticker. Absent benchmark data disables the
-        correlation reduction (it cannot fabricate a correlation) but never
-        blocks the trade — the reduction only ever *tightens* sizing.
+        Used for both the market benchmark and the rates proxy. Resolved by
+        exchange ticker. Absent data disables that reduction (it cannot
+        fabricate a correlation) but never blocks the trade — the reduction only
+        ever *tightens* sizing.
         """
         instrument = (
             await self._session.execute(

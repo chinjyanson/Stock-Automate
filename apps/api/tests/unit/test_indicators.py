@@ -230,6 +230,31 @@ class TestCorrelation:
         assert ind.rolling_correlation(a, flat, 5) is None
 
 
+class TestBeta:
+    def test_beta_against_itself_is_one(self) -> None:
+        a = np.array([0.01, -0.02, 0.03, -0.01, 0.02])
+        assert ind.beta(a, a, 5) == pytest.approx(1.0)
+
+    def test_beta_of_a_doubled_series_is_two(self) -> None:
+        # Same shape, twice the amplitude: correlation 1, twice the deviation.
+        b = np.array([0.01, -0.02, 0.03, -0.01, 0.02])
+        assert ind.beta(b * 2, b, 5) == pytest.approx(2.0)
+
+    def test_beta_is_negative_when_the_series_move_against_each_other(self) -> None:
+        b = np.array([0.01, -0.02, 0.03, -0.01, 0.02])
+        assert ind.beta(-b, b, 5) == pytest.approx(-1.0)
+
+    def test_beta_none_when_the_reference_is_flat(self) -> None:
+        # No benchmark variance means the regression slope is undefined — the
+        # answer is "unknown", never 0.0.
+        a = np.array([0.01, -0.02, 0.03, -0.01, 0.02])
+        assert ind.beta(a, np.zeros(5), 5) is None
+
+    def test_beta_none_when_insufficient_history(self) -> None:
+        a = np.array([0.01, -0.02, 0.03])
+        assert ind.beta(a, a, 60) is None
+
+
 class TestSlope:
     def test_rising_average_has_positive_slope(self) -> None:
         closes = np.arange(1.0, 60.0)  # steadily rising

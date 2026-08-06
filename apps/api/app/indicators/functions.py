@@ -378,3 +378,28 @@ def rolling_correlation(returns_a: FloatArray, returns_b: FloatArray, period: in
     if np.std(a) == 0 or np.std(b) == 0:
         return None
     return float(np.corrcoef(a, b)[0, 1])
+
+
+def beta(returns_a: FloatArray, returns_b: FloatArray, period: int) -> float | None:
+    """Sensitivity of A's returns to B's over the last `period` bars (CAPM beta).
+
+    `corr(a, b) * std(a) / std(b)` — the slope of a regression of A on B. 1.0
+    means A moves one-for-one with B, 2.0 twice as hard, negative means it moves
+    against it. Correlation says whether two series move together; beta says by
+    how much, which is the part position sizing cares about.
+
+    None when either series is too short, or when B has no variance and the
+    slope is therefore undefined.
+    """
+    a = _clean(returns_a)
+    b = _clean(returns_b)
+    if min(a.size, b.size) < period:
+        return None
+    a, b = a[-period:], b[-period:]
+    std_b = float(np.std(b))
+    if std_b == 0:
+        return None
+    corr = rolling_correlation(a, b, period)
+    if corr is None:
+        return None
+    return float(corr * float(np.std(a)) / std_b)

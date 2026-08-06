@@ -49,6 +49,14 @@ SECTOR_ETFS: dict[str, str] = {
     "XLC": "Communication Services Select Sector SPDR Fund",
 }
 
+#: Rate-sensitivity proxy for the scanner's risk category. A bond *price* series,
+#: deliberately not a yield index — see `scanner.engine.RATES_PROXY_SYMBOL`.
+RATES_PROXY_ETFS: dict[str, str] = {"IEF": "iShares 7-10 Year Treasury Bond ETF"}
+
+#: Every ETF seeded as a shared reference series for scoring. None is ever a
+#: trade candidate; they exist so the daily refresh keeps them fresh.
+REFERENCE_ETFS: dict[str, str] = {**SECTOR_ETFS, **RATES_PROXY_ETFS}
+
 _ETF_BACKFILL_DAYS = 500
 _UNCLASSIFIED = "Unclassified"
 
@@ -133,10 +141,14 @@ class EnrichmentService:
         return result
 
     async def ensure_sector_etfs(self, provider: YFinanceProvider) -> dict[str, int]:
-        """Create + candle-backfill the 11 sector ETFs. Idempotent."""
+        """Create + candle-backfill the reference ETFs. Idempotent.
+
+        The 11 SPDR sector proxies plus the rates proxy — every series the
+        scanner correlates an instrument against, other than the SPY benchmark.
+        """
         created = 0
         candles = 0
-        for symbol, name in SECTOR_ETFS.items():
+        for symbol, name in REFERENCE_ETFS.items():
             instrument = (
                 (
                     await self._session.execute(

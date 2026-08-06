@@ -8,9 +8,10 @@ active halt, or stale data.
 
 from __future__ import annotations
 
+import itertools
 import uuid
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 import pytest
 from sqlalchemy import select
@@ -36,6 +37,26 @@ pytestmark = pytest.mark.asyncio
 
 async def _rising_instrument(db: object, ticker: str) -> Instrument:
     """An instrument with a 130-bar rising daily series (correlated to any other)."""
+    return await _instrument_with_closes(db, ticker, [80 + i * 0.5 for i in range(130)])
+
+
+async def _inverse_instrument(db: object, ticker: str, of: list[float]) -> Instrument:
+    """An instrument whose daily returns are exactly the negative of `of`'s.
+
+    Correlation -1 by construction, so a test can state "moves against" without
+    depending on how a falling ramp happens to correlate with a rising one.
+    """
+    closes = [of[0]]
+    for previous, current in itertools.pairwise(of):
+        closes.append(closes[-1] * (1 - (current / previous - 1.0)))
+    return await _instrument_with_closes(db, ticker, closes)
+
+
+def _rising_closes() -> list[float]:
+    return [80 + i * 0.5 for i in range(130)]
+
+
+async def _instrument_with_closes(db: object, ticker: str, closes: list[float]) -> Instrument:
     exchange = (
         await db.execute(select(Exchange).where(Exchange.mic == "XNAS"))  # type: ignore[attr-defined]
     ).scalar_one_or_none()
@@ -56,7 +77,6 @@ async def _rising_instrument(db: object, ticker: str) -> Instrument:
     await db.flush()  # type: ignore[attr-defined]
 
     now = datetime.now(UTC).replace(second=0, microsecond=0)
-    closes = [80 + i * 0.5 for i in range(130)]
     candles = [
         CandleDTO(
             symbol=ticker,
@@ -231,3 +251,92 @@ class TestCorrelation:
         assert not decision.rejected
         assert decision.correlation is not None and decision.correlation > 0.8
         assert "correlation_reduction" in decision.applied_caps
+
+
+class TestRateSensitivity:
+    """The other way a book quietly becomes one bet.
+
+    A portfolio of REITs, utilities and long-duration growth passes the sector
+    and benchmark checks and is still a single position on bond yields.
+    """
+
+    async def _book(self, db: object) -> tuple[Instrument, BrokerPosition]:
+        held = await _rising_instrument(db, "HELD")
+        candidate = await _rising_instrument(db, "CAND")
+        # ~14.5k of a 100k book — above a 10% limit.
+        return candidate, BrokerPosition(
+            broker_ticker=str(held.id),
+            quantity=Decimal("100"),
+            average_price=Decimal("145"),
+            current_price=Decimal("145"),
+        )
+
+    async def test_a_rate_sensitive_book_cuts_the_size(self, db: object) -> None:
+        rates = await _rising_instrument(db, "IEF")
+        candidate, position = await self._book(db)
+        config = await _seed_config(db, max_portfolio_rate_sensitive_pct=Decimal("0.10"))
+
+        decision = await RiskEngine(db).evaluate(  # type: ignore[arg-type]
+            instrument=candidate,
+            config=config,
+            account=_account(),
+            positions=[position],
+            candles=await _candles(db, candidate),
+            rates_candles=await _candles(db, rates),
+        )
+        assert not decision.rejected
+        assert decision.rate_correlation is not None and decision.rate_correlation > 0.8
+        assert "rate_correlation_reduction" in decision.applied_caps
+
+    async def test_moving_against_rates_still_counts_as_a_rates_bet(self, db: object) -> None:
+        """Magnitude, not direction — the reason the rates gate uses abs()."""
+        rates = await _inverse_instrument(db, "IEF", _rising_closes())
+        candidate, position = await self._book(db)
+        config = await _seed_config(db, max_portfolio_rate_sensitive_pct=Decimal("0.10"))
+
+        decision = await RiskEngine(db).evaluate(  # type: ignore[arg-type]
+            instrument=candidate,
+            config=config,
+            account=_account(),
+            positions=[position],
+            candles=await _candles(db, candidate),
+            rates_candles=await _candles(db, rates),
+        )
+        assert decision.rate_correlation is not None and decision.rate_correlation < -0.8
+        assert "rate_correlation_reduction" in decision.applied_caps
+
+    async def test_both_gates_firing_cut_the_size_once_not_twice(self, db: object) -> None:
+        """Two x0.5 multipliers would give x0.25, which neither rule intends."""
+        benchmark = await _rising_instrument(db, "SPY")
+        rates = await _rising_instrument(db, "IEF")
+        candidate, position = await self._book(db)
+        config = await _seed_config(
+            db,
+            max_portfolio_sp500_pct=Decimal("0.10"),
+            max_portfolio_rate_sensitive_pct=Decimal("0.10"),
+        )
+        candles = await _candles(db, candidate)
+
+        baseline = await RiskEngine(db).evaluate(  # type: ignore[arg-type]
+            instrument=candidate,
+            config=config,
+            account=_account(),
+            positions=[position],
+            candles=candles,
+        )
+        both = await RiskEngine(db).evaluate(  # type: ignore[arg-type]
+            instrument=candidate,
+            config=config,
+            account=_account(),
+            positions=[position],
+            candles=candles,
+            benchmark_candles=await _candles(db, benchmark),
+            rates_candles=await _candles(db, rates),
+        )
+        # Both gates are reported, so the audit trail shows the full reason...
+        assert "correlation_reduction" in both.applied_caps
+        assert "rate_correlation_reduction" in both.applied_caps
+        # ...but the size was cut exactly once.
+        assert both.approved_quantity == (baseline.approved_quantity * Decimal("0.5")).quantize(
+            QUANTITY_STEP, rounding=ROUND_DOWN
+        )
