@@ -56,6 +56,14 @@ def _rising_closes() -> list[float]:
     return [80 + i * 0.5 for i in range(130)]
 
 
+async def _volatile_instrument(db: object, ticker: str) -> Instrument:
+    """An instrument that swings ~8% a day — a real drawdown risk in a book."""
+    closes = [100.0]
+    for i in range(129):
+        closes.append(closes[-1] * (1.08 if i % 2 == 0 else 1 / 1.08))
+    return await _instrument_with_closes(db, ticker, closes)
+
+
 async def _instrument_with_closes(db: object, ticker: str, closes: list[float]) -> Instrument:
     exchange = (
         await db.execute(select(Exchange).where(Exchange.mic == "XNAS"))  # type: ignore[attr-defined]
@@ -251,6 +259,109 @@ class TestCorrelation:
         assert not decision.rejected
         assert decision.correlation is not None and decision.correlation > 0.8
         assert "correlation_reduction" in decision.applied_caps
+
+
+class TestStressDrawdown:
+    """The whole-book cap.
+
+    Every other cap sizes this position against this position. This one asks
+    what the portfolio does in a bad month — the only cap that can see a book
+    whose positions are individually reasonable and collectively not.
+    """
+
+    async def _volatile_book(self, db: object) -> tuple[Instrument, BrokerPosition]:
+        held = await _volatile_instrument(db, "SWING")
+        candidate = await _volatile_instrument(db, "CAND")
+        return candidate, BrokerPosition(
+            broker_ticker=str(held.id),
+            quantity=Decimal("100"),
+            average_price=Decimal("145"),
+            current_price=Decimal("145"),
+        )
+
+    async def test_a_book_past_its_drawdown_limit_takes_no_new_position(self, db: object) -> None:
+        candidate, position = await self._volatile_book(db)
+        config = await _seed_config(db, max_portfolio_drawdown_pct=Decimal("0.001"))
+
+        decision = await RiskEngine(db).evaluate(  # type: ignore[arg-type]
+            instrument=candidate,
+            config=config,
+            account=_account(),
+            positions=[position],
+            candles=await _candles(db, candidate),
+        )
+        # Shrinking the candidate cannot fix a book that already breaches, so
+        # the answer is to add nothing to it — stated as a reason, not a silent skip.
+        assert decision.rejected
+        assert decision.reason is not None and "stress_drawdown" in decision.reason
+
+    async def test_a_generous_limit_lets_the_same_book_trade(self, db: object) -> None:
+        """Proves it was the stress cap that bound, not the volatility."""
+        candidate, position = await self._volatile_book(db)
+        config = await _seed_config(db, max_portfolio_drawdown_pct=Decimal("1.0"))
+
+        decision = await RiskEngine(db).evaluate(  # type: ignore[arg-type]
+            instrument=candidate,
+            config=config,
+            account=_account(),
+            positions=[position],
+            candles=await _candles(db, candidate),
+        )
+        assert not decision.rejected
+        assert decision.approved_quantity > 0
+        assert "stress_drawdown" not in decision.applied_caps
+
+    async def test_the_stressed_loss_is_reported(self, db: object) -> None:
+        candidate, position = await self._volatile_book(db)
+        config = await _seed_config(db, max_portfolio_drawdown_pct=Decimal("1.0"))
+
+        decision = await RiskEngine(db).evaluate(  # type: ignore[arg-type]
+            instrument=candidate,
+            config=config,
+            account=_account(),
+            positions=[position],
+            candles=await _candles(db, candidate),
+        )
+        assert decision.stress_loss_pct is not None
+        assert decision.stress_loss_pct > 0
+
+    async def test_an_empty_book_is_never_stress_capped(
+        self, db: object, candled_instrument: Instrument
+    ) -> None:
+        """Nothing held means nothing to stress — the cap must drop out, not zero."""
+        config = await _seed_config(db)
+        decision = await RiskEngine(db).evaluate(  # type: ignore[arg-type]
+            instrument=candled_instrument,
+            config=config,
+            account=_account(),
+            positions=[],
+            candles=await _candles(db, candled_instrument),
+        )
+        assert not decision.rejected
+        assert "stress_drawdown" not in decision.applied_caps
+
+    async def test_a_position_with_too_little_history_does_not_block_the_trade(
+        self, db: object
+    ) -> None:
+        """Unmeasurable is not zero. A short series drops out of the simulation."""
+        short = await _instrument_with_closes(db, "SHORT", [100.0 + i for i in range(25)])
+        candidate = await _rising_instrument(db, "CAND")
+        position = BrokerPosition(
+            broker_ticker=str(short.id),
+            quantity=Decimal("100"),
+            average_price=Decimal("100"),
+            current_price=Decimal("100"),
+        )
+        config = await _seed_config(db, max_portfolio_drawdown_pct=Decimal("0.001"))
+
+        decision = await RiskEngine(db).evaluate(  # type: ignore[arg-type]
+            instrument=candidate,
+            config=config,
+            account=_account(),
+            positions=[position],
+            candles=await _candles(db, candidate),
+        )
+        assert not decision.rejected
 
 
 class TestRateSensitivity:

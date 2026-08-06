@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_DOWN, Decimal
 
+import numpy as np
 import structlog
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,11 +23,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.broker.types import BrokerAccount, BrokerPosition
 from app.data.store import CandleStore
 from app.indicators import functions as ind
-from app.indicators.series import candles_to_series
+from app.indicators.functions import FloatArray
+from app.indicators.series import PriceSeries, candles_to_series
 from app.models.enums import BrokerKind, Interval, TradeIntentStatus
 from app.models.instrument import Instrument
 from app.models.market_data import Candle
 from app.models.risk import RiskConfiguration, TradeIntent
+from app.risk import stress
 from app.risk.halts import HaltService
 from app.services.market_regime import MarketRegimeService
 
@@ -44,6 +47,25 @@ QUANTITY_STEP = Decimal("0.00000001")
 #: benchmark exposure. A reduction, not a warning — it must change the order.
 CORRELATION_REDUCTION = Decimal("0.5")
 
+#: Daily bars loaded per held position for the whole-book stress test. A year is
+#: enough to include a drawdown or two without making the resample a survey of
+#: ancient history the current book has nothing to do with.
+STRESS_HISTORY_BARS = 260
+
+#: Key the candidate is filed under while it is simulated alongside the book. A
+#: UUID is never this, so it cannot collide with a real instrument id.
+_CANDIDATE_KEY = "candidate"
+
+#: Fixed seed for the stress simulation. The same book must reach the same
+#: verdict every time it is evaluated — a position approved on one run and cut on
+#: the next, with nothing changed but the draw, would be impossible to audit or
+#: to tune against.
+STRESS_SEED = 20260806
+
+
+def _stress_rng() -> np.random.Generator:
+    return np.random.default_rng(STRESS_SEED)
+
 
 @dataclass
 class RiskDecision:
@@ -58,6 +80,9 @@ class RiskDecision:
     applied_caps: list[str] = field(default_factory=list)
     correlation: float | None = None
     rate_correlation: float | None = None
+    #: Simulated 20-day tail loss of the whole book with this position added,
+    #: as a positive fraction. None when it could not be measured.
+    stress_loss_pct: float | None = None
 
     @classmethod
     def reject(cls, reason: str) -> RiskDecision:
@@ -176,6 +201,26 @@ class RiskEngine:
         if config.monetary_position_cap is not None:
             caps["monetary_cap"] = Decimal(str(config.monetary_position_cap)) / entry_price
 
+        # Total market exposure. Previously modelled and documented but never
+        # enforced, so `docs/risk-model.md` claimed a bound that did not exist.
+        invested = sum(
+            (p.quantity * (p.current_price or p.average_price) for p in positions),
+            start=Decimal(0),
+        )
+        exposure_room = equity * Decimal(str(config.max_portfolio_exposure_pct)) - invested
+        caps["max_portfolio_exposure_pct"] = max(exposure_room, Decimal(0)) / entry_price
+
+        # Whole-book stress. Every cap above sizes this position against this
+        # position; this one asks what the *portfolio* does in a bad month with
+        # the candidate added, which is the only cap that can see six positions
+        # that are really one bet. Absent when it cannot be computed, in which
+        # case it simply does not participate.
+        stress_cap, stress_loss_pct = await self._stress_cap(
+            positions, series, entry_price, equity, config, raw_quantity
+        )
+        if stress_cap is not None:
+            caps["stress_drawdown"] = stress_cap
+
         # The binding cap is the smallest allowance.
         binding_cap = min(caps, key=lambda k: caps[k])
         quantity = caps[binding_cap]
@@ -243,6 +288,7 @@ class RiskEngine:
             applied_caps=applied_caps,
             correlation=correlation,
             rate_correlation=rate_correlation,
+            stress_loss_pct=stress_loss_pct,
         )
 
     # -- Helpers -----------------------------------------------------------
@@ -312,6 +358,69 @@ class RiskEngine:
                 price = position.current_price or position.average_price
                 correlated_value += position.quantity * price
         return correlated_value / equity
+
+    async def _stress_cap(
+        self,
+        positions: list[BrokerPosition],
+        candidate: PriceSeries,
+        entry_price: Decimal,
+        equity: Decimal,
+        config: RiskConfiguration,
+        proposed_quantity: Decimal,
+    ) -> tuple[Decimal | None, float | None]:
+        """Largest quantity that keeps the whole book inside its drawdown limit.
+
+        Returns `(cap, stressed_loss)`, either of which may be None. A None cap
+        means the stress test did not bind — because it could not be computed
+        (no positions, too little history) or because the book is comfortably
+        inside the limit. It never means zero: an unmeasurable stress must not
+        silently block a trade.
+
+        A cap of exactly zero *is* meaningful, and is returned when the existing
+        book already breaches the limit on its own. Shrinking the candidate
+        cannot fix that, so the right answer is to add nothing to it.
+        """
+        limit = float(config.max_portfolio_drawdown_pct)
+        if limit <= 0 or equity <= 0:
+            return None, None
+
+        returns: dict[str, FloatArray] = {}
+        weights: dict[str, float] = {}
+        for position in positions:
+            if position.quantity <= 0:
+                continue
+            try:
+                instrument_id = uuid.UUID(position.broker_ticker)
+            except ValueError:
+                continue  # non-paper venues key by ticker, not instrument id
+            candles = await self._store.get_candles(
+                instrument_id, Interval.D1, limit=STRESS_HISTORY_BARS, closed_only=True
+            )
+            if len(candles) < stress.MIN_RETURNS + 1:
+                continue
+            key = str(instrument_id)
+            returns[key] = ind.daily_returns(candles_to_series(candles).close)
+            price = position.current_price or position.average_price
+            weights[key] = float(position.quantity * price / equity)
+
+        held = stress.bootstrap_stress(returns, weights, rng=_stress_rng())
+        if held is not None and held.portfolio_loss_pct >= limit:
+            # Already over the limit before this trade. Nothing to allocate.
+            return Decimal(0), held.portfolio_loss_pct
+
+        # Add the candidate at its proposed size and re-measure.
+        candidate_weight = float(proposed_quantity * entry_price / equity)
+        returns[_CANDIDATE_KEY] = ind.daily_returns(candidate.close)
+        weights[_CANDIDATE_KEY] = candidate_weight
+        result = stress.bootstrap_stress(returns, weights, rng=_stress_rng())
+        if result is None:
+            return None, held.portfolio_loss_pct if held else None
+        if result.portfolio_loss_pct <= limit:
+            return None, result.portfolio_loss_pct
+        return (
+            stress.drawdown_scaled_quantity(proposed_quantity, result.portfolio_loss_pct, limit),
+            result.portfolio_loss_pct,
+        )
 
     async def _open_risk(self, broker: BrokerKind) -> Decimal:
         """Sum of (entry - stop) * filled_qty across open, stopped intents."""
