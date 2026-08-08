@@ -519,6 +519,7 @@ class YFinanceProvider(MarketDataProvider):
             earnings_growth=_to_decimal(info.get("earningsGrowth")),
             profit_margin=_to_decimal(info.get("profitMargins")),
             debt_to_equity=_to_decimal(info.get("debtToEquity")),
+            **_statement_fields(info),
             raw={},
         )
 
@@ -564,6 +565,7 @@ class YFinanceProvider(MarketDataProvider):
             earnings_growth=_to_decimal(info.get("earningsGrowth")),
             profit_margin=_to_decimal(info.get("profitMargins")),
             debt_to_equity=_to_decimal(info.get("debtToEquity")),
+            **_statement_fields(info),
             raw={},
         )
         return sector, industry, fundamentals
@@ -575,6 +577,40 @@ class YFinanceProvider(MarketDataProvider):
             return bool(info.get("symbol"))
         except Exception:
             return False
+
+
+def _statement_fields(info: dict[str, Any]) -> dict[str, Decimal | None]:
+    """Cash-flow and balance-sheet items, read from the `.info` payload.
+
+    Read here rather than from `.cashflow` / `.balance_sheet` on purpose. Those
+    are two *additional* network requests per symbol, and against a catalogue
+    scanned in batches of hundreds that is thousands of extra calls a day
+    against a free tier. `.info` is a single request the enrichment sweep is
+    already making for the sector and the P/E, and it carries every field below.
+
+    Measured before choosing: across AAPL, SHEL.L, VOD.L, ULVR.L and SAP.DE —
+    US, UK and German listings — all ten fields were present in `.info` for all
+    five. That is a small sample and coverage will be thinner in the long tail,
+    which is exactly why every field stays nullable and absence means unknown.
+
+    The one thing `.info` cannot give is *history*: the statement frames carry
+    four or five annual periods, and a growth-rate estimate for a DCF would want
+    them. That is a reason to fetch statements for a curated shortlist if a DCF
+    is ever built, not a reason to fetch them for the whole universe now — and
+    this table accumulates its own history one `as_of` at a time regardless.
+    """
+    return {
+        "free_cash_flow": _to_decimal(info.get("freeCashflow")),
+        "operating_cash_flow": _to_decimal(info.get("operatingCashflow")),
+        "total_debt": _to_decimal(info.get("totalDebt")),
+        "total_cash": _to_decimal(info.get("totalCash")),
+        "shares_outstanding": _to_decimal(info.get("sharesOutstanding")),
+        "ebitda": _to_decimal(info.get("ebitda")),
+        "enterprise_value": _to_decimal(info.get("enterpriseValue")),
+        "book_value_per_share": _to_decimal(info.get("bookValue")),
+        "return_on_equity": _to_decimal(info.get("returnOnEquity")),
+        "current_ratio": _to_decimal(info.get("currentRatio")),
+    }
 
 
 def _index_to_utc(index: Any, interval: Interval) -> datetime | None:

@@ -89,6 +89,11 @@ class ProviderKind(StrEnum):
     YFINANCE = "yfinance"
     TWELVE_DATA = "twelve_data"
     EODHD = "eodhd"
+    #: News headlines for the sentiment signal. Never a source of candles or
+    #: quotes, so it is absent from the market-data provider chains — it appears
+    #: here so its spend has a row in the credit ledger like every other
+    #: metered source.
+    FINNHUB = "finnhub"
     MOCK = "mock"
 
 

@@ -71,6 +71,7 @@ from app.models.scanner import (
     ScannerRunStatus,
     TradeProposal,
 )
+from app.models.sentiment import SentimentSnapshot
 from app.models.strategy import (
     StrategyConfiguration,
     StrategyDecision,
@@ -138,6 +139,7 @@ __all__ = [
     "ScannerResult",
     "ScannerRun",
     "ScannerRunStatus",
+    "SentimentSnapshot",
     "StrategyConfiguration",
     "StrategyDecision",
     "StrategyDecisionOutcome",

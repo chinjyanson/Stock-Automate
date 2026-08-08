@@ -54,8 +54,15 @@ def _series_from_returns(pattern: list[float], n: int, start: float = 100.0) -> 
 
 def _rate_signal(closes: np.ndarray, rates: PriceSeries) -> scoring.SubSignal:
     """The `rate_sensitivity` sub-signal alone, out of the risk category."""
-    signals = scoring._score_risk(closes, rates, {})
+    signals = scoring._score_risk(closes, rates, None, {})
     return next(s for s in signals if s.name == "rate_sensitivity")
+
+
+def _sentiment_signal(polarity: float) -> scoring.SubSignal:
+    """The `news_sentiment` sub-signal alone, out of the risk category."""
+    closes = _rising_series().preferred_close
+    signals = scoring._score_risk(closes, None, polarity, {})
+    return next(s for s in signals if s.name == "news_sentiment")
 
 
 class TestScoreRange:
@@ -170,7 +177,7 @@ class TestRateSensitivity:
         has to drop out entirely rather than score zero.
         """
         closes = _rising_series().preferred_close
-        with_slot = scoring._score_risk(closes, None, {})
+        with_slot = scoring._score_risk(closes, None, None, {})
         without_slot = [s for s in with_slot if s.name != "rate_sensitivity"]
         assert scoring._category_points(with_slot, 15.0, "risk").points == pytest.approx(
             scoring._category_points(without_slot, 15.0, "risk").points
@@ -205,6 +212,70 @@ class TestRateSensitivity:
         assert signal.positive
 
 
+class TestNewsSentiment:
+    """News tone enters as one sub-signal in the *risk* category.
+
+    Risk rather than momentum, deliberately: a week of bad headlines is a hazard
+    the price series may not have shown yet. Reading it as momentum would invite
+    the opposite and wrong conclusion — that good press is a reason to buy.
+    """
+
+    def test_absent_sentiment_leaves_the_risk_category_untouched(self) -> None:
+        """The regression guard on the existing tuning.
+
+        Most of a UK-tradable catalogue will never have news coverage, so the
+        common case must be indistinguishable from the signal not existing.
+        """
+        closes = _rising_series().preferred_close
+        with_slot = scoring._score_risk(closes, None, None, {})
+        without_slot = [s for s in with_slot if s.name != "news_sentiment"]
+        assert scoring._category_points(with_slot, 15.0, "risk").points == pytest.approx(
+            scoring._category_points(without_slot, 15.0, "risk").points
+        )
+
+    def test_absent_sentiment_marks_the_signal_unavailable(self) -> None:
+        result = scoring.score_series(_rising_series())
+        assert "news_sentiment" in result.missing_information
+
+    def test_bad_news_scores_lower_than_good_news(self) -> None:
+        series = _rising_series(n=300)
+        bad = scoring.score_series(series, sentiment=-0.8)
+        good = scoring.score_series(series, sentiment=0.8)
+        assert bad.categories["risk"].points < good.categories["risk"].points
+
+    def test_neutral_news_sits_at_the_midpoint(self) -> None:
+        signal = _sentiment_signal(0.0)
+        assert signal.available
+        assert signal.value == pytest.approx(0.5)
+
+    def test_the_signal_saturates_rather_than_using_the_full_range(self) -> None:
+        """Beyond the saturation point, worse news cannot score lower.
+
+        A polarity of -1 needs every tone word in a week of headlines to be
+        negative, which in practice means one bleak article and nothing else.
+        Scaling to the full range would bunch every real company near the
+        midpoint and waste the signal's resolution.
+        """
+        assert _sentiment_signal(-scoring.SENTIMENT_SATURATION).value == pytest.approx(0.0)
+        assert _sentiment_signal(-1.0).value == pytest.approx(0.0)
+        assert _sentiment_signal(scoring.SENTIMENT_SATURATION).value == pytest.approx(1.0)
+        assert _sentiment_signal(1.0).value == pytest.approx(1.0)
+
+    def test_it_is_bounded_within_the_category(self) -> None:
+        """One of five risk signals moves the category by at most a fifth.
+
+        This is the property that makes adding signals at the category layer
+        safe: the blend's six deliberate factor weights are untouched.
+        """
+        series = _rising_series(n=300)
+        neutral = scoring.score_series(series)
+        worst = scoring.score_series(series, sentiment=-1.0)
+        risk_max = neutral.categories["risk"].max_points
+        assert abs(worst.categories["risk"].points - neutral.categories["risk"].points) <= (
+            risk_max / 5.0 + 1e-9
+        )
+
+
 class TestConfidenceAndCompleteness:
     def test_full_history_has_higher_confidence_than_short(self) -> None:
         long = scoring.score_series(_rising_series(n=300))
@@ -216,15 +287,40 @@ class TestConfidenceAndCompleteness:
         assert 0.0 <= result.data_completeness <= 1.0
 
     def test_full_series_has_full_completeness(self) -> None:
-        # Every signal is computable only with volume AND the two optional
-        # comparison series (benchmark + sector); without them the relative and
-        # sector signals correctly report unavailable.
+        # Completeness only reaches the top of its range when *every* optional
+        # input is supplied: volume, the two comparison series (benchmark and
+        # sector), and the two looked-up readings (earnings drift, news tone).
+        # Withhold any one and the signals it feeds correctly report
+        # unavailable — which is the behaviour the rest of this file pins.
         result = scoring.score_series(
             _rising_series(n=300),
             benchmark=_rising_series(n=300),
             sector=_rising_series(n=300),
+            rates=_rising_series(n=300),
+            pead=60.0,
+            sentiment=0.2,
         )
         assert result.data_completeness > 0.9
+
+    def test_withholding_an_optional_input_lowers_completeness(self) -> None:
+        """The counterpart: absence is *reported*, not silently filled in."""
+        full = scoring.score_series(
+            _rising_series(n=300),
+            benchmark=_rising_series(n=300),
+            sector=_rising_series(n=300),
+            rates=_rising_series(n=300),
+            pead=60.0,
+            sentiment=0.2,
+        )
+        without_news = scoring.score_series(
+            _rising_series(n=300),
+            benchmark=_rising_series(n=300),
+            sector=_rising_series(n=300),
+            rates=_rising_series(n=300),
+            pead=60.0,
+        )
+        assert without_news.data_completeness < full.data_completeness
+        assert "news_sentiment" in without_news.missing_information
 
 
 class TestSectorScoring:

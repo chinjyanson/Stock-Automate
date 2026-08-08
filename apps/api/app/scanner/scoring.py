@@ -56,6 +56,14 @@ RATE_CORRELATION_WINDOW = 60
 #: holding is more a bet on bond yields than on the company.
 RATE_CORRELATION_BAD_AT = 0.80
 
+#: Polarity at which news sentiment scores its worst (0.0) and its best (1.0).
+#: Not the full [-1, +1] range: a polarity of exactly -1 needs every tone word in
+#: a week's headlines to be negative, which in practice only happens when a
+#: company generated one bleak article and nothing else. Saturating at ±0.5 makes
+#: the signal responsive over the range real companies actually occupy instead of
+#: bunching almost everything around the midpoint.
+SENTIMENT_SATURATION = 0.50
+
 # -- Final-score factor weights. Fundamentals-first: intrinsic value + P/E lead,
 # with price cheapness and the reversal/quality/sector signals in support. Sum to
 # 1.0; a missing factor drops out and the rest re-normalise (see combine_final_score).
@@ -230,6 +238,7 @@ def score_series(
     sector: PriceSeries | None = None,
     rates: PriceSeries | None = None,
     pead: float | None = None,
+    sentiment: float | None = None,
     fundamentals: dict[str, Decimal | None] | None = None,
 ) -> ScoreResult:
     """Score one instrument's series. Pure — no I/O, fully deterministic.
@@ -244,6 +253,10 @@ def score_series(
     must be a *price* series, not a yield series — yields move inversely to
     prices, so passing one would silently invert the correlation's meaning.
     Absent, the signal drops out with no penalty like the rest.
+
+    `sentiment` is the Loughran-McDonald news polarity in [-1, +1], read from the
+    stored snapshot rather than computed here — this function stays pure. Absent
+    (no coverage, no headlines this week) it drops out like the rest.
     """
     weights = weights or DEFAULT_WEIGHTS
     thresholds = thresholds or DEFAULT_THRESHOLDS
@@ -253,7 +266,7 @@ def score_series(
 
     trend = _score_trend(series, closes, metrics)
     momentum = _score_momentum(closes, benchmark, sector, pead, metrics)
-    risk = _score_risk(closes, rates, metrics)
+    risk = _score_risk(closes, rates, sentiment, metrics)
     liquidity = _score_liquidity(closes, volumes, metrics)
     positioning = _score_positioning(closes, metrics)
     sector_signals = _score_sector(closes, sector, metrics)
@@ -602,7 +615,12 @@ def _score_momentum(
     return signals
 
 
-def _score_risk(closes: Any, rates: PriceSeries | None, metrics: dict[str, Any]) -> list[SubSignal]:
+def _score_risk(
+    closes: Any,
+    rates: PriceSeries | None,
+    sentiment: float | None,
+    metrics: dict[str, Any],
+) -> list[SubSignal]:
     vol20 = ind.annualised_volatility(closes, 20)
     vol60 = ind.annualised_volatility(closes, 60)
     dd = ind.max_drawdown(closes, ind.TRADING_DAYS_PER_YEAR)
@@ -670,6 +688,30 @@ def _score_risk(closes: Any, rates: PriceSeries | None, metrics: dict[str, Any])
                 True,
                 strength,
                 f"60-day correlation to rates is {rate_corr:+.2f}",
+                positive=strength >= 0.5,
+            )
+        )
+
+    # News tone. In the *risk* category rather than momentum because that is
+    # what it measures here: a company whose week of headlines reads badly is
+    # carrying a hazard the price series has not necessarily shown yet. Reading
+    # it as momentum would invite the opposite and wrong interpretation — that
+    # good press is a reason to buy.
+    metrics["news_sentiment"] = sentiment
+    if sentiment is None:
+        # No headlines, no coverage, or a sweep that has not reached this name.
+        # Drops out of the category average rather than scoring zero — most of a
+        # UK-tradable catalogue will never have news coverage, and scoring that
+        # absence would rank companies by how famous they are.
+        signals.append(SubSignal("news_sentiment", False))
+    else:
+        strength = _clamp01(0.5 + sentiment / (2.0 * SENTIMENT_SATURATION))
+        signals.append(
+            SubSignal(
+                "news_sentiment",
+                True,
+                strength,
+                f"news tone is {sentiment:+.2f}",
                 positive=strength >= 0.5,
             )
         )

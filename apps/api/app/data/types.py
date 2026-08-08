@@ -115,6 +115,24 @@ class Fundamentals:
     earnings_growth: Decimal | None = None
     profit_margin: Decimal | None = None
     debt_to_equity: Decimal | None = None
+
+    # -- Cash-flow and balance-sheet items ----------------------------------
+    # The inputs a discounted cash flow needs, plus two solvency ratios that are
+    # useful on their own. Absolute amounts are in `currency`, which is the
+    # company's *reporting* currency and may differ from the trading currency —
+    # so these are safe to compare against each other and against `market_cap`,
+    # and are not safe to compare across instruments without conversion.
+    free_cash_flow: Decimal | None = None
+    operating_cash_flow: Decimal | None = None
+    total_debt: Decimal | None = None
+    total_cash: Decimal | None = None
+    shares_outstanding: Decimal | None = None
+    ebitda: Decimal | None = None
+    enterprise_value: Decimal | None = None
+    book_value_per_share: Decimal | None = None
+    return_on_equity: Decimal | None = None
+    current_ratio: Decimal | None = None
+
     raw: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -131,6 +149,16 @@ class Fundamentals:
                 self.earnings_growth,
                 self.profit_margin,
                 self.debt_to_equity,
+                self.free_cash_flow,
+                self.operating_cash_flow,
+                self.total_debt,
+                self.total_cash,
+                self.shares_outstanding,
+                self.ebitda,
+                self.enterprise_value,
+                self.book_value_per_share,
+                self.return_on_equity,
+                self.current_ratio,
             )
             if value is not None
         )

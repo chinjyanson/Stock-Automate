@@ -130,6 +130,21 @@ class RiskConfiguration(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Ratio, nullable=False, default=0.50
     )
 
+    # -- News sentiment -----------------------------------------------------
+    #: News polarity (-1..+1) at or below which a new position is halved. Set
+    #: well below zero: ordinary news is mildly negative more often than not
+    #: (failures are reported, functioning is not), so a threshold at 0 would
+    #: shrink almost every trade and stop meaning anything.
+    sentiment_reduction_threshold: Mapped[Any] = mapped_column(Ratio, nullable=False, default=-0.35)
+    #: Polarity at or below which the trade is refused outright. Null disables
+    #: the veto and leaves only the reduction — which is the conservative
+    #: default for a signal that counts words and cannot read a headline.
+    sentiment_veto_threshold: Mapped[Any | None] = mapped_column(Ratio)
+    #: A reading older than this is ignored entirely and the gate does not fire.
+    #: Absence of news is not bad news: a feed outage must never express itself
+    #: as a portfolio-wide refusal to trade.
+    sentiment_max_age_days: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+
     #: Freeform extras so a limit can be added without a migration.
     extra: Mapped[dict[str, Any] | None] = mapped_column()
 

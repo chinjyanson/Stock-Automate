@@ -59,6 +59,9 @@ class RiskConfigResponse(ORMModel):
     max_portfolio_sp500_pct: SerializedDecimal
     rate_proxy_symbol: str
     max_portfolio_rate_sensitive_pct: SerializedDecimal
+    sentiment_reduction_threshold: SerializedDecimal
+    sentiment_veto_threshold: SerializedDecimal | None
+    sentiment_max_age_days: int
     trailing_stop_enabled: bool
     max_holding_days: int
     #: Persistent live ceilings (replacing the old per-session arming values).
@@ -88,6 +91,9 @@ class RiskConfigUpdate(BaseModel):
     max_portfolio_sp500_pct: SerializedDecimal | None = None
     rate_proxy_symbol: str | None = None
     max_portfolio_rate_sensitive_pct: SerializedDecimal | None = None
+    sentiment_reduction_threshold: SerializedDecimal | None = None
+    sentiment_veto_threshold: SerializedDecimal | None = None
+    sentiment_max_age_days: int | None = None
     trailing_stop_enabled: bool | None = None
     max_holding_days: int | None = None
     max_live_capital: SerializedDecimal | None = None

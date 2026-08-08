@@ -31,6 +31,7 @@ from app.models.instrument import Exchange, Instrument
 from app.models.risk import RiskConfiguration
 from app.risk.engine import QUANTITY_STEP, RiskEngine
 from app.risk.halts import HaltService
+from app.services.sentiment import SentimentService
 
 pytestmark = pytest.mark.asyncio
 
@@ -451,3 +452,182 @@ class TestRateSensitivity:
         assert both.approved_quantity == (baseline.approved_quantity * Decimal("0.5")).quantize(
             QUANTITY_STEP, rounding=ROUND_DOWN
         )
+
+
+class TestSentimentGate:
+    """News tone is the only gate here that can refuse a trade outright.
+
+    That makes its fail-open behaviour the most important thing in this file: a
+    news feed that has gone quiet, gone stale, or gone down must leave every
+    order exactly as it found it. A control that reads absence as danger would
+    stop the whole book on an outage, which is the opposite of safe.
+    """
+
+    async def _record(
+        self,
+        db: object,
+        instrument: Instrument,
+        *,
+        polarity: float,
+        days_ago: int = 0,
+        provider_score: float | None = None,
+    ) -> None:
+        await SentimentService(db).record(  # type: ignore[arg-type]
+            instrument_id=instrument.id,
+            as_of=datetime.now(UTC).date() - timedelta(days=days_ago),
+            provider_symbol=instrument.exchange_ticker,
+            polarity=polarity,
+            uncertainty=0.1,
+            positive_words=1,
+            negative_words=4,
+            headline_count=5,
+            provider_score=provider_score,
+        )
+
+    async def _evaluate(self, db: object, instrument: Instrument, config: RiskConfiguration):
+        return await RiskEngine(db).evaluate(  # type: ignore[arg-type]
+            instrument=instrument,
+            config=config,
+            account=_account(),
+            positions=[],
+            candles=await _candles(db, instrument),
+        )
+
+    async def test_bad_news_halves_the_position(self, db: object) -> None:
+        quiet = await _rising_instrument(db, "QUIET")
+        grim = await _rising_instrument(db, "GRIM")
+        config = await _seed_config(db, sentiment_reduction_threshold=Decimal("-0.35"))
+        await self._record(db, grim, polarity=-0.8)
+
+        baseline = await self._evaluate(db, quiet, config)
+        cut = await self._evaluate(db, grim, config)
+        assert cut.approved_quantity == (baseline.approved_quantity * Decimal("0.5")).quantize(
+            QUANTITY_STEP, rounding=ROUND_DOWN
+        )
+        assert "sentiment_reduction(lexicon)" in cut.applied_caps
+
+    async def test_mildly_negative_news_does_not_fire(self, db: object) -> None:
+        """Ordinary news skews mildly negative — failures get reported and
+        functioning does not. A threshold that fired here would shrink almost
+        every trade and stop carrying information."""
+        quiet = await _rising_instrument(db, "CALM")
+        mild = await _rising_instrument(db, "MILD")
+        config = await _seed_config(db, sentiment_reduction_threshold=Decimal("-0.35"))
+        await self._record(db, mild, polarity=-0.1)
+
+        baseline = await self._evaluate(db, quiet, config)
+        result = await self._evaluate(db, mild, config)
+        assert result.approved_quantity == baseline.approved_quantity
+        assert not any("sentiment" in cap for cap in result.applied_caps)
+
+    async def test_the_veto_refuses_the_trade(self, db: object) -> None:
+        instrument = await _rising_instrument(db, "AWFUL")
+        config = await _seed_config(db, sentiment_veto_threshold=Decimal("-0.60"))
+        await self._record(db, instrument, polarity=-0.9)
+
+        result = await self._evaluate(db, instrument, config)
+        assert result.rejected
+        assert result.approved_quantity == Decimal(0)
+        assert "sentiment_veto" in result.applied_caps
+        # The rejection still carries the reading, so the audit trail can say
+        # what was refused and on whose word.
+        record = result.as_record()
+        assert record["sentiment_polarity"] == pytest.approx(-0.9)
+        assert record["sentiment_source"] == "lexicon"
+
+    async def test_the_veto_is_off_by_default(self, db: object) -> None:
+        """A signal that counts words and cannot read a headline should not be
+        able to refuse a trade until someone deliberately turns that on."""
+        instrument = await _rising_instrument(db, "DEFAULT")
+        config = await _seed_config(db)
+        assert config.sentiment_veto_threshold is None
+        await self._record(db, instrument, polarity=-0.95)
+
+        result = await self._evaluate(db, instrument, config)
+        assert not result.rejected
+
+    async def test_the_provider_score_is_named_in_the_audit_trail(self, db: object) -> None:
+        instrument = await _rising_instrument(db, "PROVIDED")
+        config = await _seed_config(db, sentiment_reduction_threshold=Decimal("-0.35"))
+        # Lexicon says fine, Finnhub says bad. Finnhub gates risk, by decision.
+        await self._record(db, instrument, polarity=0.4, provider_score=-0.8)
+
+        result = await self._evaluate(db, instrument, config)
+        assert "sentiment_reduction(provider)" in result.applied_caps
+        assert result.sentiment_source == "provider"
+        assert result.sentiment_polarity == pytest.approx(-0.8)
+
+    async def test_no_reading_leaves_the_order_untouched(self, db: object) -> None:
+        """The common case: no coverage at all."""
+        quiet = await _rising_instrument(db, "NOCOVER")
+        reference = await _rising_instrument(db, "REFERENCE")
+        config = await _seed_config(db, sentiment_veto_threshold=Decimal("-0.60"))
+
+        result = await self._evaluate(db, quiet, config)
+        baseline = await self._evaluate(db, reference, config)
+        assert not result.rejected
+        assert result.approved_quantity == baseline.approved_quantity
+        assert result.sentiment_polarity is None
+
+    async def test_a_stale_reading_leaves_the_order_untouched(self, db: object) -> None:
+        """The failure that would hurt most: a feed that stopped updating must
+        not become a permanent veto on every name it ever covered."""
+        instrument = await _rising_instrument(db, "OLDNEWS")
+        reference = await _rising_instrument(db, "REF2")
+        config = await _seed_config(
+            db, sentiment_veto_threshold=Decimal("-0.60"), sentiment_max_age_days=3
+        )
+        await self._record(db, instrument, polarity=-0.95, days_ago=30)
+
+        result = await self._evaluate(db, instrument, config)
+        baseline = await self._evaluate(db, reference, config)
+        assert not result.rejected
+        assert result.approved_quantity == baseline.approved_quantity
+
+    async def test_bad_news_on_top_of_correlation_still_cuts_only_once(self, db: object) -> None:
+        """Being concentrated *and* in the news is not twice as bad as either.
+
+        Three x0.5 multipliers would give x0.125, which no rule here intends.
+        """
+        benchmark = await _rising_instrument(db, "SPYX")
+        rates = await _rising_instrument(db, "IEFX")
+        # Two identical candidates under one config and one book. The only
+        # difference between them is that one is also in the news, so whatever
+        # separates their sizes is the sentiment gate's marginal effect.
+        quiet = await _rising_instrument(db, "QUIETPILE")
+        noisy = await _rising_instrument(db, "NOISYPILE")
+        held = await _rising_instrument(db, "HELDPILE")
+        position = BrokerPosition(
+            broker_ticker=str(held.id),
+            quantity=Decimal("300"),
+            average_price=Decimal("100"),
+            current_price=Decimal("100"),
+        )
+        config = await _seed_config(
+            db,
+            max_portfolio_sp500_pct=Decimal("0.10"),
+            max_portfolio_rate_sensitive_pct=Decimal("0.10"),
+            sentiment_reduction_threshold=Decimal("-0.35"),
+        )
+        await self._record(db, noisy, polarity=-0.9)
+
+        async def _size(instrument: Instrument):
+            return await RiskEngine(db).evaluate(  # type: ignore[arg-type]
+                instrument=instrument,
+                config=config,
+                account=_account(),
+                positions=[position],
+                candles=await _candles(db, instrument),
+                benchmark_candles=await _candles(db, benchmark),
+                rates_candles=await _candles(db, rates),
+            )
+
+        two_gates = await _size(quiet)
+        three_gates = await _size(noisy)
+
+        assert "correlation_reduction" in three_gates.applied_caps
+        assert "rate_correlation_reduction" in three_gates.applied_caps
+        assert "sentiment_reduction(lexicon)" in three_gates.applied_caps
+        # A third gate firing changes nothing about the size. Two x0.5 already
+        # became one; a third must not make it x0.125.
+        assert three_gates.approved_quantity == two_gates.approved_quantity

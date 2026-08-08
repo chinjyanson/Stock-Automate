@@ -42,6 +42,7 @@ app = Celery(
         "worker.jobs.market_regime",
         "worker.jobs.index_options",
         "worker.jobs.earnings",
+        "worker.jobs.sentiment",
     ],
 )
 
@@ -82,6 +83,15 @@ app.conf.beat_schedule = {
         "task": "worker.jobs.market_data.refresh_daily_candles",
         "schedule": crontab(hour=21, minute=30),
         "options": {"expires": 7200},
+    },
+    # Ahead of everything else in the evening chain, because it is the slowest
+    # and the most likely to be cut short: it is rate-limited to roughly a call
+    # a second and stops when its daily budget is spent. Starting it first means
+    # a partial sweep still lands before the scan reads the table at 22:00.
+    "sweep-sentiment": {
+        "task": "worker.jobs.sentiment.sweep_sentiment",
+        "schedule": crontab(hour=20, minute=30),
+        "options": {"expires": 5400},
     },
     # Before the regime measurement, so the day's index picture — dealer gamma,
     # skew, at-the-money implied vol — is complete before anything sizes against

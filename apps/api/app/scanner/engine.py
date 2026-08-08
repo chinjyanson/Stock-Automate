@@ -39,6 +39,7 @@ from app.scanner import scoring
 from app.services.insider import InsiderIngestionService
 from app.services.pead import REACTION_BARS as PEAD_REACTION_BARS
 from app.services.pead import PeadService
+from app.services.sentiment import SentimentService
 
 log = structlog.get_logger(__name__)
 
@@ -226,6 +227,7 @@ class ScannerEngine:
             sector=sector_series,
             rates=rates,
             pead=await self._pead_score(instrument.id, benchmark),
+            sentiment=await self._sentiment_score(instrument.id),
             fundamentals=fundamentals,
         )
 
@@ -391,6 +393,24 @@ class ScannerEngine:
             log.warning("scanner.pead_failed", instrument_id=str(instrument_id), error=str(exc))
             return None
         return score.score if score is not None else None
+
+    async def _sentiment_score(self, instrument_id: uuid.UUID) -> float | None:
+        """News tone as a polarity in [-1, +1], or None when there is none.
+
+        Reads the stored snapshot only — the sweep that calls Finnhub is a
+        separate job, so a scan never depends on a news feed being reachable.
+        Wrapped for the same reason as `_insider_factor` and `_pead_score`: an
+        optional signal covering a minority of the catalogue must never take
+        down the scoring of an instrument whose other signals are fine.
+        """
+        try:
+            score = await SentimentService(self._session).score_instrument(instrument_id)
+        except Exception as exc:
+            log.warning(
+                "scanner.sentiment_failed", instrument_id=str(instrument_id), error=str(exc)
+            )
+            return None
+        return score.polarity if score is not None else None
 
     async def _load_fundamentals(
         self, instrument_id: uuid.UUID

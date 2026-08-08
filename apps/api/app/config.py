@@ -139,6 +139,22 @@ class Settings(BaseSettings):
     eodhd_daily_operational_limit: int = 18
     eodhd_daily_emergency_reserve: int = 2
 
+    # -- News: Finnhub (sentiment) ------------------------------------------
+    #: Unset means the sentiment sweep does not run and the signal is simply
+    #: unavailable — which the scanner and the risk engine both already treat as
+    #: "no information", not as bad news.
+    finnhub_api_key: SecretStr | None = None
+    finnhub_base_url: str = "https://finnhub.io/api/v1"
+    #: The free tier's published ceiling is 60 calls/minute. Held one below it:
+    #: the limiter counts our own issued calls, and a retry we did not count
+    #: would put us over a limit whose penalty is a suspended key.
+    finnhub_per_minute_limit: int = 59
+    #: The free tier documents no hard daily cap, so this is a self-imposed one.
+    #: One call per instrument per day, sized to the sweep's batch limit with
+    #: room for the optional second (premium) call per symbol.
+    finnhub_daily_operational_limit: int = 900
+    finnhub_daily_emergency_reserve: int = 100
+
     # -- Data quality gates -------------------------------------------------
     stale_daily_candle_max_age_hours: int = 36
     stale_intraday_candle_max_age_minutes: int = 45

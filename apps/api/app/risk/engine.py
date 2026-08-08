@@ -33,6 +33,7 @@ from app.models.risk import RiskConfiguration, TradeIntent
 from app.risk import stress
 from app.risk.halts import HaltService
 from app.services.market_regime import MarketRegimeService
+from app.services.sentiment import RiskSentiment, SentimentService
 
 log = structlog.get_logger(__name__)
 
@@ -86,6 +87,11 @@ class RiskDecision:
     stress_loss_pct: float | None = None
     #: The market-regime multiplier that scaled the risk budget.
     regime_factor: float | None = None
+    #: News polarity the sentiment gate read, and which source it came from
+    #: ("provider" = Finnhub's own score, "lexicon" = ours). Both None when
+    #: there was no usable reading and the gate stood down.
+    sentiment_polarity: float | None = None
+    sentiment_source: str | None = None
 
     def as_record(self) -> dict[str, Any]:
         """The verdict as a JSON-safe dict, for the audit trail.
@@ -107,6 +113,8 @@ class RiskDecision:
             "rate_correlation": self.rate_correlation,
             "stress_loss_pct": self.stress_loss_pct,
             "regime_factor": self.regime_factor,
+            "sentiment_polarity": self.sentiment_polarity,
+            "sentiment_source": self.sentiment_source,
         }
 
     @classmethod
@@ -288,11 +296,42 @@ class RiskEngine:
                 )
                 if exposure > Decimal(str(config.max_portfolio_rate_sensitive_pct)):
                     reductions.append("rate_correlation_reduction")
+        # News tone. The one gate here that can refuse a trade outright rather
+        # than shrink it, and therefore the one that most needs to fail open: a
+        # missing, stale or unreadable reading leaves the order untouched. A news
+        # feed that has gone quiet must not look like a market full of bad news.
+        sentiment = await self._sentiment(instrument.id, config)
+        if sentiment is not None:
+            veto = config.sentiment_veto_threshold
+            if veto is not None and sentiment.polarity <= float(veto):
+                return RiskDecision(
+                    approved_quantity=Decimal(0),
+                    entry_price=entry_price,
+                    stop_price=None,
+                    risk_amount=Decimal(0),
+                    rejected=True,
+                    reason=(
+                        f"News sentiment for {instrument.name} is "
+                        f"{sentiment.polarity:+.2f} ({sentiment.source}), at or below the "
+                        f"veto threshold of {float(veto):+.2f}."
+                    ),
+                    applied_caps=[*applied_caps, "sentiment_veto"],
+                    correlation=correlation,
+                    rate_correlation=rate_correlation,
+                    stress_loss_pct=stress_loss_pct,
+                    regime_factor=regime,
+                    sentiment_polarity=sentiment.polarity,
+                    sentiment_source=sentiment.source,
+                )
+            if sentiment.polarity <= float(config.sentiment_reduction_threshold):
+                reductions.append(f"sentiment_reduction({sentiment.source})")
+
         if reductions:
             # At most one cut, however many gates fired. Two independent x0.5
             # multipliers would give x0.25, which neither rule intends — being
             # concentrated in two ways is not twice as bad as being concentrated
-            # in one. Every gate that fired is still named, so the audit trail
+            # in one, and bad news on top of concentration is not twice as bad
+            # again. Every gate that fired is still named, so the audit trail
             # shows the full reason.
             quantity = quantity * CORRELATION_REDUCTION
             applied_caps.extend(reductions)
@@ -315,9 +354,31 @@ class RiskEngine:
             rate_correlation=rate_correlation,
             stress_loss_pct=stress_loss_pct,
             regime_factor=regime,
+            sentiment_polarity=sentiment.polarity if sentiment else None,
+            sentiment_source=sentiment.source if sentiment else None,
         )
 
     # -- Helpers -----------------------------------------------------------
+
+    async def _sentiment(
+        self, instrument_id: uuid.UUID, config: RiskConfiguration
+    ) -> RiskSentiment | None:
+        """The stored news reading, or None — and None means "do not gate".
+
+        Store-only, so sizing never waits on a news feed. Wrapped because this
+        gate can *reject* a trade: an exception in an optional signal must not
+        become a refusal to trade, which is precisely the failure mode a
+        fail-closed default would produce here.
+        """
+        try:
+            return await SentimentService(self._session).risk_reading(
+                instrument_id, max_age_days=config.sentiment_max_age_days
+            )
+        except Exception as exc:
+            log.warning(
+                "risk.sentiment_unavailable", instrument_id=str(instrument_id), error=str(exc)
+            )
+            return None
 
     def _correlation(
         self,
