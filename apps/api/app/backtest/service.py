@@ -1,0 +1,156 @@
+"""Load stored candles and replay the strategy over them (§8).
+
+The thin I/O layer around `engine.replay`, kept separate for the same reason
+`scanner/scoring.py` is separate from `scanner/engine.py`: the arithmetic stays
+pure and testable, and only this file knows about a database.
+
+Reads the candle store and nothing else — no provider calls — so a backtest can
+be re-run any number of times without spending a single API request, and two runs
+over the same stored history give byte-identical answers.
+"""
+
+from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass
+
+import structlog
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.backtest.engine import BacktestResult, PortfolioResult, ReplayConfig, replay
+from app.data.store import CandleStore
+from app.indicators.series import candles_to_series
+from app.models.enums import Interval
+from app.models.instrument import Instrument
+from app.models.scanner import ScannerResult, ScannerRun, ScannerRunStatus
+from app.strategies.mean_reversion import EntryRules
+
+log = structlog.get_logger(__name__)
+
+#: Bars pulled per instrument. The store holds ~400 daily bars for an enriched
+#: name; asking for more costs nothing when they do not exist.
+DEFAULT_HISTORY_BARS = 900
+
+
+@dataclass(frozen=True, slots=True)
+class InstrumentRun:
+    instrument_id: uuid.UUID
+    name: str
+    bars: int
+    result: BacktestResult
+
+
+class BacktestService:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+        self._store = CandleStore(session)
+
+    async def run(
+        self,
+        instruments: list[Instrument],
+        rules: EntryRules,
+        config: ReplayConfig | None = None,
+        *,
+        history_bars: int = DEFAULT_HISTORY_BARS,
+    ) -> tuple[PortfolioResult, list[InstrumentRun]]:
+        """Replay `rules` over every instrument that has enough stored history.
+
+        An instrument with too few bars is skipped rather than counted as a run
+        that found nothing — the two are different facts, and conflating them
+        would let a thin sample masquerade as a strategy that does not trade.
+        """
+        per_instrument: dict[str, BacktestResult] = {}
+        runs: list[InstrumentRun] = []
+
+        for instrument in instruments:
+            candles = await self._store.get_candles(
+                instrument.id, Interval.D1, limit=history_bars, closed_only=True
+            )
+            if len(candles) < rules.required_bars + 1:
+                continue
+            series = candles_to_series(candles)
+            try:
+                result = replay(series, rules, config)
+            except Exception as exc:  # one bad series must not end the sweep
+                log.warning(
+                    "backtest.instrument_failed",
+                    instrument_id=str(instrument.id),
+                    error=str(exc),
+                )
+                continue
+            key = str(instrument.id)
+            per_instrument[key] = result
+            runs.append(
+                InstrumentRun(
+                    instrument_id=instrument.id,
+                    name=instrument.name or instrument.exchange_ticker or key,
+                    bars=series.length,
+                    result=result,
+                )
+            )
+
+        return PortfolioResult(per_instrument), runs
+
+    async def top_ranked_instruments(self, limit: int) -> list[Instrument]:
+        """The universe the strategy would actually have been given.
+
+        Backtesting over the whole catalogue would measure a different system:
+        the live strategy only ever sees the scanner's top names, and its edge —
+        if it has one — is partly the scanner's. Reading the same ranking keeps
+        the two questions from being quietly merged.
+        """
+        latest_run = (
+            await self._session.execute(
+                select(ScannerRun.id)
+                .where(ScannerRun.status == ScannerRunStatus.COMPLETED)
+                .where(ScannerRun.is_ad_hoc.is_(False))
+                .order_by(ScannerRun.started_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if latest_run is None:
+            return []
+
+        ids = (
+            (
+                await self._session.execute(
+                    select(ScannerResult.instrument_id)
+                    .where(ScannerResult.run_id == latest_run)
+                    .order_by(ScannerResult.primary_score.desc())
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not ids:
+            return []
+        rows = (
+            (await self._session.execute(select(Instrument).where(Instrument.id.in_(ids))))
+            .scalars()
+            .all()
+        )
+        order = {instrument_id: i for i, instrument_id in enumerate(ids)}
+        return sorted(rows, key=lambda r: order.get(r.id, 1 << 30))
+
+    async def instruments_with_history(self, limit: int) -> list[Instrument]:
+        """Fallback universe: anything the store holds daily candles for.
+
+        Used when no scan has run yet. Measures the entry rule against a broader,
+        unranked sample, which is a different — and weaker — question than the
+        one `top_ranked_instruments` asks.
+        """
+        rows = (
+            (
+                await self._session.execute(
+                    select(Instrument)
+                    .where(Instrument.is_scanner_eligible.is_(True))
+                    .order_by(Instrument.last_scanned_at.desc().nullslast())
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return list(rows)

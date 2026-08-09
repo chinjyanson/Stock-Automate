@@ -92,7 +92,10 @@ changed.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from app.indicators import functions as ind
+from app.indicators.series import PriceSeries
 from app.models.enums import Interval, OrderSide, StrategyKind
 from app.strategies.base import Strategy, StrategyContext, StrategySignal
 
@@ -112,33 +115,200 @@ def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, value))
 
 
+@dataclass(frozen=True, slots=True)
+class EntryRules:
+    """Every tunable the entry decision uses, resolved from params once.
+
+    Frozen and free of I/O so the same rules object can drive the live strategy
+    and a historical replay. That sharing is not a convenience — it is the only
+    thing stopping the backtest from measuring a subtly different strategy from
+    the one that trades, which is the classic way a backtest comes to be
+    confidently wrong.
+    """
+
+    bb_period: int = 20
+    bb_std: float = 2.0
+    rsi_period: int = 14
+    atr_period: int = 14
+    min_atr_pct: float = 0.02
+    weight_band: float = 0.45
+    weight_rsi: float = 0.40
+    weight_discount: float = 0.15
+    entry_threshold: float = 0.60
+    trend_slope_min: float = 0.0
+    avwap_enabled: bool = False
+    avwap_anchor_period: int = ind.TRADING_DAYS_PER_YEAR
+
+    @property
+    def required_bars(self) -> int:
+        """Below this nothing can be computed at all."""
+        return max(self.bb_period, self.rsi_period + 1, self.atr_period + 1)
+
+    @property
+    def preferred_bars(self) -> int:
+        """Enough for the 200-day slope and its 21-bar fit window."""
+        return max(self.bb_period * 6, 260)
+
+
+@dataclass(frozen=True, slots=True)
+class EntryReading:
+    """What the price series alone says about entering, at one point in time.
+
+    Everything here is derived from bars up to and including the last one in the
+    series handed in — there is no way for it to see forward, which is what makes
+    it safe to replay.
+
+    `pead` is deliberately absent: it comes from the earnings table rather than
+    from prices, so the caller applies it. `admits` therefore means "the price
+    series raises no objection", not "trade this".
+    """
+
+    score: float
+    lower: float
+    middle: float
+    upper: float
+    rsi: float
+    atr: float
+    atr_pct: float
+    trend_slope: float | None
+    avwap: float | None
+    score_ok: bool
+    atr_ok: bool
+    trend_ok: bool
+    avwap_ok: bool
+
+    @property
+    def admits(self) -> bool:
+        return self.score_ok and self.atr_ok and self.trend_ok and self.avwap_ok
+
+
+def read_entry(series: PriceSeries, rules: EntryRules) -> EntryReading | None:
+    """Score the dislocation and evaluate the price-derived gates.
+
+    None when no opinion is possible: too few bars, a flat window with no
+    meaningful band, or an unusable price. That is distinct from a reading that
+    declines — "cannot tell" and "no" are different answers and the caller
+    treats them differently.
+    """
+    closes = series.close
+    if series.length < rules.required_bars:
+        return None
+
+    bands = ind.bollinger_bands(closes, rules.bb_period, rules.bb_std)
+    if bands is None:
+        return None  # flat window: no meaningful band, so no opinion
+    lower, middle, upper = bands
+
+    rsi = ind.relative_strength_index(closes, rules.rsi_period)
+    atr = ind.average_true_range(series.high, series.low, closes, period=rules.atr_period)
+    last = float(closes[-1])
+    if rsi is None or atr is None or last <= 0:
+        return None
+
+    # -- How dislocated is this? Three readings, one score. -------------------
+    #
+    # Each contributes (weight, strength); anything unmeasurable is left out and
+    # the divisor shrinks with it, so absence neither helps nor hurts. None of
+    # the three can veto on its own.
+    components: list[tuple[float, float]] = []
+
+    band_width = upper - lower
+    if band_width > 0:
+        # Inverted %B: 1.0 at or below the lower band, 0.5 at the middle, 0.0 at
+        # the upper. Reading it as a position rather than as a yes/no break is
+        # what lets a stock that stopped just short of its band still make the
+        # case on the strength of the other two.
+        components.append((rules.weight_band, _clamp01(1.0 - (last - lower) / band_width)))
+
+    components.append(
+        (rules.weight_rsi, _clamp01((RSI_NEUTRAL - float(rsi)) / (RSI_NEUTRAL - RSI_FULL)))
+    )
+
+    if middle > 0:
+        discount = (middle - last) / middle
+        components.append((rules.weight_discount, _clamp01(discount / SMA20_DISCOUNT_FULL)))
+
+    total_weight = sum(w for w, _ in components)
+    score = sum(w * s for w, s in components) / total_weight if total_weight > 0 else 0.0
+
+    # -- Should this ever be bought? Absolute gates. ---------------------------
+    atr_pct = atr / last
+
+    # `sma_slope` returns None on a series too short to fit 200 bars, which is
+    # most newly-listed names — and that reads as satisfied. A gate that failed
+    # closed on missing data would quietly stop this strategy trading anything
+    # without a year of history.
+    trend_slope = ind.sma_slope(closes, 200, slope_window=21)
+
+    avwap: float | None = None
+    if rules.avwap_enabled:
+        anchor = ind.lowest_close_index(closes, rules.avwap_anchor_period)
+        if anchor is not None:
+            avwap = ind.anchored_vwap(series.high, series.low, closes, series.volume, anchor)
+
+    return EntryReading(
+        score=score,
+        lower=lower,
+        middle=middle,
+        upper=upper,
+        rsi=float(rsi),
+        atr=atr,
+        atr_pct=atr_pct,
+        trend_slope=trend_slope,
+        avwap=avwap,
+        score_ok=score >= rules.entry_threshold,
+        atr_ok=atr_pct >= rules.min_atr_pct,
+        trend_ok=trend_slope is None or trend_slope >= rules.trend_slope_min,
+        avwap_ok=avwap is None or last <= avwap,
+    )
+
+
 class MeanReversionStrategy(Strategy):
     kind = StrategyKind.MEAN_REVERSION
     interval = Interval.D1
 
+    def rules(self) -> EntryRules:
+        """The entry tunables, as the shared frozen object the backtest replays.
+
+        Built here and nowhere else, so a historical run and a live run cannot
+        drift apart on a default.
+
+        The weights are relative, not absolute: they are renormalised by whatever
+        could be measured, so they need not sum to 1 and a missing component
+        costs nothing. The band leads because it is the only one of the three
+        scaled to the instrument's own volatility; the discount trails because it
+        partly restates the band — deliberately, as an absolute-magnitude check
+        on two relative measures — and would otherwise double-count.
+
+        `entry_threshold` at 0.60 is deliberately *below* where the old
+        all-or-nothing rules sat: a band break AND RSI <= 35 corresponded to
+        roughly 0.71 on this scale, so the same setups still qualify and a band
+        break with RSI in the low 40s — or a deeply oversold stock that stopped
+        just short of its band — now qualifies too, where before either was
+        refused outright.
+
+        `trend_slope_min` ships **on**, unlike anchored VWAP: it has real
+        evidence behind it rather than a plausible story, and its failure mode
+        (skipping a dip in a declining business) is the one this strategy most
+        needs protection from.
+        """
+        return EntryRules(
+            bb_period=int(self.param("bb_period", 20)),
+            bb_std=float(self.param("bb_std", 2.0)),
+            rsi_period=int(self.param("rsi_period", 14)),
+            atr_period=int(self.param("atr_period", 14)),
+            min_atr_pct=float(self.param("min_atr_pct", 0.02)),
+            weight_band=float(self.param("entry_weight_band", 0.45)),
+            weight_rsi=float(self.param("entry_weight_rsi", 0.40)),
+            weight_discount=float(self.param("entry_weight_discount", 0.15)),
+            entry_threshold=float(self.param("entry_threshold", 0.60)),
+            trend_slope_min=float(self.param("trend_slope_min", 0.0)),
+            avwap_enabled=bool(self.param("avwap_enabled", False)),
+            avwap_anchor_period=int(self.param("avwap_anchor_period", ind.TRADING_DAYS_PER_YEAR)),
+        )
+
     async def evaluate(self, ctx: StrategyContext) -> list[StrategySignal]:
-        bb_period = int(self.param("bb_period", 20))
-        bb_std = float(self.param("bb_std", 2.0))
-        rsi_period = int(self.param("rsi_period", 14))
-        atr_period = int(self.param("atr_period", 14))
-        min_atr_pct = float(self.param("min_atr_pct", 0.02))
-        # -- The dislocation score. Weights are relative, not absolute: they are
-        # renormalised by whatever could be measured, so they need not sum to 1
-        # and a missing component costs nothing.
-        #
-        # The band leads because it is the only one of the three that is scaled
-        # to the instrument's own volatility. The discount trails because it
-        # partly restates the band — deliberately, as an absolute-magnitude check
-        # on two relative measures — and would otherwise double-count.
-        w_band = float(self.param("entry_weight_band", 0.45))
-        w_rsi = float(self.param("entry_weight_rsi", 0.40))
-        w_discount = float(self.param("entry_weight_discount", 0.15))
-        # 0.60 is deliberately *below* where the old all-or-nothing rules sat.
-        # Requiring a band break AND RSI <= 35 corresponded to roughly 0.71 on
-        # this scale, so the same setups still qualify and a band break with RSI
-        # in the low 40s — or a deeply oversold stock that stopped just short of
-        # its band — now qualifies too, where before either was refused outright.
-        entry_threshold = float(self.param("entry_threshold", 0.60))
+        rules = self.rules()
         # Insider selling pressure (0..0.40) at which a held position is closed.
         # 0.10 is a quarter of maximum, so it takes a real chief-officer sale
         # rather than a small or half-decayed one.
@@ -146,132 +316,60 @@ class MeanReversionStrategy(Strategy):
         # ...but only while the drop has not already happened. Measured in ATR
         # so it means the same on a calm stock and a wild one.
         insider_exit_max_drop = float(self.param("insider_exit_max_drop_atr", 1.0))
-        # Anchored VWAP as a fourth entry condition, shipped **off**. It is a
-        # gate rather than a conviction adjustment because conviction never
-        # reaches sizing — the risk engine sizes from ATR and equity alone — so a
-        # conviction-based version would change nothing that happens. Being a
-        # gate, it can only ever make entries rarer, which is a real change to
-        # the strategy's behaviour and belongs behind a flag that can be turned
-        # on and measured rather than assumed.
-        avwap_enabled = bool(self.param("avwap_enabled", False))
-        avwap_anchor_period = int(self.param("avwap_anchor_period", ind.TRADING_DAYS_PER_YEAR))
-        # Minimum slope of the 200-day average, as fractional change per bar.
-        # Zero means "flat or rising". Ships **on**, unlike anchored VWAP: this
-        # one has real evidence behind it rather than a plausible story, and its
-        # failure mode (skipping a dip in a declining business) is the one this
-        # strategy most needs protection from.
-        trend_slope_min = float(self.param("trend_slope_min", 0.0))
         # PEAD reading at or below which a dip is left alone. 50 is neutral, so
         # 40 is a real negative reaction rather than noise — roughly a 2%
         # abnormal move down on a fresh report, or a 10% one about seven weeks
-        # ago once the decay is applied.
+        # ago once the decay is applied. Applied here rather than inside
+        # `read_entry` because it comes from the earnings table, not from prices.
         pead_veto_below = float(self.param("pead_veto_below", 40.0))
 
         signals: list[StrategySignal] = []
         for instrument in ctx.instruments:
             # The 200-day slope needs 200 bars plus its 21-bar fit window, which
-            # is far more than the Bollinger window asks for — hence the floor
-            # rather than a plain multiple of `bb_period`. `required` is
-            # deliberately *not* raised with it: a short series must still be
-            # tradable, it just cannot answer the trend question (see below).
+            # is far more than the Bollinger window asks for — hence
+            # `preferred_bars` rather than a plain multiple of `bb_period`.
+            # `required` is deliberately *not* raised with it: a short series
+            # must still be tradable, it just cannot answer the trend question.
             series = await ctx.series(
                 instrument.id,
                 self.read_interval,
-                limit=max(bb_period * 6, 260),
-                required=max(bb_period, rsi_period + 1, atr_period + 1),
+                limit=rules.preferred_bars,
+                required=rules.required_bars,
             )
             if series is None:
                 continue
 
-            bands = ind.bollinger_bands(series.close, bb_period, bb_std)
-            if bands is None:
-                continue  # flat window: no meaningful band, so no opinion
-            lower, middle, upper = bands
-            rsi = ind.relative_strength_index(series.close, rsi_period)
-            atr = ind.average_true_range(series.high, series.low, series.close, period=atr_period)
-            last = float(series.close[-1])
-            if rsi is None or atr is None or last <= 0:
+            # The same call the backtest makes, on the same rules object.
+            reading = read_entry(series, rules)
+            if reading is None:
                 continue
 
-            # ATR as a fraction of price, so the threshold means the same thing
-            # for a £2 stock and a £200 one.
-            atr_pct = atr / last
+            last = float(series.close[-1])
             held = ctx.held_quantity(instrument.id)
             pressure = ctx.sell_pressure(instrument.id)
-
-            # -- How dislocated is this? Three readings, one score. -----------
-            #
-            # Each contributes (weight, strength); anything unmeasurable is left
-            # out and the divisor shrinks with it, so absence neither helps nor
-            # hurts. None of the three can veto on its own.
-            components: list[tuple[float, float]] = []
-
-            band_width = upper - lower
-            if band_width > 0:
-                # Inverted %B: 1.0 at or below the lower band, 0.5 at the middle,
-                # 0.0 at the upper. Reading it as a position rather than as a
-                # yes/no break is what lets a stock that stopped just short of
-                # its band still make the case on the strength of the other two.
-                percent_b = (last - lower) / band_width
-                components.append((w_band, _clamp01(1.0 - percent_b)))
-
-            if rsi is not None:
-                components.append(
-                    (w_rsi, _clamp01((RSI_NEUTRAL - float(rsi)) / (RSI_NEUTRAL - RSI_FULL)))
-                )
-
-            if middle > 0:
-                discount = (middle - last) / middle
-                components.append((w_discount, _clamp01(discount / SMA20_DISCOUNT_FULL)))
-
-            total_weight = sum(w for w, _ in components)
-            entry_score = (
-                sum(w * s for w, s in components) / total_weight if total_weight > 0 else 0.0
-            )
-
-            # Anchored to the lowest close of the last year: the average price
-            # paid by everyone who has bought since the bottom. Entering below it
-            # means buying cheaper than the crowd that already committed to this
-            # recovery, rather than at the top of their range.
-            avwap: float | None = None
-            if avwap_enabled:
-                anchor = ind.lowest_close_index(series.close, avwap_anchor_period)
-                if anchor is not None:
-                    avwap = ind.anchored_vwap(
-                        series.high, series.low, series.close, series.volume, anchor
-                    )
-            # Unavailable reads as satisfied, the same discipline as everywhere
-            # else here: a missing measurement must not silently block trading.
-            avwap_ok = avwap is None or last <= avwap
-
-            # Is the long-term trend still intact? `sma_slope` returns None on a
-            # series too short to fit 200 bars, which is most newly-listed names
-            # — and that reads as satisfied, for the same reason as above. A gate
-            # that fails closed on missing data would quietly stop this strategy
-            # trading anything without a year of history.
-            trend_slope = ind.sma_slope(series.close, 200, slope_window=21)
-            trend_ok = trend_slope is None or trend_slope >= trend_slope_min
+            lower, middle = reading.lower, reading.middle
 
             # Is the market still repricing a bad report? Absent means no live
             # earnings event, which is the common case outside the US where the
-            # calendar is thin — again, satisfied.
+            # calendar is thin — and absence reads as satisfied, like every other
+            # missing measurement here.
             pead = ctx.pead_score(instrument.id)
             pead_ok = pead is None or pead > pead_veto_below
 
             metrics = {
                 "bb_lower": lower,
                 "bb_middle": middle,
-                "bb_upper": upper,
-                "rsi": float(rsi),
-                "atr": atr,
-                "atr_pct": atr_pct,
+                "bb_upper": reading.upper,
+                "rsi": reading.rsi,
+                "atr": reading.atr,
+                "atr_pct": reading.atr_pct,
                 "close": last,
-                "entry_score": entry_score,
+                "entry_score": reading.score,
             }
-            if avwap is not None:
-                metrics["anchored_vwap"] = avwap
-            if trend_slope is not None:
-                metrics["sma200_slope"] = trend_slope
+            if reading.avwap is not None:
+                metrics["anchored_vwap"] = reading.avwap
+            if reading.trend_slope is not None:
+                metrics["sma200_slope"] = reading.trend_slope
             if pead is not None:
                 metrics["pead_score"] = pead
 
@@ -318,19 +416,21 @@ class MeanReversionStrategy(Strategy):
                     )
                 )
             elif held <= 0:
-                # The score decides *whether it is dislocated enough*; the three
-                # gates decide *whether it should be bought at all*. A gate can
-                # refuse a perfect score, and no score can talk a gate round.
-                if (
-                    entry_score >= entry_threshold
-                    and atr_pct >= min_atr_pct
-                    and avwap_ok
-                    and trend_ok
-                    and pead_ok
-                ):
-                    avwap_note = f", below anchored VWAP {avwap:.2f}" if avwap is not None else ""
+                # `reading.admits` is the score plus every price-derived gate;
+                # PEAD is the one the price series cannot answer. The score
+                # decides *whether it is dislocated enough*, the gates decide
+                # *whether it should be bought at all*, and a gate can refuse a
+                # perfect score while no score can talk a gate round.
+                if reading.admits and pead_ok:
+                    avwap_note = (
+                        f", below anchored VWAP {reading.avwap:.2f}"
+                        if reading.avwap is not None
+                        else ""
+                    )
                     trend_note = (
-                        f", 200-day trend {trend_slope:+.3%}/day" if trend_slope is not None else ""
+                        f", 200-day trend {reading.trend_slope:+.3%}/day"
+                        if reading.trend_slope is not None
+                        else ""
                     )
                     signals.append(
                         StrategySignal(
@@ -340,13 +440,14 @@ class MeanReversionStrategy(Strategy):
                             # equity alone — but it is at least now a number that
                             # means something rather than a restatement of the
                             # band break.
-                            conviction=entry_score,
+                            conviction=reading.score,
                             side=OrderSide.BUY,
                             reason=(
-                                f"Mean reversion: entry score {entry_score:.2f} "
-                                f"(>= {entry_threshold:.2f}) — close {last:.2f} vs lower band "
-                                f"{lower:.2f}, RSI {rsi:.0f}, "
-                                f"ATR {atr_pct:.1%} of price (>= {min_atr_pct:.1%})"
+                                f"Mean reversion: entry score {reading.score:.2f} "
+                                f"(>= {rules.entry_threshold:.2f}) — close {last:.2f} vs lower "
+                                f"band {lower:.2f}, RSI {reading.rsi:.0f}, "
+                                f"ATR {reading.atr_pct:.1%} of price "
+                                f"(>= {rules.min_atr_pct:.1%})"
                                 f"{avwap_note}{trend_note}"
                             ),
                             metrics=metrics,
