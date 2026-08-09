@@ -18,7 +18,13 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.backtest.engine import BacktestResult, PortfolioResult, ReplayConfig, replay
+from app.backtest.engine import (
+    BacktestResult,
+    PortfolioResult,
+    ReplayConfig,
+    is_continuous,
+    replay,
+)
 from app.data.store import CandleStore
 from app.indicators.series import candles_to_series
 from app.models.enums import Interval
@@ -28,9 +34,9 @@ from app.strategies.mean_reversion import EntryRules
 
 log = structlog.get_logger(__name__)
 
-#: Bars pulled per instrument. The store holds ~400 daily bars for an enriched
-#: name; asking for more costs nothing when they do not exist.
-DEFAULT_HISTORY_BARS = 900
+#: Bars pulled per instrument. Deep enough for the ~1,700-bar names the store now
+#: holds; asking for more costs nothing when they do not exist.
+DEFAULT_HISTORY_BARS = 2000
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +45,15 @@ class InstrumentRun:
     name: str
     bars: int
     result: BacktestResult
+
+
+@dataclass(frozen=True, slots=True)
+class Skipped:
+    """Why an instrument was left out, so exclusions are visible not silent."""
+
+    too_short: int = 0
+    discontinuous: int = 0
+    failed: int = 0
 
 
 class BacktestService:
@@ -54,8 +69,9 @@ class BacktestService:
         *,
         history_bars: int = DEFAULT_HISTORY_BARS,
         min_bars: int | None = None,
-    ) -> tuple[PortfolioResult, list[InstrumentRun]]:
-        """Replay `rules` over every instrument with enough stored history.
+        require_continuous: bool = True,
+    ) -> tuple[PortfolioResult, list[InstrumentRun], Skipped]:
+        """Replay `rules` over every instrument with usable stored history.
 
         An instrument with too few bars is skipped rather than counted as a run
         that found nothing — the two are different facts, and conflating them
@@ -73,6 +89,12 @@ class BacktestService:
         `required_bars` (~21) while `replay` starts at the warmup (~260), so
         instruments between the two were admitted and then contributed nothing
         at all, padding the denominator with rows that never traded.
+
+        `require_continuous` drops series carrying an unadjusted split. The raw
+        OHLC the replay needs is uncorrected — only `adjusted_close` is fixed —
+        so a reverse split appears as a genuine price move and the ATR-based
+        stop sits an absurd distance away. One such instrument once contributed
+        +2,489R against roughly -10R from 928 others.
         """
         config = config or ReplayConfig()
         warmup = config.warmup_bars if config.warmup_bars is not None else rules.preferred_bars
@@ -80,17 +102,23 @@ class BacktestService:
 
         per_instrument: dict[str, BacktestResult] = {}
         runs: list[InstrumentRun] = []
+        too_short = discontinuous = failed = 0
 
         for instrument in instruments:
             candles = await self._store.get_candles(
                 instrument.id, Interval.D1, limit=history_bars, closed_only=True
             )
             if len(candles) < threshold:
+                too_short += 1
                 continue
             series = candles_to_series(candles)
+            if require_continuous and not is_continuous(series):
+                discontinuous += 1
+                continue
             try:
                 result = replay(series, rules, config)
             except Exception as exc:  # one bad series must not end the sweep
+                failed += 1
                 log.warning(
                     "backtest.instrument_failed",
                     instrument_id=str(instrument.id),
@@ -108,7 +136,11 @@ class BacktestService:
                 )
             )
 
-        return PortfolioResult(per_instrument), runs
+        return (
+            PortfolioResult(per_instrument),
+            runs,
+            Skipped(too_short=too_short, discontinuous=discontinuous, failed=failed),
+        )
 
     async def top_ranked_instruments(self, limit: int) -> list[Instrument]:
         """The universe the strategy would actually have been given.

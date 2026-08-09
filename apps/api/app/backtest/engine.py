@@ -36,6 +36,7 @@ What this **cannot** tell you, and it matters:
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -46,6 +47,51 @@ from app.strategies.mean_reversion import EntryRules, read_entry
 #: read from `RiskConfiguration` so the replay stays pure; pass the live value in
 #: if it has been tuned away from the default.
 DEFAULT_ATR_STOP_MULTIPLIER = 2.0
+
+#: A single-bar close ratio beyond this is a corporate action or bad data, not a
+#: price move, and the series is not a continuous record of what a holder would
+#: have experienced.
+#:
+#: Four is deliberately loose. A real equity essentially never doubles and
+#: doubles again in a day; even a 3x leveraged ETP tops out well inside it. The
+#: bound exists to catch unadjusted splits, and the first run of this harness
+#: shows why it has to: a 3x inverse ETP with an unadjusted reverse split
+#: (0.0003 -> 20.97 in one bar, a 917-million-fold range across its history)
+#: produced +2,489R on its own against roughly -10R from the other 928
+#: instruments combined, and turned a losing rule into an apparent 4.79 profit
+#: factor. Nothing about that was a trading result.
+MAX_DAILY_PRICE_RATIO = 4.0
+
+
+def worst_daily_ratio(series: PriceSeries) -> float:
+    """Largest single-bar price ratio in the series, always >= 1.
+
+    Detects unadjusted splits, which the store's raw OHLC carries because only
+    `adjusted_close` is corrected and the replay needs open/high/low too. Returns
+    1.0 for a series with fewer than two usable bars — nothing to compare.
+    """
+    closes = series.close
+    if closes.size < 2:
+        return 1.0
+    worst = 1.0
+    for previous, current in itertools.pairwise(closes):
+        a, b = float(previous), float(current)
+        if a <= 0 or b <= 0:
+            continue
+        ratio = b / a
+        worst = max(worst, ratio, 1.0 / ratio)
+    return worst
+
+
+def is_continuous(series: PriceSeries, *, max_ratio: float = MAX_DAILY_PRICE_RATIO) -> bool:
+    """Whether the series can be read as one uninterrupted price record.
+
+    Excluding a discontinuous instrument is the honest response rather than
+    trying to repair it: a split factor inferred from the jump would be a guess,
+    and a wrong guess produces plausible-looking trades instead of obviously
+    broken ones.
+    """
+    return worst_daily_ratio(series) <= max_ratio
 
 
 class ExitReason(StrEnum):
@@ -126,6 +172,36 @@ class BacktestResult:
         nothing without the payoff beside it.
         """
         return self.total_r / self.trade_count if self.trades else 0.0
+
+    @property
+    def median_r(self) -> float:
+        """Middle trade by R. Read this beside `expectancy_r`, always.
+
+        The mean is what compounds and is therefore the number that matters, but
+        it is also the number a single broken series can capture — one
+        split-corrupted instrument once contributed +2,489R against roughly -10R
+        from 928 others. When mean and median disagree wildly, the mean is
+        describing one trade, not a strategy.
+        """
+        if not self.trades:
+            return 0.0
+        ordered = sorted(t.r_multiple for t in self.trades)
+        mid = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[mid]
+        return (ordered[mid - 1] + ordered[mid]) / 2
+
+    @property
+    def largest_trade_share(self) -> float:
+        """Fraction of gross absolute R contributed by the single biggest trade.
+
+        A concentration alarm. Anything much above a few percent means the
+        headline is an anecdote.
+        """
+        gross = sum(abs(t.r_multiple) for t in self.trades)
+        if gross <= 0:
+            return 0.0
+        return max(abs(t.r_multiple) for t in self.trades) / gross
 
     @property
     def avg_bars_held(self) -> float:

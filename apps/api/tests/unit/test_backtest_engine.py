@@ -23,7 +23,9 @@ from app.backtest.engine import (
     ExitReason,
     PortfolioResult,
     ReplayConfig,
+    is_continuous,
     replay,
+    worst_daily_ratio,
 )
 from app.indicators.series import PriceSeries
 from app.strategies.mean_reversion import EntryRules, read_entry
@@ -72,6 +74,69 @@ def _trade(entry: float, exit_: float, stop: float, **kw: object) -> BacktestTra
         entry_score=float(kw.get("entry_score", 0.7)),
         exit_reason=ExitReason(kw.get("exit_reason", ExitReason.TARGET)),
     )
+
+
+class TestSplitDetection:
+    """An unadjusted split is a corporate action, not a price move.
+
+    The store's raw OHLC is uncorrected — only `adjusted_close` is fixed, and the
+    replay needs open/high/low too — so a reverse split reads as a genuine move
+    and the ATR-derived stop ends up an absurd distance away. This is not
+    hypothetical: it produced a +2,489R instrument against roughly -10R from 928
+    others, turning a losing rule into an apparent 4.79 profit factor.
+    """
+
+    def test_an_ordinary_series_is_continuous(self) -> None:
+        assert is_continuous(_series(_cyclical(3)))
+
+    def test_a_reverse_split_is_caught(self) -> None:
+        """The real shape that broke the first deep run: 0.0003 -> 20.97."""
+        closes = [*(0.0003 for _ in range(40)), *(20.97 for _ in range(40))]
+        assert not is_continuous(_series(closes))
+
+    def test_a_forward_split_is_caught_too(self) -> None:
+        """Halving is as discontinuous as doubling; the check is symmetric."""
+        closes = [*(100.0 for _ in range(40)), *(5.0 for _ in range(40))]
+        assert not is_continuous(_series(closes))
+
+    def test_a_violent_but_real_move_is_kept(self) -> None:
+        """A 60% single-day crash is a catastrophe, not a split, and the strategy
+        should be measured on it rather than quietly excused from it."""
+        closes = [*(100.0 for _ in range(40)), 40.0, *(41.0 for _ in range(20))]
+        assert is_continuous(_series(closes))
+
+    def test_the_worst_ratio_is_reported_for_diagnosis(self) -> None:
+        closes = [10.0, 10.0, 100.0, 100.0]
+        assert worst_daily_ratio(_series(closes)) == pytest.approx(10.0)
+
+    def test_a_series_too_short_to_compare_is_not_flagged(self) -> None:
+        assert worst_daily_ratio(_series([100.0])) == 1.0
+
+
+class TestConcentration:
+    """One trade must not be able to carry a headline unnoticed."""
+
+    def _result(self, *r_multiples: float) -> BacktestResult:
+        return BacktestResult(
+            trades=tuple(_trade(100.0, 100.0 + 10.0 * r, 90.0) for r in r_multiples)
+        )
+
+    def test_the_median_ignores_a_single_outlier(self) -> None:
+        """Mean and median disagreeing wildly is the tell.
+
+        Four losses and one enormous win averages positive; the median says the
+        typical trade lost. Reporting only the mean is how a broken series passes
+        for an edge.
+        """
+        result = self._result(-1.0, -1.0, -1.0, -1.0, 500.0)
+        assert result.expectancy_r > 90
+        assert result.median_r == pytest.approx(-1.0)
+
+    def test_the_largest_trade_share_flags_the_outlier(self) -> None:
+        assert self._result(-1.0, -1.0, -1.0, -1.0, 500.0).largest_trade_share > 0.99
+
+    def test_an_even_spread_is_not_flagged(self) -> None:
+        assert self._result(1.0, -1.0, 1.5, -1.0, 0.5).largest_trade_share < 0.4
 
 
 class TestRMultiples:

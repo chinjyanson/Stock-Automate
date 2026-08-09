@@ -28,7 +28,7 @@ import argparse
 import asyncio
 
 from app.backtest.engine import PortfolioResult, ReplayConfig
-from app.backtest.service import BacktestService, InstrumentRun
+from app.backtest.service import BacktestService, InstrumentRun, Skipped
 from app.db import session_scope
 from app.models.instrument import Instrument
 from app.strategies.mean_reversion import EntryRules
@@ -61,14 +61,19 @@ def _print_result(label: str, pooled: PortfolioResult, *, instruments: int) -> N
     # demonstrated anything, however good its point estimate looks.
     band = f"+/-{2 * se:.2f}" if se is not None else "  n/a"
     verdict = "" if se is None else ("  *" if abs(combined.expectancy_r) > 2 * se else "")
+    # The median sits beside the mean on purpose. The mean is what compounds,
+    # but it is also what a single broken series can capture; when the two
+    # disagree wildly the mean is describing one trade, not a strategy.
+    concentration = combined.largest_trade_share
+    alarm = "  !! one trade is " + f"{concentration:.0%} of gross R" if concentration > 0.10 else ""
     print(
         f"  {label:<24} {combined.trade_count:>5} trades  "
         f"win {combined.win_rate:>6.1%}  "
         f"exp {combined.expectancy_r:>+6.2f}R {band}  "
-        f"total {combined.total_r:>+8.1f}R  "
+        f"med {combined.median_r:>+5.2f}R  "
         f"maxDD {combined.max_drawdown_r:>6.1f}R  "
         f"PF {('  n/a' if pf is None else f'{pf:>5.2f}')}  "
-        f"held {combined.avg_bars_held:>5.1f}d{verdict}"
+        f"held {combined.avg_bars_held:>4.1f}d{verdict}{alarm}"
     )
 
 
@@ -125,12 +130,15 @@ async def _run(size: int, sweep: str | None, warmup: int | None) -> None:
             print("No instruments to replay. Ingest candles or run a scan first.")
             return
 
-        async def measure(rules: EntryRules) -> tuple[PortfolioResult, list[InstrumentRun]]:
+        async def measure(
+            rules: EntryRules,
+        ) -> tuple[PortfolioResult, list[InstrumentRun], Skipped]:
             return await service.run(instruments, rules, config, min_bars=min_bars)
 
         print(f"Universe:   {len(instruments)} instrument(s) from {source}")
         print(f"Warmup:     {effective_warmup} bars")
         print(f"Eligible:   >= {min_bars} stored bars, applied identically to every bucket")
+        print("Excluded:   series with an unadjusted split (see MAX_DAILY_PRICE_RATIO)")
         print("Marked *:   expectancy is more than two standard errors from zero\n")
 
         if sweep == "threshold":
@@ -145,7 +153,7 @@ async def _run(size: int, sweep: str | None, warmup: int | None) -> None:
             # an end, extend the range rather than believing it.
             print("Entry threshold sweep (0.71 = the old all-or-nothing equivalent)")
             for threshold in (0.35, 0.45, 0.50, 0.55, 0.60, 0.65, 0.71, 0.80, 0.88, 0.94):
-                pooled, _ = await measure(EntryRules(entry_threshold=threshold))
+                pooled, _, _ = await measure(EntryRules(entry_threshold=threshold))
                 _print_result(f"threshold {threshold:.2f}", pooled, instruments=len(instruments))
             print(
                 "\n  A bucket at either end of this range is the least trustworthy result\n"
@@ -161,7 +169,7 @@ async def _run(size: int, sweep: str | None, warmup: int | None) -> None:
                 ("gate on (default)", EntryRules(trend_slope_min=0.0)),
                 ("gate strict", EntryRules(trend_slope_min=0.0005)),
             ):
-                pooled, _ = await measure(rules)
+                pooled, _, _ = await measure(rules)
                 _print_result(label, pooled, instruments=len(instruments))
             print(
                 "\n  Read with care: these trade sets are overlapping, not nested. Only one\n"
@@ -171,15 +179,17 @@ async def _run(size: int, sweep: str | None, warmup: int | None) -> None:
             )
             return
 
-        pooled, runs = await measure(baseline)
+        pooled, runs, skipped = await measure(baseline)
         print("Shipping configuration")
         _print_result("default", pooled, instruments=len(instruments))
         _print_exits(pooled)
         replayed = [r for r in runs if r.result.bars_replayed]
         bars = sum(r.result.bars_replayed for r in runs)
+        print(f"\n  {len(replayed)} of {len(instruments)} instrument(s) replayed, {bars:,} bars")
         print(
-            f"\n  {len(replayed)} of {len(instruments)} instrument(s) eligible, "
-            f"{bars:,} bars replayed"
+            f"  skipped: {skipped.too_short} too short, "
+            f"{skipped.discontinuous} discontinuous (unadjusted split), "
+            f"{skipped.failed} failed"
         )
         _print_top(runs)
 
