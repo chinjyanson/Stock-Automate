@@ -405,37 +405,37 @@ export default function ScannerPage() {
                 </th>
                 <th
                   className="px-4 py-2 text-right font-medium"
-                  title="Final fundamentals-first score (0-100): intrinsic value + P/E lead, with cheapness, reversal, quality and sector in support"
+                  title="The score (0-100): a weighted blend of the five groups to its right, over whichever of them could be measured"
                 >
                   Score
                 </th>
                 <th
                   className="px-4 py-2 text-right font-medium"
-                  title="Intrinsic value / P/E: Graham margin-of-safety, earnings yield, P/B, PEG (heaviest factor)"
+                  title="Intrinsic value (weight 32): Graham margin-of-safety, earnings yield, P/B, PEG, dividend yield"
                 >
                   Intr.
                 </th>
                 <th
                   className="px-4 py-2 text-right font-medium"
-                  title="Price cheapness: pulled back / oversold vs its own history"
+                  title="Price cheapness (weight 30): pullback from the 52-week high, position in range, discount to the 200-day average"
                 >
                   Cheap
                 </th>
                 <th
                   className="px-4 py-2 text-right font-medium"
-                  title="Reversal: is it turning up from a decline?"
+                  title="Insider buying (weight 16): SEC Form 4, 50 = neutral. Blank for non-US listings, which file no Form 4"
                 >
-                  Rev.
+                  Ins.
                 </th>
                 <th
                   className="px-4 py-2 text-right font-medium"
-                  title="Quality / soundness: margins, growth, low debt, low volatility, liquidity"
+                  title="Quality / soundness (weight 13): margins, growth, low debt, low volatility, liquidity"
                 >
                   Qual.
                 </th>
                 <th
                   className="px-4 py-2 text-right font-medium"
-                  title="Sector health: is the stock's own industry (its sector ETF) strengthening?"
+                  title="Sector health (weight 9): is the stock's own industry (its sector ETF) strengthening?"
                 >
                   Sec.
                 </th>
@@ -567,7 +567,7 @@ function FragmentRow({
           {r.price_value_score == null ? "—" : Number(r.price_value_score).toFixed(0)}
         </td>
         <td className="tabular px-4 py-2 text-right">
-          {r.reversal_score == null ? "—" : Number(r.reversal_score).toFixed(0)}
+          {r.insider_score == null ? "—" : Number(r.insider_score).toFixed(0)}
         </td>
         <td className="tabular px-4 py-2 text-right">
           {r.quality_score == null ? "—" : Number(r.quality_score).toFixed(0)}
@@ -613,10 +613,14 @@ function ExpandedDetail({ detail }: { detail: ScannerResultDetail }) {
           </span>
         </span>
         <span>
-          <span className="text-[var(--color-ink-muted)]">Momentum </span>
-          {Number(detail.core_score).toFixed(0)}
-          <span className="text-[var(--color-ink-muted)]"> · Value </span>
-          {detail.value_score == null ? "—" : Number(detail.value_score).toFixed(0)}
+          <span className="text-[var(--color-ink-muted)]">Score </span>
+          {Number(detail.primary_score).toFixed(1)}
+          {detail.insider_sell_penalty != null && Number(detail.insider_sell_penalty) > 0 && (
+            <span className="text-[var(--color-warn)]">
+              {" "}
+              (−{(Number(detail.insider_sell_penalty) * 100).toFixed(0)}% insider selling)
+            </span>
+          )}
           <span className="text-[var(--color-ink-muted)]"> · confidence </span>
           {(Number(detail.confidence) * 100).toFixed(0)}%
         </span>
@@ -624,14 +628,15 @@ function ExpandedDetail({ detail }: { detail: ScannerResultDetail }) {
       </div>
 
       <p className="text-xs text-[var(--color-ink-muted)]">
-        Momentum rewards strength (uptrend, near highs). Value rewards cheapness (pulled back,
-        oversold). Two separate lenses — a high value score means potentially undervalued, not a
-        recommendation to buy.
+        One score: how much this looks worth owning, weighing intrinsic value, price cheapness,
+        insider buying, soundness and sector health. A group nothing could be measured for is
+        dropped along with its weight, so a blank column never counts against a stock. Timing —
+        whether now is the moment to buy — is the strategy&apos;s question, not this table&apos;s.
       </p>
 
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <SignalList title="Momentum — positive" items={detail.positive_signals} tone="ok" />
-        <SignalList title="Momentum — negative" items={detail.negative_signals} tone="warn" />
+        <SignalList title="In its favour" items={detail.positive_signals} tone="ok" />
+        <SignalList title="Against it" items={detail.negative_signals} tone="warn" />
         <SignalList title="Value — cheap signals" items={detail.value_positive_signals} tone="ok" />
         <SignalList
           title="Value — expensive signals"

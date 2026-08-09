@@ -111,69 +111,66 @@ class TestRoleClassification:
         assert is_c_suite_title("General Counsel") is False
 
 
-class TestFactorBlend:
-    """The insider factor must behave like every other optional factor."""
+class TestInsiderGroupBlend:
+    """The insider group must behave like every other optional group."""
 
-    def _result(self, insider: float | None) -> scoring.ScoreResult:
-        return scoring.ScoreResult(
-            core_score=50.0,
-            categories={},
-            fundamental_score=60.0,
-            classification=scoring.Classification.WATCHLIST_CANDIDATE,
-            data_completeness=1.0,
-            confidence=1.0,
-            candles_used=300,
-            fundamental_value=70.0,
-            price_cheapness=60.0,
-            reversal=60.0,
-            quality=60.0,
-            sector_factor=50.0,
-            insider=insider,
-        )
+    def _groups(self, insider: float | None) -> dict[str, scoring.GroupScore]:
+        scores: dict[str, float | None] = {
+            "value": 70.0,
+            "cheapness": 60.0,
+            "insider": insider,
+            "quality": 60.0,
+            "sector": 50.0,
+        }
+        return {
+            name: scoring.GroupScore(
+                name=name, score=scores[name], weight=scoring.DEFAULT_WEIGHTS[name]
+            )
+            for name in scoring.GROUP_NAMES
+        }
 
     def test_absent_insider_data_neither_helps_nor_hurts(self) -> None:
         """The common case: no Form 4 filings at all.
 
-        A missing factor must drop out and let the rest renormalise, and the
-        penalty must be zero. Otherwise the ~60% of a UK-tradable universe that
-        can never carry this factor would be silently marked down.
+        A missing group must drop out *with its weight* and let the rest
+        renormalise. Otherwise the ~60% of a UK-tradable universe that can never
+        carry this group would be silently marked down.
         """
-        baseline = scoring.combine_final_score(self._result(None))
+        baseline = scoring.combine_score(self._groups(None))
         assert baseline > 0
         # Adding an insider *buy* can only ever raise it from here.
-        assert scoring.combine_final_score(self._result(90.0)) > baseline
+        assert scoring.combine_score(self._groups(90.0)) > baseline
 
     def test_selling_discounts_the_score_via_the_penalty(self) -> None:
-        """Selling acts as a multiplicative discount, not as a low factor value."""
-        clean = self._result(None)
-        selling = self._result(None)
-        selling.insider_sell_penalty = 0.40
-        assert scoring.combine_final_score(selling) == pytest.approx(
-            scoring.combine_final_score(clean) * 0.60, rel=1e-3
-        )
+        """Selling acts as a multiplicative discount, not as a low group score."""
+        clean = scoring.combine_score(self._groups(None))
+        selling = scoring.combine_score(self._groups(None), insider_sell_penalty=0.40)
+        assert selling == pytest.approx(clean * 0.60, rel=1e-3)
 
     def test_the_penalty_is_capped(self) -> None:
         """Even at full strength a stock is marked down, never erased."""
-        r = self._result(None)
-        r.insider_sell_penalty = scoring.DEFAULT_INSIDER_SELL_PENALTY
-        clean = scoring.combine_final_score(self._result(None))
-        expected = clean * (1.0 - scoring.DEFAULT_INSIDER_SELL_PENALTY)
-        assert scoring.combine_final_score(r) == pytest.approx(expected, rel=1e-3)
-        assert scoring.combine_final_score(r) > 0
+        clean = scoring.combine_score(self._groups(None))
+        marked = scoring.combine_score(
+            self._groups(None), insider_sell_penalty=scoring.DEFAULT_INSIDER_SELL_PENALTY
+        )
+        assert marked == pytest.approx(
+            clean * (1.0 - scoring.DEFAULT_INSIDER_SELL_PENALTY), rel=1e-3
+        )
+        assert marked > 0
 
     def test_buying_cannot_dominate_the_ranking(self) -> None:
-        """At 0.15 the buy factor matters without deciding the outcome.
+        """At weight 16 the group matters without deciding the outcome.
 
         The failure this guards against: a weight large enough for insider
         activity to swing the ranking makes *having US filings* the dominant
         criterion, since instruments without them renormalise around the gap.
         """
-        best = scoring.combine_final_score(self._result(100.0))
-        none = scoring.combine_final_score(self._result(None))
+        best = scoring.combine_score(self._groups(100.0))
+        none = scoring.combine_score(self._groups(None))
         assert (best - none) < 12.0
 
-    def test_weights_still_sum_to_one(self) -> None:
-        assert abs(sum(scoring.DEFAULT_FACTOR_WEIGHTS.values()) - 1.0) < 1e-9
+    def test_weights_still_sum_to_one_hundred(self) -> None:
+        assert abs(sum(scoring.DEFAULT_WEIGHTS.values()) - 100.0) < 1e-9
 
 
 class TestEvidenceDrivenRules:

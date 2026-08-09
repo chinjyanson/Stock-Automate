@@ -78,31 +78,22 @@ class ScannerResultResponse(ORMModel):
     #: The instrument's sector (yfinance/GICS), so the table can show industry
     #: context alongside the sector score.
     sector: str | None = None
-    #: The score driving classification/ranking (momentum, value, or a blend,
-    #: per the run's configuration).
+    #: The absolute 0-100 score that drives classification and ranking.
     primary_score: SerializedDecimal
-    core_score: SerializedDecimal
-    trend_score: SerializedDecimal
-    momentum_score: SerializedDecimal
-    risk_score: SerializedDecimal
-    liquidity_score: SerializedDecimal
-    positioning_score: SerializedDecimal
-    #: Health of the instrument's own sector (via its sector-ETF proxy).
-    sector_score: SerializedDecimal | None = None
-    #: Two more of the five final-score factors: turning-up strength, and
-    #: soundness (fundamentals + low-risk + liquidity).
-    reversal_score: SerializedDecimal | None = None
-    quality_score: SerializedDecimal | None = None
+    # -- Its five groups, each 0-100. Null means the group could not be measured
+    # at all, and was dropped from the blend along with its weight.
+    #: Intrinsic value: Graham margin of safety, earnings yield, P/B, PEG, yield.
+    fundamental_value_score: SerializedDecimal | None = None
+    #: Price cheapness against the instrument's own 52-week range.
+    price_value_score: SerializedDecimal | None = None
     #: Insider *buying*, 50 = neutral, up to 100. Null when nobody senior bought.
     insider_score: SerializedDecimal | None = None
-    #: Fraction of the score removed for insider selling (0..0.30).
+    #: Business and market soundness: margins/growth/leverage + risk + liquidity.
+    quality_score: SerializedDecimal | None = None
+    #: Health of the instrument's own sector (via its sector-ETF proxy).
+    sector_score: SerializedDecimal | None = None
+    #: Fraction of the score removed for insider selling (0..0.40).
     insider_sell_penalty: SerializedDecimal | None = None
-    fundamental_score: SerializedDecimal | None
-    #: The valuation lens (0-100): how cheap the instrument looks. Separate from
-    #: the momentum core score.
-    value_score: SerializedDecimal | None
-    price_value_score: SerializedDecimal | None
-    fundamental_value_score: SerializedDecimal | None
     classification: str
     data_completeness: SerializedDecimal
     data_freshness_days: SerializedDecimal | None

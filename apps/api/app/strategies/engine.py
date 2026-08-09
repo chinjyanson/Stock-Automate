@@ -34,6 +34,8 @@ from app.broker.base import Broker
 from app.broker.factory import resolve_broker
 from app.broker.types import BrokerOrderRejectedError, BrokerOrderRequest
 from app.data.store import CandleStore
+from app.indicators import functions as ind
+from app.indicators.series import candles_to_series
 from app.models.enums import (
     ActorKind,
     AuditEventKind,
@@ -45,7 +47,7 @@ from app.models.enums import (
     StrategyRunStatus,
     TradeIntentStatus,
 )
-from app.models.instrument import BrokerInstrument, Instrument
+from app.models.instrument import BrokerInstrument, Instrument, MarketDataMapping
 from app.models.risk import TradeIntent
 from app.models.scanner import ProposalStatus
 from app.models.strategy import StrategyConfiguration, StrategyDecision, StrategyRun
@@ -55,6 +57,8 @@ from app.scanner.proposals import ProposalError, ProposalInputs, ProposalService
 from app.services.index_options import IndexOptionsService
 from app.services.insider import InsiderIngestionService
 from app.services.market_regime import MarketRegimeService
+from app.services.pead import REACTION_BARS as PEAD_REACTION_BARS
+from app.services.pead import PeadService
 from app.services.system_settings import active_broker_kind, autonomous_live_enabled
 from app.strategies.base import (
     IndexConditions,
@@ -73,6 +77,11 @@ log = structlog.get_logger(__name__)
 #: gate vacuous: bars days old would pass a check meant to catch minutes.
 _DAILY_STALE_MAX_AGE = timedelta(days=5)
 _INTRADAY_STALE_MAX_AGE = timedelta(minutes=45)
+
+#: Benchmark whose move over the reaction window turns a raw post-earnings move
+#: into an *abnormal* one. Matches the scanner's default benchmark so both layers
+#: measure "abnormal" against the same yardstick.
+PEAD_BENCHMARK_SYMBOL = "SPY"
 
 
 @dataclass
@@ -200,6 +209,7 @@ class StrategyEngine:
             instruments=instruments,
             positions=positions,
             insider_sell_pressure=await self._insider_pressure(instruments),
+            pead_scores=await self._pead_scores(instruments),
             index_conditions=await self._index_conditions(),
         )
         try:
@@ -561,6 +571,52 @@ class StrategyEngine:
                     move_atr=score.move_since_filing_atr,
                 )
         return pressure
+
+    async def _pead_scores(self, instruments: list[Instrument]) -> dict[uuid.UUID, float]:
+        """Post-earnings drift across the universe, resolved once per run.
+
+        Same contract as `_insider_pressure`: looked up here so `evaluate` reads
+        only what it is handed, and failures degrade to an absent key rather than
+        an exception. An absent key means "no objection", which is what a missing
+        measurement must always mean — a thin earnings calendar outside the US
+        cannot be allowed to look like bad news about every UK listing.
+
+        The benchmark's move over the same window makes the surprise *abnormal*
+        rather than raw: without it, a report that landed on a day the whole
+        market fell would read as a bad reaction to the company's own news. It is
+        loaded once for the whole universe, not once per instrument.
+        """
+        benchmark_move = await self._benchmark_reaction()
+        service = PeadService(self._session)
+        scores: dict[uuid.UUID, float] = {}
+        for instrument in instruments:
+            try:
+                score = await service.score_instrument(instrument.id, benchmark_move)
+            except Exception as exc:
+                log.warning(
+                    "strategy.pead_failed", instrument_id=str(instrument.id), error=str(exc)
+                )
+                continue
+            if score is not None:
+                scores[instrument.id] = score.score
+        return scores
+
+    async def _benchmark_reaction(self) -> float | None:
+        """The benchmark's move over the PEAD reaction window, or None."""
+        result = await self._session.execute(
+            select(MarketDataMapping)
+            .where(MarketDataMapping.provider_symbol == PEAD_BENCHMARK_SYMBOL)
+            .limit(1)
+        )
+        mapping = result.scalar_one_or_none()
+        if mapping is None:
+            return None
+        candles = await self._store.get_candles(
+            mapping.instrument_id, Interval.D1, limit=PEAD_REACTION_BARS + 5, closed_only=True
+        )
+        if len(candles) < PEAD_REACTION_BARS + 1:
+            return None
+        return ind.trailing_return(candles_to_series(candles).preferred_close, PEAD_REACTION_BARS)
 
     async def _count_stale(self, instruments: list[Instrument], interval: Interval) -> int:
         """How many instruments hold no bar newer than the freshness threshold.

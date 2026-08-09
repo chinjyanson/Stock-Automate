@@ -96,6 +96,12 @@ class StrategyContext:
     #: handed to it and stays testable against fixtures with no database.
     #: Absent key means no qualifying selling.
     insider_sell_pressure: dict[uuid.UUID, InsiderPressure] = field(default_factory=dict)
+    #: Post-earnings drift per instrument, 0-100 with 50 neutral — below it means
+    #: the market reacted badly to the last report and, per PEAD, is not finished
+    #: repricing. Resolved once by the engine and passed in, exactly like
+    #: `insider_sell_pressure`. An absent key means no live earnings event, which
+    #: is the common case and reads as "no objection" rather than as bad news.
+    pead_scores: dict[uuid.UUID, float] = field(default_factory=dict)
     #: Instruments `series()` could not serve, and why. Populated as a side
     #: effect so strategies stay branch-free about it; the engine drains this
     #: into SKIPPED decisions after the pass, which is what makes a data outage
@@ -105,6 +111,10 @@ class StrategyContext:
     def sell_pressure(self, instrument_id: uuid.UUID) -> InsiderPressure | None:
         """Insider selling on one instrument, or None when there is none."""
         return self.insider_sell_pressure.get(instrument_id)
+
+    def pead_score(self, instrument_id: uuid.UUID) -> float | None:
+        """Post-earnings drift on one instrument, or None when there is no event."""
+        return self.pead_scores.get(instrument_id)
 
     def held_quantity(self, instrument_id: uuid.UUID) -> Decimal:
         """How much of `instrument_id` the paper venue currently holds."""

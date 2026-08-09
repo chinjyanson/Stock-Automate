@@ -1,9 +1,16 @@
 """Scanner scoring (§6, §20).
 
 The most important test here is acceptance criterion 7: missing optional data
-must not reduce the core score. It is easy to get wrong (divide by the full
-signal count instead of the available count) and the failure is invisible —
-sparse instruments just quietly score low — so it is pinned from several angles.
+must not reduce the score. It is easy to get wrong in two different places —
+dividing a group by its full signal count instead of its available count, or
+dividing the blend by the full 100 instead of the weight that actually scored —
+and both failures are invisible, since sparse instruments just quietly rank low.
+Both are pinned from several angles.
+
+Two structural guards also live here, because the design they protect is easy to
+erode one convenient addition at a time: no fact may be scored by two groups
+(`TestNoInversions`), and no momentum reading may be scored at all
+(`TestMomentumIsNotScored`).
 """
 
 from __future__ import annotations
@@ -14,6 +21,7 @@ import numpy as np
 import pytest
 
 from app.indicators.series import PriceSeries
+from app.models.scanner import Classification
 from app.scanner import scoring
 
 
@@ -53,503 +61,570 @@ def _series_from_returns(pattern: list[float], n: int, start: float = 100.0) -> 
 
 
 def _rate_signal(closes: np.ndarray, rates: PriceSeries) -> scoring.SubSignal:
-    """The `rate_sensitivity` sub-signal alone, out of the risk category."""
+    """The `rate_sensitivity` sub-signal alone, out of the risk readings."""
     signals = scoring._score_risk(closes, rates, None, {})
     return next(s for s in signals if s.name == "rate_sensitivity")
 
 
 def _sentiment_signal(polarity: float) -> scoring.SubSignal:
-    """The `news_sentiment` sub-signal alone, out of the risk category."""
+    """The `news_sentiment` sub-signal alone, out of the risk readings."""
     closes = _rising_series().preferred_close
     signals = scoring._score_risk(closes, None, polarity, {})
     return next(s for s in signals if s.name == "news_sentiment")
 
 
+CHEAP_FUNDAMENTALS: dict[str, Decimal | None] = {
+    "trailing_pe": Decimal("8"),
+    "price_to_book": Decimal("0.9"),
+    "profit_margin": Decimal("0.22"),
+    "revenue_growth": Decimal("0.15"),
+    "earnings_growth": Decimal("0.20"),
+    "debt_to_equity": Decimal("20"),
+    "dividend_yield": Decimal("0.05"),
+}
+
+EXPENSIVE_FUNDAMENTALS: dict[str, Decimal | None] = {
+    "trailing_pe": Decimal("60"),
+    "price_to_book": Decimal("9"),
+    "profit_margin": Decimal("0.01"),
+    "revenue_growth": Decimal("-0.10"),
+    "earnings_growth": Decimal("0.01"),
+    "debt_to_equity": Decimal("300"),
+    "dividend_yield": Decimal("0"),
+}
+
+
+def _group(name: str, score: float | None, weight: float) -> scoring.GroupScore:
+    return scoring.GroupScore(name=name, score=score, weight=weight)
+
+
+def _full_groups(**overrides: float | None) -> dict[str, scoring.GroupScore]:
+    """Five groups all scoring 60 unless overridden, at the default weights."""
+    scores: dict[str, float | None] = dict.fromkeys(scoring.GROUP_NAMES, 60.0)
+    scores.update(overrides)
+    return {
+        name: _group(name, scores[name], scoring.DEFAULT_WEIGHTS[name])
+        for name in scoring.GROUP_NAMES
+    }
+
+
+# -- Shape ------------------------------------------------------------------
+
+
 class TestScoreRange:
     def test_score_is_within_zero_to_one_hundred(self) -> None:
         result = scoring.score_series(_rising_series())
-        assert 0.0 <= result.core_score <= 100.0
-
-    def test_category_points_never_exceed_their_max(self) -> None:
-        result = scoring.score_series(_rising_series())
-        for category in result.categories.values():
-            assert category.points <= category.max_points + 1e-9
+        assert 0.0 <= result.score <= 100.0
 
     def test_weights_sum_to_one_hundred(self) -> None:
-        assert sum(scoring.DEFAULT_WEIGHTS.values()) == 100.0
+        assert sum(scoring.DEFAULT_WEIGHTS.values()) == pytest.approx(100.0)
 
-
-class TestTrendDiscrimination:
-    def test_strong_uptrend_scores_higher_than_downtrend(self) -> None:
-        up = scoring.score_series(_rising_series())
-        down = scoring.score_series(_falling_series())
-        assert up.core_score > down.core_score
-
-    def test_uptrend_trend_category_beats_downtrend(self) -> None:
-        up = scoring.score_series(_rising_series())
-        down = scoring.score_series(_falling_series())
-        assert up.categories["trend"].points > down.categories["trend"].points
-
-    def test_uptrend_produces_positive_signals(self) -> None:
+    def test_there_are_exactly_five_groups(self) -> None:
+        assert set(scoring.DEFAULT_WEIGHTS) == set(scoring.GROUP_NAMES)
         result = scoring.score_series(_rising_series())
-        assert any("above" in s.lower() for s in result.positive_signals)
+        assert set(result.groups) == set(scoring.GROUP_NAMES)
+
+    def test_every_group_score_is_zero_to_one_hundred_or_none(self) -> None:
+        result = scoring.score_series(_rising_series(), fundamentals=CHEAP_FUNDAMENTALS)
+        for group in result.groups.values():
+            assert group.score is None or 0.0 <= group.score <= 100.0, group.name
+
+    def test_extremes_do_not_escape_the_scale(self) -> None:
+        """A stock that is bad on every measurable axis still lands inside 0-100."""
+        result = scoring.score_series(
+            _rising_series(),  # near its high, so cheapness scores badly
+            fundamentals=EXPENSIVE_FUNDAMENTALS,
+            insider=0.0,
+            insider_sell_penalty=0.40,
+        )
+        assert 0.0 <= result.score <= 100.0
 
 
 class TestClassification:
     def test_bands(self) -> None:
-        assert scoring.classify(80) is scoring.Classification.SCREENING_CANDIDATE
-        assert scoring.classify(65) is scoring.Classification.WATCHLIST_CANDIDATE
-        assert scoring.classify(40) is scoring.Classification.DOES_NOT_PASS
+        assert scoring.classify(80.0) is Classification.SCREENING_CANDIDATE
+        assert scoring.classify(65.0) is Classification.WATCHLIST_CANDIDATE
+        assert scoring.classify(40.0) is Classification.DOES_NOT_PASS
 
     def test_boundaries_are_inclusive_at_the_lower_edge(self) -> None:
-        assert scoring.classify(75) is scoring.Classification.SCREENING_CANDIDATE
-        assert scoring.classify(60) is scoring.Classification.WATCHLIST_CANDIDATE
-        assert scoring.classify(59.99) is scoring.Classification.DOES_NOT_PASS
+        assert scoring.classify(75.0) is Classification.SCREENING_CANDIDATE
+        assert scoring.classify(60.0) is Classification.WATCHLIST_CANDIDATE
+        assert scoring.classify(59.99) is Classification.DOES_NOT_PASS
 
     def test_thresholds_are_configurable(self) -> None:
-        strict = {"screening": 90, "watchlist": 80}
-        assert scoring.classify(85, strict) is scoring.Classification.WATCHLIST_CANDIDATE
+        loose = {"screening": 50.0, "watchlist": 30.0}
+        assert scoring.classify(55.0, loose) is Classification.SCREENING_CANDIDATE
+
+    def test_the_result_classifies_on_its_own_score(self) -> None:
+        """There is one score, so there can only be one classification.
+
+        The old two-score design computed a classification from the momentum
+        core and then threw it away, while the engine recomputed a different one
+        from the blend. Anything reading `result.classification` was reading the
+        discarded answer.
+        """
+        result = scoring.score_series(_rising_series(), fundamentals=CHEAP_FUNDAMENTALS)
+        assert result.classification is scoring.classify(result.score)
+
+
+# -- Acceptance criterion 7 -------------------------------------------------
 
 
 class TestMissingDataDoesNotPenalise:
-    """Acceptance criterion 7, from every angle it could break."""
+    def test_unavailable_signals_leave_their_group_average_alone(self) -> None:
+        """Three available signals at 0.5 score 50, whether or not two are missing."""
+        present = [scoring.SubSignal(f"s{i}", True, 0.5) for i in range(3)]
+        padded = [*present, scoring.SubSignal("gone_a", False), scoring.SubSignal("gone_b", False)]
+        assert scoring._group("g", present, 30.0).score == pytest.approx(50.0)
+        assert scoring._group("g", padded, 30.0).score == pytest.approx(50.0)
 
-    def test_short_history_is_not_scored_as_failing(self) -> None:
-        """An instrument with 30 bars must not score near zero just for being
-        new. Its available signals are scored; the unavailable ones are dropped,
-        not counted as failures."""
-        short = scoring.score_series(_rising_series(n=30))
-        # A rising short series still scores respectably on the signals it can
-        # compute — not floored.
-        assert short.core_score > 40.0
-        # And it is honest about what is missing.
-        assert len(short.missing_information) > 0
+    def test_a_group_with_nothing_available_scores_none_not_zero(self) -> None:
+        empty = [scoring.SubSignal("a", False), scoring.SubSignal("b", False)]
+        assert scoring._group("g", empty, 30.0).score is None
 
-    def test_missing_fundamentals_yield_none_not_zero(self) -> None:
-        result = scoring.score_series(_rising_series(), fundamentals={})
-        assert result.fundamental_score is None
+    def test_a_missing_group_shrinks_the_divisor(self) -> None:
+        """The single most important line in the module.
 
-    def test_fundamentals_never_change_the_core_score(self) -> None:
-        series = _rising_series()
-        without = scoring.score_series(series)
-        with_funds = scoring.score_series(
-            series,
-            fundamentals={
-                "trailing_pe": Decimal("15"),
-                "profit_margin": Decimal("0.25"),
-            },
+        Four groups at 60 with the fifth absent must still score 60 — not
+        60 x (weight that scored / 100), which is what dividing by the full
+        weight would give.
+        """
+        groups = _full_groups(insider=None)
+        assert scoring.combine_score(groups) == pytest.approx(60.0)
+
+    def test_a_missing_group_is_not_scored_as_a_neutral_fifty(self) -> None:
+        """Absence must be *removed*, not replaced with a midpoint.
+
+        A neutral 50 would drag every high scorer down and lift every low one,
+        and since ~60% of a tradable catalogue can never carry Form 4 data, the
+        drag would fall almost entirely on non-US listings.
+        """
+        absent = scoring.combine_score(_full_groups(insider=None))
+        neutral = scoring.combine_score(_full_groups(insider=50.0))
+        assert absent == pytest.approx(60.0)
+        assert neutral < absent
+
+    def test_every_group_missing_scores_zero_rather_than_dividing_by_zero(self) -> None:
+        nothing = {name: _group(name, None, 20.0) for name in scoring.GROUP_NAMES}
+        assert scoring.combine_score(nothing) == 0.0
+
+    def test_absence_lowers_confidence_not_score(self) -> None:
+        rich = scoring.score_series(_rising_series(), fundamentals=CHEAP_FUNDAMENTALS)
+        sparse = scoring.score_series(_rising_series())
+        assert sparse.confidence < rich.confidence
+        assert sparse.data_completeness < rich.data_completeness
+
+    def test_missing_signals_are_named_not_silent(self) -> None:
+        result = scoring.score_series(_rising_series())
+        assert "earnings_yield" in result.missing_information
+        assert "insider_activity" in result.missing_information
+
+
+class TestPenalties:
+    def test_no_fundamentals_costs_a_tenth(self) -> None:
+        groups = _full_groups(value=None)
+        with_penalty = scoring.combine_score(groups, fundamentals_penalty=0.10)
+        without = scoring.combine_score(groups, fundamentals_penalty=0.0)
+        assert with_penalty == pytest.approx(without * 0.90, rel=1e-3)
+
+    def test_the_penalty_does_not_apply_when_value_scored(self) -> None:
+        groups = _full_groups()
+        assert scoring.combine_score(groups, fundamentals_penalty=0.10) == pytest.approx(60.0)
+
+    def test_insider_selling_discounts_the_whole_score(self) -> None:
+        groups = _full_groups()
+        assert scoring.combine_score(groups, insider_sell_penalty=0.40) == pytest.approx(36.0)
+
+    def test_the_sell_penalty_is_clamped(self) -> None:
+        groups = _full_groups()
+        assert scoring.combine_score(groups, insider_sell_penalty=5.0) == 0.0
+        assert scoring.combine_score(groups, insider_sell_penalty=-1.0) == pytest.approx(60.0)
+
+
+# -- Structural guards ------------------------------------------------------
+
+
+def _all_scored_signal_names() -> list[str]:
+    """Every signal name that contributes to the score, across all groups."""
+    series = _rising_series()
+    closes = series.preferred_close
+    names = [
+        *(s.name for s in scoring._score_value(CHEAP_FUNDAMENTALS)),
+        *(s.name for s in scoring._score_cheapness(closes, {})),
+        *(s.name for s in scoring._score_sector(series, {})),
+        *(s.name for s in scoring._score_risk(closes, None, None, {})),
+        *(s.name for s in scoring._score_liquidity(closes, series.volume, {})),
+        "insider_buying",
+    ]
+    return names
+
+
+class TestNoInversions:
+    def test_no_fact_is_scored_by_two_groups(self) -> None:
+        """The guard against reintroducing the old design's contradictions.
+
+        The two-score scanner read the same fact in opposite directions four
+        times over — `price_above_sma200` against `below_200d_average`,
+        `distance_from_52w_high` against `pullback_from_high`, and so on. Every
+        group now shares one orientation (cheap and sound scores high), which is
+        only sustainable if each measurement appears exactly once.
+        """
+        names = _all_scored_signal_names()
+        duplicates = {n for n in names if names.count(n) > 1}
+        assert not duplicates, f"scored twice: {sorted(duplicates)}"
+
+    def test_the_rsi_level_is_not_scored(self) -> None:
+        """It is the strategy's entry condition, checked nightly on fresh candles.
+
+        Scoring it here as well would count one fact in two layers, and the
+        scanner's copy would be up to 100 days stale by the time it was compared
+        against a freshly-scanned name.
+        """
+        assert not any("rsi" in n for n in _all_scored_signal_names())
+
+    def test_pe_is_read_as_an_earnings_yield_and_nowhere_else(self) -> None:
+        """`value` prices it; `quality` must not also reward it as soundness."""
+        quality_inputs = scoring._quality_fundamentals(CHEAP_FUNDAMENTALS)
+        without_pe = scoring._quality_fundamentals(
+            {**CHEAP_FUNDAMENTALS, "trailing_pe": Decimal("60")}
         )
-        # The fundamental score appears, but the CORE score is byte-identical.
-        assert with_funds.fundamental_score is not None
-        assert without.core_score == with_funds.core_score
+        assert quality_inputs == without_pe
 
-    def test_a_category_with_no_signals_gets_the_neutral_midpoint(self) -> None:
-        """A single bar makes momentum/trend uncomputable. That category must
-        land at its midpoint, not zero — absence of evidence is not a failing
-        grade."""
-        result = scoring.score_series(_series_from_closes([100.0]))
-        momentum = result.categories["momentum"]
-        assert momentum.signals_available == 0
-        assert momentum.points == momentum.max_points * 0.5
 
-    def test_partial_fundamentals_score_on_what_is_present(self) -> None:
-        # Only profit margin is known; the score reflects it and ignores the rest.
-        result = scoring.score_series(
-            _rising_series(), fundamentals={"profit_margin": Decimal("0.30")}
+class TestMomentumIsNotScored:
+    #: Everything the old momentum and trend categories measured.
+    MOMENTUM_NAMES = frozenset(
+        {
+            "price_above_sma50",
+            "price_above_sma200",
+            "sma50_above_sma200",
+            "sma200_slope",
+            "return_1m",
+            "return_3m",
+            "return_6m",
+            "return_12m",
+            "relative_momentum_12m",
+            "relative_momentum_vs_sector",
+            "earnings_drift",
+        }
+    )
+
+    def test_no_momentum_signal_contributes_to_the_score(self) -> None:
+        assert self.MOMENTUM_NAMES.isdisjoint(_all_scored_signal_names())
+
+    def test_a_rising_and_a_falling_stock_score_the_same_on_quality(self) -> None:
+        """Trend direction must not leak into the score through a side door."""
+        rising = scoring.score_series(_rising_series(), fundamentals=CHEAP_FUNDAMENTALS)
+        falling = scoring.score_series(_falling_series(), fundamentals=CHEAP_FUNDAMENTALS)
+        # Cheapness legitimately differs — the falling stock *is* cheaper — but
+        # nothing in the value group reads price at all.
+        assert rising.group_score("value") == falling.group_score("value")
+
+    def test_momentum_is_still_reported_as_a_metric(self) -> None:
+        """Unscored is not unmeasured: the results table still shows the trend."""
+        result = scoring.score_series(_rising_series())
+        for key in ("sma50", "sma200", "sma200_slope", "return_1m", "return_12m"):
+            assert key in result.metrics, key
+        assert result.metrics["sma200_slope"] is not None
+
+    def test_the_sector_trend_is_scored_and_that_is_deliberate(self) -> None:
+        """An industry's trend is a slow structural fact, not a fast one.
+
+        It survives the scanner's rotation staleness in a way a single stock's
+        one-month return does not, which is why it is the one trend reading that
+        still earns a score.
+        """
+        names = [s.name for s in scoring._score_sector(_rising_series(), {})]
+        assert "sector_trend_rising" in names
+
+
+# -- Individual groups ------------------------------------------------------
+
+
+class TestValueGroup:
+    def test_cheap_fundamentals_score_above_expensive_ones(self) -> None:
+        cheap = scoring._group("value", scoring._score_value(CHEAP_FUNDAMENTALS), 32.0)
+        dear = scoring._group("value", scoring._score_value(EXPENSIVE_FUNDAMENTALS), 32.0)
+        assert cheap.score is not None and dear.score is not None
+        assert cheap.score > dear.score
+
+    def test_no_fundamentals_means_no_score(self) -> None:
+        assert scoring._group("value", scoring._score_value(None), 32.0).score is None
+
+    def test_partial_fundamentals_still_score(self) -> None:
+        partial: dict[str, Decimal | None] = {"dividend_yield": Decimal("0.04")}
+        group = scoring._group("value", scoring._score_value(partial), 32.0)
+        assert group.score == pytest.approx(100.0)
+        assert group.signals_available == 1
+
+    def test_graham_needs_both_ratios(self) -> None:
+        only_pe: dict[str, Decimal | None] = {"trailing_pe": Decimal("10")}
+        signals = {s.name: s for s in scoring._score_value(only_pe)}
+        assert signals["earnings_yield"].available
+        assert not signals["graham_margin_of_safety"].available
+
+    def test_a_negative_pe_is_not_treated_as_cheap(self) -> None:
+        """A loss-making company has no earnings yield, not an enormous one."""
+        loss: dict[str, Decimal | None] = {"trailing_pe": Decimal("-5")}
+        signals = {s.name: s for s in scoring._score_value(loss)}
+        assert not signals["earnings_yield"].available
+
+
+class TestCheapnessGroup:
+    def test_a_pulled_back_stock_scores_above_one_at_its_high(self) -> None:
+        at_high = _rising_series()
+        pulled_back = _series_from_closes(
+            [100.0 * (1.001**i) for i in range(250)] + [70.0 - i * 0.05 for i in range(50)]
         )
-        assert result.fundamental_score is not None
-        assert result.fundamental_score > 0
+        high_score = scoring._group(
+            "c", scoring._score_cheapness(at_high.preferred_close, {}), 30.0
+        )
+        back_score = scoring._group(
+            "c", scoring._score_cheapness(pulled_back.preferred_close, {}), 30.0
+        )
+        assert high_score.score is not None and back_score.score is not None
+        assert back_score.score > high_score.score
+
+    def test_it_reads_three_things(self) -> None:
+        names = [s.name for s in scoring._score_cheapness(_rising_series().preferred_close, {})]
+        assert names == ["pullback_from_high", "low_in_range", "below_200d_average"]
+
+    def test_a_short_series_drops_the_200_day_signal(self) -> None:
+        short = _series_from_closes([100.0 + i for i in range(40)])
+        signals = {s.name: s for s in scoring._score_cheapness(short.preferred_close, {})}
+        assert not signals["below_200d_average"].available
+        assert signals["pullback_from_high"].available
+
+
+class TestQualityGroup:
+    def test_it_is_a_three_part_mean_not_a_flat_average(self) -> None:
+        """Flattening would give the seven risk signals half the group.
+
+        With business soundness at 1.0 and both candle-derived parts at 0.0, a
+        three-part mean is 1/3. A flat average over 3 + 7 + 4 signals would be
+        3/14, which is a materially more risk-driven group than the one that was
+        tuned.
+        """
+        risk = [scoring.SubSignal(f"r{i}", True, 0.0) for i in range(7)]
+        liquidity = [scoring.SubSignal(f"l{i}", True, 0.0) for i in range(4)]
+        perfect: dict[str, Decimal | None] = {
+            "profit_margin": Decimal("0.30"),
+            "revenue_growth": Decimal("0.20"),
+            "debt_to_equity": Decimal("0"),
+        }
+        group = scoring._quality_group(perfect, risk, liquidity, 13.0)
+        assert group.score == pytest.approx(100.0 / 3.0)
+
+    def test_it_still_scores_without_fundamentals(self) -> None:
+        risk = [scoring.SubSignal("r", True, 0.6)]
+        liquidity = [scoring.SubSignal("l", True, 0.8)]
+        group = scoring._quality_group(None, risk, liquidity, 13.0)
+        assert group.score == pytest.approx(70.0)
+
+    def test_it_carries_no_signals_of_its_own(self) -> None:
+        """Risk and liquidity are tallied once, by `score_series`.
+
+        Attaching them to the quality group as well would double-count them in
+        the completeness figure and in the explanation lists.
+        """
+        result = scoring.score_series(_rising_series())
+        assert result.groups["quality"].signals == []
+
+
+class TestInsiderGroup:
+    def test_a_buy_score_becomes_the_group_score(self) -> None:
+        result = scoring.score_series(_rising_series(), insider=82.0)
+        assert result.group_score("insider") == pytest.approx(82.0)
+
+    def test_no_filings_means_no_score(self) -> None:
+        result = scoring.score_series(_rising_series(), insider=None)
+        assert result.group_score("insider") is None
+
+    def test_selling_is_a_penalty_not_a_group_score(self) -> None:
+        clean = scoring.score_series(_rising_series(), fundamentals=CHEAP_FUNDAMENTALS)
+        sold = scoring.score_series(
+            _rising_series(), fundamentals=CHEAP_FUNDAMENTALS, insider_sell_penalty=0.40
+        )
+        assert sold.score < clean.score
+        assert sold.group_score("insider") is None
+
+
+class TestSectorGroup:
+    def test_a_healthy_sector_scores_above_a_weak_one(self) -> None:
+        strong = scoring._group("s", scoring._score_sector(_rising_series(), {}), 9.0)
+        weak = scoring._group("s", scoring._score_sector(_falling_series(), {}), 9.0)
+        assert strong.score is not None and weak.score is not None
+        assert strong.score > weak.score
+
+    def test_an_untagged_instrument_has_no_sector_score(self) -> None:
+        """None, not a midpoint — the group drops out with its weight."""
+        result = scoring.score_series(_rising_series(), sector=None)
+        assert result.group_score("sector") is None
+
+    def test_the_sector_group_is_on_the_same_scale_as_the_others(self) -> None:
+        """It used to store category *points* (max 20) beside 0-100 columns.
+
+        An untagged stock showed 10.0 in a results table where every neighbour
+        ran to 100, which read as a very low sector score rather than as no
+        sector score at all.
+        """
+        result = scoring.score_series(_rising_series(), sector=_rising_series())
+        score = result.group_score("sector")
+        assert score is not None and 0.0 <= score <= 100.0
+        assert score > 20.0
+
+
+# -- Risk readings (Quality's market-risk part) -----------------------------
 
 
 class TestRateSensitivity:
-    """Rate sensitivity is a *risk* signal measured on magnitude, not direction.
+    def test_an_uncorrelated_instrument_scores_high(self) -> None:
+        closes = _series_from_returns([0.01, -0.01], 240).preferred_close
+        rates = _series_from_returns([0.01, 0.01, -0.01, -0.01], 240)
+        signal = _rate_signal(closes, rates)
+        assert signal.available
+        assert signal.value > 0.9
 
-    A holding that moves hard against yields is as much a bet on rates as one
-    that moves with them, so the signal has to be symmetric about zero. Getting
-    that wrong would let a book load up on one side of the trade unchallenged.
-    """
-
-    def test_absent_rates_leave_the_risk_category_untouched(self) -> None:
-        """The regression guard on the existing tuning.
-
-        Adding a sub-signal must not move the category when its data is missing
-        — `_category_points` averages over *available* signals, so the new slot
-        has to drop out entirely rather than score zero.
-        """
-        closes = _rising_series().preferred_close
-        with_slot = scoring._score_risk(closes, None, None, {})
-        without_slot = [s for s in with_slot if s.name != "rate_sensitivity"]
-        assert scoring._category_points(with_slot, 15.0, "risk").points == pytest.approx(
-            scoring._category_points(without_slot, 15.0, "risk").points
-        )
-
-    def test_absent_rates_marks_the_signal_unavailable(self) -> None:
-        result = scoring.score_series(_rising_series())
-        assert "rate_sensitivity" in result.missing_information
-
-    def test_a_rate_tracking_stock_scores_zero_strength(self) -> None:
-        rates = _series_from_returns([0.01, 0.01, -0.01, -0.01], n=80)
+    def test_a_rate_tracking_instrument_scores_low(self) -> None:
+        rates = _series_from_returns([0.012, -0.008, 0.004, -0.011], 240)
         signal = _rate_signal(rates.preferred_close, rates)
         assert signal.available
-        assert signal.value == pytest.approx(0.0)
+        assert signal.value == pytest.approx(0.0, abs=0.01)
 
-    def test_moving_against_rates_is_penalised_the_same_as_moving_with_them(self) -> None:
-        """Symmetry. An inverse rates bet is still a rates bet."""
-        rates = _series_from_returns([0.01, 0.01, -0.01, -0.01], n=80)
-        mirror = _series_from_returns([-0.01, -0.01, 0.01, 0.01], n=80)
-        with_rates = _rate_signal(rates.preferred_close, rates)
-        against_rates = _rate_signal(mirror.preferred_close, rates)
-        assert against_rates.value == pytest.approx(with_rates.value)
+    def test_negative_correlation_is_penalised_just_as_much(self) -> None:
+        """Moving hard *against* rates is still a bet on rates."""
+        pattern = [0.012, -0.008, 0.004, -0.011]
+        rates = _series_from_returns(pattern, 240)
+        inverse = _series_from_returns([-r for r in pattern], 240)
+        assert _rate_signal(inverse.preferred_close, rates).value == pytest.approx(0.0, abs=0.01)
 
-    def test_an_uncorrelated_stock_scores_full_strength(self) -> None:
-        # Orthogonal repeating patterns: over any whole number of 4-bar cycles
-        # the correlation is exactly zero.
-        rates = _series_from_returns([0.01, 0.01, -0.01, -0.01], n=80)
-        stock = _series_from_returns([0.01, -0.01, 0.01, -0.01], n=80)
-        signal = _rate_signal(stock.preferred_close, rates)
-        assert signal.available
-        assert signal.value == pytest.approx(1.0)
-        assert signal.positive
+    def test_no_rates_proxy_drops_the_signal(self) -> None:
+        signals = scoring._score_risk(_rising_series().preferred_close, None, None, {})
+        rate = next(s for s in signals if s.name == "rate_sensitivity")
+        assert not rate.available
 
 
 class TestNewsSentiment:
-    """News tone enters as one sub-signal in the *risk* category.
+    def test_neutral_tone_sits_at_the_midpoint(self) -> None:
+        assert _sentiment_signal(0.0).value == pytest.approx(0.5)
 
-    Risk rather than momentum, deliberately: a week of bad headlines is a hazard
-    the price series may not have shown yet. Reading it as momentum would invite
-    the opposite and wrong conclusion — that good press is a reason to buy.
-    """
+    def test_bad_news_scores_low_and_good_news_high(self) -> None:
+        assert _sentiment_signal(-0.4).value < 0.5
+        assert _sentiment_signal(0.4).value > 0.5
 
-    def test_absent_sentiment_leaves_the_risk_category_untouched(self) -> None:
-        """The regression guard on the existing tuning.
-
-        Most of a UK-tradable catalogue will never have news coverage, so the
-        common case must be indistinguishable from the signal not existing.
-        """
-        closes = _rising_series().preferred_close
-        with_slot = scoring._score_risk(closes, None, None, {})
-        without_slot = [s for s in with_slot if s.name != "news_sentiment"]
-        assert scoring._category_points(with_slot, 15.0, "risk").points == pytest.approx(
-            scoring._category_points(without_slot, 15.0, "risk").points
-        )
-
-    def test_absent_sentiment_marks_the_signal_unavailable(self) -> None:
-        result = scoring.score_series(_rising_series())
-        assert "news_sentiment" in result.missing_information
-
-    def test_bad_news_scores_lower_than_good_news(self) -> None:
-        series = _rising_series(n=300)
-        bad = scoring.score_series(series, sentiment=-0.8)
-        good = scoring.score_series(series, sentiment=0.8)
-        assert bad.categories["risk"].points < good.categories["risk"].points
-
-    def test_neutral_news_sits_at_the_midpoint(self) -> None:
-        signal = _sentiment_signal(0.0)
-        assert signal.available
-        assert signal.value == pytest.approx(0.5)
-
-    def test_the_signal_saturates_rather_than_using_the_full_range(self) -> None:
-        """Beyond the saturation point, worse news cannot score lower.
-
-        A polarity of -1 needs every tone word in a week of headlines to be
-        negative, which in practice means one bleak article and nothing else.
-        Scaling to the full range would bunch every real company near the
-        midpoint and waste the signal's resolution.
-        """
-        assert _sentiment_signal(-scoring.SENTIMENT_SATURATION).value == pytest.approx(0.0)
+    def test_it_saturates_rather_than_running_to_the_extremes(self) -> None:
+        assert _sentiment_signal(-0.5).value == pytest.approx(0.0)
+        assert _sentiment_signal(0.5).value == pytest.approx(1.0)
         assert _sentiment_signal(-1.0).value == pytest.approx(0.0)
-        assert _sentiment_signal(scoring.SENTIMENT_SATURATION).value == pytest.approx(1.0)
-        assert _sentiment_signal(1.0).value == pytest.approx(1.0)
 
-    def test_it_is_bounded_within_the_category(self) -> None:
-        """One of five risk signals moves the category by at most a fifth.
+    def test_no_coverage_drops_the_signal(self) -> None:
+        signals = scoring._score_risk(_rising_series().preferred_close, None, None, {})
+        news = next(s for s in signals if s.name == "news_sentiment")
+        assert not news.available
 
-        This is the property that makes adding signals at the category layer
-        safe: the blend's six deliberate factor weights are untouched.
+    def test_its_influence_on_the_score_is_small_by_design(self) -> None:
+        """One of seven risk signals, in one of three quality parts, at weight 13.
+
+        Worth roughly 0.6% of the final score — bounded and local, which is the
+        whole point of admitting new signals at the group layer.
         """
-        series = _rising_series(n=300)
-        neutral = scoring.score_series(series)
-        worst = scoring.score_series(series, sentiment=-1.0)
-        risk_max = neutral.categories["risk"].max_points
-        assert abs(worst.categories["risk"].points - neutral.categories["risk"].points) <= (
-            risk_max / 5.0 + 1e-9
-        )
+        series = _rising_series()
+        best = scoring.score_series(series, fundamentals=CHEAP_FUNDAMENTALS, sentiment=0.5)
+        worst = scoring.score_series(series, fundamentals=CHEAP_FUNDAMENTALS, sentiment=-0.5)
+        assert 0.0 < best.score - worst.score < 3.0
+
+
+# -- Provenance -------------------------------------------------------------
 
 
 class TestConfidenceAndCompleteness:
-    def test_full_history_has_higher_confidence_than_short(self) -> None:
-        long = scoring.score_series(_rising_series(n=300))
-        short = scoring.score_series(_rising_series(n=40))
-        assert long.confidence > short.confidence
-
-    def test_completeness_is_a_fraction(self) -> None:
-        result = scoring.score_series(_rising_series())
-        assert 0.0 <= result.data_completeness <= 1.0
-
-    def test_full_series_has_full_completeness(self) -> None:
-        # Completeness only reaches the top of its range when *every* optional
-        # input is supplied: volume, the two comparison series (benchmark and
-        # sector), and the two looked-up readings (earnings drift, news tone).
-        # Withhold any one and the signals it feeds correctly report
-        # unavailable — which is the behaviour the rest of this file pins.
-        result = scoring.score_series(
-            _rising_series(n=300),
-            benchmark=_rising_series(n=300),
-            sector=_rising_series(n=300),
-            rates=_rising_series(n=300),
-            pead=60.0,
-            sentiment=0.2,
+    def test_a_full_input_set_is_more_complete_than_a_bare_one(self) -> None:
+        bare = scoring.score_series(_series_from_closes([100.0 + i for i in range(40)]))
+        full = scoring.score_series(
+            _rising_series(),
+            benchmark=_rising_series(),
+            sector=_rising_series(),
+            rates=_rising_series(),
+            sentiment=0.1,
+            fundamentals=CHEAP_FUNDAMENTALS,
+            insider=60.0,
         )
-        assert result.data_completeness > 0.9
+        assert full.data_completeness > bare.data_completeness
+        assert full.confidence > bare.confidence
 
     def test_withholding_an_optional_input_lowers_completeness(self) -> None:
-        """The counterpart: absence is *reported*, not silently filled in."""
         full = scoring.score_series(
-            _rising_series(n=300),
-            benchmark=_rising_series(n=300),
-            sector=_rising_series(n=300),
-            rates=_rising_series(n=300),
-            pead=60.0,
-            sentiment=0.2,
+            _rising_series(),
+            benchmark=_rising_series(),
+            sector=_rising_series(),
+            rates=_rising_series(),
+            sentiment=0.1,
+            fundamentals=CHEAP_FUNDAMENTALS,
         )
-        without_news = scoring.score_series(
-            _rising_series(n=300),
-            benchmark=_rising_series(n=300),
-            sector=_rising_series(n=300),
-            rates=_rising_series(n=300),
-            pead=60.0,
+        without = scoring.score_series(
+            _rising_series(),
+            benchmark=_rising_series(),
+            sector=_rising_series(),
+            rates=None,
+            sentiment=0.1,
+            fundamentals=CHEAP_FUNDAMENTALS,
         )
-        assert without_news.data_completeness < full.data_completeness
-        assert "news_sentiment" in without_news.missing_information
+        assert without.data_completeness < full.data_completeness
 
-
-class TestSectorScoring:
-    def test_rising_sector_scores_higher_than_falling_sector(self) -> None:
-        """The sector-health category tracks the sector proxy's own trend."""
-        stock = _rising_series(n=300)
-        up = scoring.score_series(stock, sector=_rising_series(n=300))
-        down = scoring.score_series(stock, sector=_falling_series(n=300))
-        assert up.categories["sector"].points > down.categories["sector"].points
-
-    def test_outperforming_its_sector_reads_positive(self) -> None:
-        """Relative strength = stock return - sector return; beating peers is +."""
-        strong = _rising_series(n=300, daily=0.003)
-        result = scoring.score_series(strong, sector=_falling_series(n=300))
-        assert result.metrics["relative_momentum_vs_sector_12m"] > 0
-
-    def test_missing_sector_is_neutral_not_penalised(self) -> None:
-        """No sector proxy → the category is scored at the neutral midpoint, and
-        contributes no sector metrics — the same discipline as any missing data."""
-        result = scoring.score_series(_rising_series(n=300))
-        sector_cat = result.categories["sector"]
-        assert sector_cat.signals_available == 0
-        assert sector_cat.points == sector_cat.max_points * 0.5
-        assert "sector_sma200" not in result.metrics
-        assert "relative_momentum_vs_sector_12m" not in result.metrics
-
-
-class TestFundamentalsFirstScoring:
-    def _result(self, **factors: float | None) -> scoring.ScoreResult:
-        """A minimal ScoreResult carrying just the five final-score factors."""
-        from app.models.scanner import Classification
-
-        return scoring.ScoreResult(
-            core_score=50.0,
-            categories={},
-            fundamental_score=None,
-            classification=Classification.DOES_NOT_PASS,
-            data_completeness=1.0,
-            confidence=1.0,
-            candles_used=300,
-            **factors,
+    def test_short_history_lowers_confidence_even_when_complete(self) -> None:
+        short = scoring.score_series(
+            _series_from_closes([100.0 + i for i in range(60)]),
+            fundamentals=CHEAP_FUNDAMENTALS,
         )
+        long = scoring.score_series(_rising_series(), fundamentals=CHEAP_FUNDAMENTALS)
+        assert short.confidence < long.confidence
 
-    def test_intrinsic_value_rewards_cheap_fundamentals(self) -> None:
-        cheap = scoring.score_value(
-            _rising_series(n=300),
-            fundamentals={"trailing_pe": Decimal("8"), "price_to_book": Decimal("1.0")},
-        )
-        dear = scoring.score_value(
-            _rising_series(n=300),
-            fundamentals={"trailing_pe": Decimal("40"), "price_to_book": Decimal("8")},
-        )
-        assert cheap.fundamental_value_score is not None
-        assert dear.fundamental_value_score is not None
-        assert cheap.fundamental_value_score > dear.fundamental_value_score
-
-    def test_final_score_is_a_clean_0_100(self) -> None:
-        r = self._result(
-            fundamental_value=80, price_cheapness=60, reversal=70, quality=55, sector_factor=50
-        )
-        final = scoring.combine_final_score(r)
-        assert 0.0 <= final <= 100.0
-        # A weighted average over the *available* factors, renormalised. Derived
-        # from the live weights rather than hardcoded: this fixture has no
-        # insider data, so the insider weight must drop out and the remaining
-        # five must re-normalise to 1.0. Hardcoding the numbers made this test
-        # fail for the wrong reason the moment a sixth factor was added.
-        w = scoring.DEFAULT_FACTOR_WEIGHTS
-        factors = {
-            "fundamental_value": 80,
-            "price_cheapness": 60,
-            "reversal": 70,
-            "quality": 55,
-            "sector": 50,
-        }
-        available_weight = sum(w[name] for name in factors)
-        expected = sum(w[name] * value for name, value in factors.items()) / available_weight
-        assert abs(final - expected) < 0.01
-
-    def test_missing_fundamentals_is_penalised_but_not_buried(self) -> None:
-        with_f = self._result(
-            fundamental_value=70, price_cheapness=60, reversal=70, quality=55, sector_factor=50
-        )
-        without_f = self._result(
-            fundamental_value=None, price_cheapness=60, reversal=70, quality=55, sector_factor=50
-        )
-        # No fundamentals → scored on the rest (renormalised) * 0.90 penalty, so
-        # strictly lower, but still a real score (not zeroed).
-        assert scoring.combine_final_score(without_f) < scoring.combine_final_score(with_f)
-        assert scoring.combine_final_score(without_f) > 40.0
-
-    def test_score_is_absolute_not_cohort_relative(self) -> None:
-        # The same inputs always produce the same score — it never depends on
-        # what else was in the batch.
-        r = self._result(
-            fundamental_value=75, price_cheapness=55, reversal=60, quality=50, sector_factor=45
-        )
-        assert scoring.combine_final_score(r) == scoring.combine_final_score(r)
-
-
-class TestReversalScoring:
-    def test_bottoming_series_scores_higher_than_still_falling(self) -> None:
-        # A V-shape: 150 sessions down, then 30 turning up.
-        down = [100.0 * (0.995**i) for i in range(150)]
-        up = [down[-1] * (1.01**i) for i in range(1, 31)]
-        bottoming = scoring.score_reversal(_series_from_closes(down + up))
-        falling = scoring.score_reversal(_falling_series(n=180))
-        assert bottoming is not None and falling is not None
-        assert bottoming > falling
+    def test_candles_used_is_reported(self) -> None:
+        assert scoring.score_series(_rising_series(n=250)).candles_used == 250
 
 
 class TestExplanations:
-    def test_no_output_claims_good_investment(self) -> None:
-        """§0: the scanner must never assert an instrument is a good investment."""
-        result = scoring.score_series(_rising_series())
-        blob = " ".join(
-            result.positive_signals + result.negative_signals + result.missing_information
-        ).lower()
-        for forbidden in ("good investment", "buy", "recommend", "should invest", "great stock"):
-            assert forbidden not in blob
+    def test_signals_carry_mechanical_language(self) -> None:
+        result = scoring.score_series(_rising_series(), fundamentals=CHEAP_FUNDAMENTALS)
+        text = " ".join(result.positive_signals + result.negative_signals).lower()
+        for word in ("buy", "sell", "recommend", "should"):
+            assert word not in text
 
-    def test_signals_use_mechanical_language(self) -> None:
-        result = scoring.score_series(_rising_series())
-        # Explanations describe measurements, e.g. "Price is above its 200-day".
-        assert result.positive_signals
-        assert all(isinstance(s, str) and s for s in result.positive_signals)
+    def test_both_sides_are_reported(self) -> None:
+        result = scoring.score_series(_rising_series(), fundamentals=EXPENSIVE_FUNDAMENTALS)
+        assert result.positive_signals or result.negative_signals
+        assert all(isinstance(s, str) and s for s in result.negative_signals)
 
-
-class TestValueScoring:
-    """The valuation lens: high score = cheap/undervalued, the mirror of momentum."""
-
-    def test_value_runs_alongside_momentum_without_changing_it(self) -> None:
-        # The core (momentum) score must be identical whether or not value is read.
-        series = _rising_series()
-        result = scoring.score_series(series)
-        assert result.value is not None
-        # Recompute core in isolation to confirm value did not perturb it.
-        core_only = sum(c.points for c in result.categories.values())
-        assert result.core_score == pytest.approx(round(core_only, 2))
-
-    def test_beaten_down_stock_scores_high_on_value(self) -> None:
-        """A stock in a steady downtrend is cheap by the value lens — the exact
-        opposite of the momentum score, which would rate it low."""
-        falling = _falling_series(n=300, daily=-0.003)
-        result = scoring.score_series(falling)
-        assert result.value is not None
-        assert result.value.value_score > 55.0
-        # And its momentum core is low — the two lenses disagree, as intended.
-        assert result.core_score < result.value.value_score
-
-    def test_stock_at_its_highs_scores_low_on_value(self) -> None:
-        """A stock marching to new highs is expensive by the value lens, even as
-        the momentum score rates it highly."""
-        rising = _rising_series(n=300, daily=0.003)
-        result = scoring.score_series(rising)
-        assert result.value is not None
-        assert result.value.value_score < 45.0
-        assert result.core_score > result.value.value_score
-
-    def test_value_and_momentum_are_independent_lenses(self) -> None:
-        rising = scoring.score_series(_rising_series())
-        falling = scoring.score_series(_falling_series())
-        assert rising.value is not None and falling.value is not None
-        # Momentum: rising beats falling. Value: falling beats rising. Opposite.
-        assert rising.core_score > falling.core_score
-        assert falling.value.value_score > rising.value.value_score
-
-    def test_fundamental_value_uses_cheapness_not_quality(self) -> None:
-        series = _rising_series()
-        cheap = scoring.score_series(
-            series,
-            fundamentals={"trailing_pe": Decimal("8"), "price_to_book": Decimal("1.0")},
+    def test_no_signal_is_listed_twice(self) -> None:
+        result = scoring.score_series(
+            _rising_series(), fundamentals=CHEAP_FUNDAMENTALS, sector=_rising_series()
         )
-        expensive = scoring.score_series(
-            series,
-            fundamentals={"trailing_pe": Decimal("50"), "price_to_book": Decimal("12")},
-        )
-        assert cheap.value is not None and expensive.value is not None
-        assert cheap.value.fundamental_value_score is not None
-        assert cheap.value.value_score > expensive.value.value_score
-
-    def test_missing_fundamentals_do_not_zero_the_value_score(self) -> None:
-        # No fundamentals → fundamental value is None, price value carries.
-        result = scoring.score_series(_falling_series())
-        assert result.value is not None
-        assert result.value.fundamental_value_score is None
-        assert result.value.value_score > 0
-
-    def test_value_signals_use_mechanical_language(self) -> None:
-        result = scoring.score_series(_falling_series())
-        assert result.value is not None
-        blob = " ".join(result.value.positive_signals + result.value.negative_signals).lower()
-        for forbidden in ("good investment", "buy", "undervalued stock", "recommend"):
-            assert forbidden not in blob
+        listed = result.positive_signals + result.negative_signals
+        assert len(listed) == len(set(listed))
 
 
-class TestPrimaryScoreBlend:
-    def test_momentum_primary_returns_the_core_unchanged(self) -> None:
-        # value_weight 0 → primary is exactly the momentum core.
-        p = scoring.combine_primary_score(80.0, 20.0, momentum_weight=1.0, value_weight=0.0)
-        assert p == pytest.approx(80.0)
+# -- Absoluteness -----------------------------------------------------------
 
-    def test_value_primary_leads_with_value(self) -> None:
-        # value-primary (0.3/0.7): a cheap, weak stock scores high on primary.
-        p = scoring.combine_primary_score(30.0, 90.0, momentum_weight=0.3, value_weight=0.7)
-        # 0.3*30 + 0.7*90 = 72.
-        assert p == pytest.approx(72.0)
 
-    def test_value_and_momentum_primary_rank_oppositely(self) -> None:
-        # A strong-expensive stock vs a weak-cheap one, under each configuration.
-        strong_expensive = (85.0, 10.0)  # (momentum, value)
-        weak_cheap = (30.0, 85.0)
+class TestScoreIsAbsolute:
+    def test_score_is_absolute_not_cohort_relative(self) -> None:
+        """The same inputs must score the same however the batch is composed.
 
-        def mom(m: float, v: float) -> float:
-            return scoring.combine_primary_score(m, v, momentum_weight=1.0, value_weight=0.0)
+        Batch-relative ranking would make a rotation over ~20,000 instruments
+        meaningless: tonight's 400 would be scored against each other rather than
+        against a fixed standard, so a score could not be compared with one from
+        a different night.
+        """
+        series = _rising_series()
+        alone = scoring.score_series(series, fundamentals=CHEAP_FUNDAMENTALS)
+        for _ in range(5):
+            scoring.score_series(_falling_series(), fundamentals=EXPENSIVE_FUNDAMENTALS)
+        again = scoring.score_series(series, fundamentals=CHEAP_FUNDAMENTALS)
+        assert alone.score == again.score
 
-        def val(m: float, v: float) -> float:
-            return scoring.combine_primary_score(m, v, momentum_weight=0.3, value_weight=0.7)
-
-        # Momentum-primary ranks the strong one higher.
-        assert mom(*strong_expensive) > mom(*weak_cheap)
-        # Value-primary ranks the cheap one higher — the inversion the user wants.
-        assert val(*weak_cheap) > val(*strong_expensive)
-
-    def test_missing_value_contributes_neutrally(self) -> None:
-        # No value score → treated as 50, neither rewarded nor punished.
-        p = scoring.combine_primary_score(80.0, None, momentum_weight=0.5, value_weight=0.5)
-        assert p == pytest.approx(65.0)  # (80 + 50) / 2
-
-    def test_degenerate_zero_weights_fall_back_to_momentum(self) -> None:
-        p = scoring.combine_primary_score(77.0, 20.0, momentum_weight=0.0, value_weight=0.0)
-        assert p == pytest.approx(77.0)
+    def test_scoring_is_deterministic(self) -> None:
+        series = _rising_series()
+        first = scoring.score_series(series, fundamentals=CHEAP_FUNDAMENTALS, insider=55.0)
+        second = scoring.score_series(series, fundamentals=CHEAP_FUNDAMENTALS, insider=55.0)
+        assert first.score == second.score
+        assert first.data_completeness == second.data_completeness

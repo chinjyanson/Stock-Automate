@@ -119,6 +119,24 @@ _RECOVERED = [*_STABLE_BASE, 95.0, 90.0, 86.0, 92.0, 97.0, 100.0]
 #: fixture proves the AVWAP gate rather than accidentally tripping another one.
 _BOUNCED = [*_STABLE_BASE, 95.0, 84.0, 65.0, 69.0]
 
+
+def _ramp(start: float, end: float, n: int) -> list[float]:
+    return [start + (end - start) * i / (n - 1) for i in range(n)]
+
+
+#: The same sell-off, reached from two opposite long-run trends. Both are 268
+#: bars, because `sma_slope(closes, 200, 21)` needs 200 bars plus its fit window
+#: and returns None below that — which is exactly why `_SELLOFF` alone cannot
+#: test the trend gate.
+#:
+#: The last 20 bars are identical in both, so the Bollinger bands, RSI and ATR
+#: are identical too (band 90.19, RSI ~38, close 86). The *only* thing that
+#: differs is the direction of the 200-day average underneath: +0.17%/day in one
+#: and -0.19%/day in the other. That is what makes these a test of the trend
+#: filter rather than of anything else.
+_UPTREND_SELLOFF = [*_ramp(60.0, 98.0, 220), *_SELLOFF]
+_DOWNTREND_SELLOFF = [*_ramp(160.0, 102.0, 220), *_SELLOFF]
+
 #: The sell-off above lands RSI at ~38.7. Pinned in the fixture rather than
 #: relying on the configured default, so retuning the strategy cannot silently
 #: change what these tests prove.
@@ -387,6 +405,151 @@ class TestMeanReversion:
         assert decision.outcome is StrategyDecisionOutcome.REJECTED_BY_RISK
         assert "stale 1d data" in decision.reason
         assert await InternalPaperBroker(db).get_positions() == []  # type: ignore[arg-type]
+
+
+class TestTrendFilter:
+    """Buy the dip in a business that is still growing, not one that is dying.
+
+    This is where momentum lives now. The scanner deliberately scores none of it:
+    it rotates 200-2000 names a night against ~20,000 instruments, so a stored
+    trend reading is 10-100 days old when compared against a fresh one. This
+    strategy sees every candidate every night, against last night's candles.
+    """
+
+    async def _run(self, db: object, ticker: str, closes: list[float], **params: object) -> int:
+        await _risk_config(db)
+        instrument = await _instrument(db, ticker)
+        await _upsert(db, instrument, Interval.D1, closes)
+        config = _config(instrument, f"meanrev-{ticker.lower()}", **params)
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+        summary = await StrategyEngine(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).run(config)
+        await db.commit()  # type: ignore[attr-defined]
+        return summary.signals
+
+    async def test_a_dip_in_a_rising_trend_is_entered(self, db: object) -> None:
+        assert await self._run(db, "UPTREND", _UPTREND_SELLOFF) == 1
+
+    async def test_the_same_dip_in_a_falling_trend_is_refused(self, db: object) -> None:
+        """Identical band, RSI and ATR — only the 200-day direction differs.
+
+        The bands, RSI and ATR see the last twenty bars, which are byte-identical
+        between the two fixtures. Nothing but the long-run trend can account for
+        the difference in outcome, which is what makes this a test of the gate.
+        """
+        assert await self._run(db, "DOWNTREND", _DOWNTREND_SELLOFF) == 0
+
+    async def test_a_short_history_still_trades(self, db: object) -> None:
+        """The gate must fail *open*, like every other optional measurement.
+
+        `sma_slope` returns None below ~221 bars, which covers every recent
+        listing. A gate that treated "cannot tell" as "no" would quietly stop the
+        strategy trading anything without a year of history — a silent, growing
+        restriction nobody asked for.
+        """
+        assert await self._run(db, "SHORTHIST", _SELLOFF) == 1
+
+    async def test_the_threshold_is_configurable(self, db: object) -> None:
+        """Loosened far enough, the declining stock is admitted again.
+
+        Proves the refusal above came from the threshold rather than from the
+        fixture tripping some other veto.
+        """
+        assert await self._run(db, "LOOSE", _DOWNTREND_SELLOFF, trend_slope_min=-1.0) == 1
+
+    async def test_a_rising_trend_can_be_required_to_be_steeper(self, db: object) -> None:
+        """The uptrend fixture rises ~0.17%/day; demand 1%/day and it is refused."""
+        assert await self._run(db, "STEEP", _UPTREND_SELLOFF, trend_slope_min=0.01) == 0
+
+    async def test_the_slope_is_recorded_on_the_decision(self, db: object) -> None:
+        """A gate that changes what is traded has to say so in the audit trail."""
+        await self._run(db, "RECORDED", _UPTREND_SELLOFF)
+        decision = (
+            (await db.execute(select(StrategyDecision)))  # type: ignore[attr-defined]
+            .scalars()
+            .one()
+        )
+        assert decision.metrics is not None
+        assert "sma200_slope" in decision.metrics
+        assert float(decision.metrics["sma200_slope"]) > 0
+        assert "200-day trend" in decision.reason
+
+
+class TestPeadVeto:
+    """Do not buy a dip the market is still repricing.
+
+    PEAD says a bad earnings reaction keeps drifting for weeks, so buying that
+    dip now is buying in front of the rest of it. The drift decays over 60 days
+    and the veto decays with it.
+    """
+
+    async def _seed_report(self, db: object, instrument: Instrument, days_ago: int) -> None:
+        from app.models.earnings import EarningsEvent
+
+        db.add(  # type: ignore[attr-defined]
+            EarningsEvent(
+                instrument_id=instrument.id,
+                report_date=(datetime.now(UTC) - timedelta(days=days_ago)).date(),
+            )
+        )
+        await db.flush()  # type: ignore[attr-defined]
+
+    async def _run(
+        self, db: object, ticker: str, *, report_days_ago: int | None, **params: object
+    ) -> int:
+        await _risk_config(db)
+        instrument = await _instrument(db, ticker)
+        await _upsert(db, instrument, Interval.D1, _SELLOFF)
+        if report_days_ago is not None:
+            await self._seed_report(db, instrument, report_days_ago)
+        config = _config(instrument, f"meanrev-{ticker.lower()}", **params)
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+        summary = await StrategyEngine(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).run(config)
+        await db.commit()  # type: ignore[attr-defined]
+        return summary.signals
+
+    async def test_no_earnings_event_does_not_block(self, db: object) -> None:
+        """The common case, especially outside the US where the calendar is thin.
+
+        A missing measurement must read as "no objection". Treating a thin
+        earnings calendar as bad news would veto most UK listings permanently.
+        """
+        assert await self._run(db, "NOREPORT", report_days_ago=None) == 1
+
+    async def test_a_fresh_bad_reaction_vetoes_the_entry(self, db: object) -> None:
+        """The sell-off *is* the reaction: -12% over the three bars after the report."""
+        assert await self._run(db, "BADNEWS", report_days_ago=3) == 0
+
+    async def test_an_old_reaction_no_longer_vetoes(self, db: object) -> None:
+        """Drift decays linearly over 60 days, and so does the veto.
+
+        At 57 days the same -12% reaction carries 5% of its original weight,
+        which lifts the score back above the threshold. A cliff at day 60 would
+        make the gate's behaviour depend on the calendar rather than on how much
+        drift is plausibly left.
+        """
+        assert await self._run(db, "OLDNEWS", report_days_ago=57) == 1
+
+    async def test_the_threshold_is_configurable(self, db: object) -> None:
+        """Set below anything achievable and the veto stands down entirely."""
+        assert await self._run(db, "PEADOFF", report_days_ago=3, pead_veto_below=-1.0) == 1
+
+    async def test_the_score_is_recorded_on_the_decision(self, db: object) -> None:
+        await self._run(db, "PEADREC", report_days_ago=3, pead_veto_below=-1.0)
+        decision = (
+            (await db.execute(select(StrategyDecision)))  # type: ignore[attr-defined]
+            .scalars()
+            .one()
+        )
+        assert decision.metrics is not None
+        assert float(decision.metrics["pead_score"]) < 40.0
 
 
 class TestStaleReporting:

@@ -25,6 +25,27 @@ Three indicators, each with a distinct job — none of them redundant:
     than a weighting because conviction never reaches sizing, so it can only
     make entries rarer; that is a real behavioural change, hence the flag.
 
+Two further gates ask a question the three indicators above cannot: is this dip
+in a company that is still fundamentally fine, or in one that is dying?
+
+  * **200-day slope** is the falling-knife filter. Buying dips works in an
+    uptrend and is a losing trade in a downtrend, and nothing in a band break or
+    an RSI reading can tell those apart. Note how it composes with the scanner
+    rather than fighting it: the scanner rewards a price *below* its 200-day
+    average, this gate requires the average *itself* to be rising. Cheap
+    relative to a business that is still growing — not cheap because it is
+    shrinking.
+  * **Post-earnings drift** vetoes a dip the market is still repricing. If the
+    last report landed badly, PEAD says the drift is not finished, so buying the
+    dip now is buying in front of more of it. The drift decays over 60 days and
+    the veto decays with it.
+
+Momentum lives here, in the timing layer, and deliberately not in the scanner.
+The scanner rotates 200-2000 names a night against ~20,000 instruments, so a
+score there is 10-100 days old when compared against a fresh one — fine for a
+P/E, useless for a trend. This strategy sees every candidate every night against
+candles from last night.
+
 ATR does double duty: the risk engine downstream also sizes the position and
 places the stop from it (`app.risk.engine`), so a wider-ranging stock
 automatically gets a smaller position and a wider stop. That is why this file
@@ -84,15 +105,29 @@ class MeanReversionStrategy(Strategy):
         # on and measured rather than assumed.
         avwap_enabled = bool(self.param("avwap_enabled", False))
         avwap_anchor_period = int(self.param("avwap_anchor_period", ind.TRADING_DAYS_PER_YEAR))
+        # Minimum slope of the 200-day average, as fractional change per bar.
+        # Zero means "flat or rising". Ships **on**, unlike anchored VWAP: this
+        # one has real evidence behind it rather than a plausible story, and its
+        # failure mode (skipping a dip in a declining business) is the one this
+        # strategy most needs protection from.
+        trend_slope_min = float(self.param("trend_slope_min", 0.0))
+        # PEAD reading at or below which a dip is left alone. 50 is neutral, so
+        # 40 is a real negative reaction rather than noise — roughly a 2%
+        # abnormal move down on a fresh report, or a 10% one about seven weeks
+        # ago once the decay is applied.
+        pead_veto_below = float(self.param("pead_veto_below", 40.0))
 
         signals: list[StrategySignal] = []
         for instrument in ctx.instruments:
-            # The longest lookback any indicator below needs, declared once so a
-            # shortfall is recorded as a SKIPPED decision rather than vanishing.
+            # The 200-day slope needs 200 bars plus its 21-bar fit window, which
+            # is far more than the Bollinger window asks for — hence the floor
+            # rather than a plain multiple of `bb_period`. `required` is
+            # deliberately *not* raised with it: a short series must still be
+            # tradable, it just cannot answer the trend question (see below).
             series = await ctx.series(
                 instrument.id,
                 self.read_interval,
-                limit=bb_period * 6,
+                limit=max(bb_period * 6, 260),
                 required=max(bb_period, rsi_period + 1, atr_period + 1),
             )
             if series is None:
@@ -129,6 +164,20 @@ class MeanReversionStrategy(Strategy):
             # else here: a missing measurement must not silently block trading.
             avwap_ok = avwap is None or last <= avwap
 
+            # Is the long-term trend still intact? `sma_slope` returns None on a
+            # series too short to fit 200 bars, which is most newly-listed names
+            # — and that reads as satisfied, for the same reason as above. A gate
+            # that fails closed on missing data would quietly stop this strategy
+            # trading anything without a year of history.
+            trend_slope = ind.sma_slope(series.close, 200, slope_window=21)
+            trend_ok = trend_slope is None or trend_slope >= trend_slope_min
+
+            # Is the market still repricing a bad report? Absent means no live
+            # earnings event, which is the common case outside the US where the
+            # calendar is thin — again, satisfied.
+            pead = ctx.pead_score(instrument.id)
+            pead_ok = pead is None or pead > pead_veto_below
+
             metrics = {
                 "bb_lower": lower,
                 "bb_middle": middle,
@@ -140,6 +189,10 @@ class MeanReversionStrategy(Strategy):
             }
             if avwap is not None:
                 metrics["anchored_vwap"] = avwap
+            if trend_slope is not None:
+                metrics["sma200_slope"] = trend_slope
+            if pead is not None:
+                metrics["pead_score"] = pead
 
             # Leave *before* the fall, or not at all. A chief officer choosing
             # to sell precedes about -6.28% excess return over the following
@@ -184,13 +237,23 @@ class MeanReversionStrategy(Strategy):
                     )
                 )
             elif held <= 0:
-                if last <= lower and rsi <= rsi_oversold and atr_pct >= min_atr_pct and avwap_ok:
+                if (
+                    last <= lower
+                    and rsi <= rsi_oversold
+                    and atr_pct >= min_atr_pct
+                    and avwap_ok
+                    and trend_ok
+                    and pead_ok
+                ):
                     # Conviction from how far below the band it closed, measured
                     # in band-widths so it stays comparable across instruments.
                     band_width = upper - lower
                     overshoot = (lower - last) / band_width if band_width > 0 else 0.0
                     conviction = min(1.0, 0.5 + overshoot)
                     avwap_note = f", below anchored VWAP {avwap:.2f}" if avwap is not None else ""
+                    trend_note = (
+                        f", 200-day trend {trend_slope:+.3%}/day" if trend_slope is not None else ""
+                    )
                     signals.append(
                         StrategySignal(
                             instrument_id=instrument.id,
@@ -200,7 +263,7 @@ class MeanReversionStrategy(Strategy):
                                 f"Mean reversion: close {last:.2f} <= lower band "
                                 f"{lower:.2f}, RSI {rsi:.0f} (<= {rsi_oversold:.0f}), "
                                 f"ATR {atr_pct:.1%} of price (>= {min_atr_pct:.1%})"
-                                f"{avwap_note}"
+                                f"{avwap_note}{trend_note}"
                             ),
                             metrics=metrics,
                         )
