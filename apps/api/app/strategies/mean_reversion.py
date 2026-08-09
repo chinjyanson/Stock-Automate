@@ -6,31 +6,40 @@ names become this strategy's universe. This strategy decides only *when*: it
 buys a ranked stock that has been pushed unusually cheap relative to its own
 recent range, and sells it once that dislocation has closed.
 
-Three indicators, each with a distinct job — none of them redundant:
+The entry has two halves that work in completely different ways, and the split
+is the design.
 
-  * **Bollinger Bands** locate the dislocation. A close below the lower band is
-    a move large relative to the stock's own recent volatility, which is what
-    makes this comparable across a volatile small-cap and a steady large-cap.
-  * **RSI** confirms it. Price alone can pierce a band while still trending
-    down hard; requiring oversold momentum too filters the "cheap and still
-    falling" case that a band break cannot distinguish on its own.
+**How dislocated is this? — a weighted score.** Three readings of the same
+underlying question, blended into one 0-1 number that must clear
+`entry_threshold`:
+
+  * **Bollinger band position** measures the move against the stock's *own*
+    recent volatility, which is what makes a 6% drop comparable between a wild
+    small-cap and a steady large-cap. Read as an inverted %B, so at or below the
+    lower band is full strength, the middle band is a half, and the upper band
+    is nothing.
+  * **RSI** reads whether the selling is exhausted. Price can pierce a band
+    while still trending down hard, and RSI is the thing that tells those apart.
+  * **Discount to the 20-day average** is the sanity check on the other two,
+    both of which are *relative* measures. A very quiet stock can break two
+    standard deviations on a move that is, in cash terms, nothing; this asks how
+    far it actually fell.
+
+None of the three is individually required. A deeply oversold RSI can carry a
+shallow band break and a violent band break can carry a middling RSI, which is
+the point: they measure one thing by three routes, so demanding all three
+clear a threshold was arbitrary. A component that cannot be computed drops out
+and the remaining weights renormalise — the same discipline the scanner uses.
+
+**Should this ever be bought? — hard gates.** These stay absolute, because they
+answer a different question. No amount of dislocation should overrule them: a
+dying business must not become buyable merely by falling far enough.
+
   * **ATR** gates on volatility. A stock whose true range is a rounding error
-    has no snapback worth trading, and its band width is noise. The entry
-    therefore requires a minimum ATR as a fraction of price.
-
-  * **Anchored VWAP** is an optional fourth condition, off by default. Anchored
-    to the last year's lowest close, it is the average price paid by everyone
-    who has bought since the bottom — entering below it means buying cheaper
-    than the crowd already committed to this recovery. It is a hard gate rather
-    than a weighting because conviction never reaches sizing, so it can only
-    make entries rarer; that is a real behavioural change, hence the flag.
-
-Two further gates ask a question the three indicators above cannot: is this dip
-in a company that is still fundamentally fine, or in one that is dying?
-
+    has no snapback worth trading, and its band width is noise.
   * **200-day slope** is the falling-knife filter. Buying dips works in an
-    uptrend and is a losing trade in a downtrend, and nothing in a band break or
-    an RSI reading can tell those apart. Note how it composes with the scanner
+    uptrend and loses money in a downtrend, and nothing in a band break or an
+    RSI reading can tell those apart. Note how it composes with the scanner
     rather than fighting it: the scanner rewards a price *below* its 200-day
     average, this gate requires the average *itself* to be rising. Cheap
     relative to a business that is still growing — not cheap because it is
@@ -39,6 +48,16 @@ in a company that is still fundamentally fine, or in one that is dying?
     last report landed badly, PEAD says the drift is not finished, so buying the
     dip now is buying in front of more of it. The drift decays over 60 days and
     the veto decays with it.
+  * **Anchored VWAP** is an optional fourth gate, off by default. Anchored to
+    the last year's lowest close, it is the average price paid by everyone who
+    has bought since the bottom — entering below it means buying cheaper than
+    the crowd already committed to this recovery. Being a gate it can only make
+    entries rarer, which is a real behavioural change and belongs behind a flag.
+
+A gate can refuse a perfect score, and no score can talk a gate round. That
+asymmetry is the whole reason the entry is split in two rather than being one
+number: "how attractive is this" and "is this allowed" are not the same question,
+and blending them lets an attractive enough trade buy its way past a safety rule.
 
 Momentum lives here, in the timing layer, and deliberately not in the scanner.
 The scanner rotates 200-2000 names a night against ~20,000 instruments, so a
@@ -77,6 +96,21 @@ from app.indicators import functions as ind
 from app.models.enums import Interval, OrderSide, StrategyKind
 from app.strategies.base import Strategy, StrategyContext, StrategySignal
 
+#: RSI at which the oversold component scores nothing, and at which it is full.
+#: 50 is the neutral midpoint of the indicator, so anything above it contributes
+#: zero rather than negatively — this is a dip-buying strategy, and an
+#: overbought reading is simply not evidence, not evidence against.
+RSI_NEUTRAL = 50.0
+RSI_FULL = 20.0
+
+#: Discount to the 20-day average at which that component reaches full strength.
+#: 10% is a large move against a twenty-day mean for most listed equities.
+SMA20_DISCOUNT_FULL = 0.10
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
 
 class MeanReversionStrategy(Strategy):
     kind = StrategyKind.MEAN_REVERSION
@@ -86,9 +120,25 @@ class MeanReversionStrategy(Strategy):
         bb_period = int(self.param("bb_period", 20))
         bb_std = float(self.param("bb_std", 2.0))
         rsi_period = int(self.param("rsi_period", 14))
-        rsi_oversold = float(self.param("rsi_oversold", 35.0))
         atr_period = int(self.param("atr_period", 14))
         min_atr_pct = float(self.param("min_atr_pct", 0.02))
+        # -- The dislocation score. Weights are relative, not absolute: they are
+        # renormalised by whatever could be measured, so they need not sum to 1
+        # and a missing component costs nothing.
+        #
+        # The band leads because it is the only one of the three that is scaled
+        # to the instrument's own volatility. The discount trails because it
+        # partly restates the band — deliberately, as an absolute-magnitude check
+        # on two relative measures — and would otherwise double-count.
+        w_band = float(self.param("entry_weight_band", 0.45))
+        w_rsi = float(self.param("entry_weight_rsi", 0.40))
+        w_discount = float(self.param("entry_weight_discount", 0.15))
+        # 0.60 is deliberately *below* where the old all-or-nothing rules sat.
+        # Requiring a band break AND RSI <= 35 corresponded to roughly 0.71 on
+        # this scale, so the same setups still qualify and a band break with RSI
+        # in the low 40s — or a deeply oversold stock that stopped just short of
+        # its band — now qualifies too, where before either was refused outright.
+        entry_threshold = float(self.param("entry_threshold", 0.60))
         # Insider selling pressure (0..0.40) at which a held position is closed.
         # 0.10 is a quarter of maximum, so it takes a real chief-officer sale
         # rather than a small or half-decayed one.
@@ -149,6 +199,36 @@ class MeanReversionStrategy(Strategy):
             held = ctx.held_quantity(instrument.id)
             pressure = ctx.sell_pressure(instrument.id)
 
+            # -- How dislocated is this? Three readings, one score. -----------
+            #
+            # Each contributes (weight, strength); anything unmeasurable is left
+            # out and the divisor shrinks with it, so absence neither helps nor
+            # hurts. None of the three can veto on its own.
+            components: list[tuple[float, float]] = []
+
+            band_width = upper - lower
+            if band_width > 0:
+                # Inverted %B: 1.0 at or below the lower band, 0.5 at the middle,
+                # 0.0 at the upper. Reading it as a position rather than as a
+                # yes/no break is what lets a stock that stopped just short of
+                # its band still make the case on the strength of the other two.
+                percent_b = (last - lower) / band_width
+                components.append((w_band, _clamp01(1.0 - percent_b)))
+
+            if rsi is not None:
+                components.append(
+                    (w_rsi, _clamp01((RSI_NEUTRAL - float(rsi)) / (RSI_NEUTRAL - RSI_FULL)))
+                )
+
+            if middle > 0:
+                discount = (middle - last) / middle
+                components.append((w_discount, _clamp01(discount / SMA20_DISCOUNT_FULL)))
+
+            total_weight = sum(w for w, _ in components)
+            entry_score = (
+                sum(w * s for w, s in components) / total_weight if total_weight > 0 else 0.0
+            )
+
             # Anchored to the lowest close of the last year: the average price
             # paid by everyone who has bought since the bottom. Entering below it
             # means buying cheaper than the crowd that already committed to this
@@ -186,6 +266,7 @@ class MeanReversionStrategy(Strategy):
                 "atr": atr,
                 "atr_pct": atr_pct,
                 "close": last,
+                "entry_score": entry_score,
             }
             if avwap is not None:
                 metrics["anchored_vwap"] = avwap
@@ -237,19 +318,16 @@ class MeanReversionStrategy(Strategy):
                     )
                 )
             elif held <= 0:
+                # The score decides *whether it is dislocated enough*; the three
+                # gates decide *whether it should be bought at all*. A gate can
+                # refuse a perfect score, and no score can talk a gate round.
                 if (
-                    last <= lower
-                    and rsi <= rsi_oversold
+                    entry_score >= entry_threshold
                     and atr_pct >= min_atr_pct
                     and avwap_ok
                     and trend_ok
                     and pead_ok
                 ):
-                    # Conviction from how far below the band it closed, measured
-                    # in band-widths so it stays comparable across instruments.
-                    band_width = upper - lower
-                    overshoot = (lower - last) / band_width if band_width > 0 else 0.0
-                    conviction = min(1.0, 0.5 + overshoot)
                     avwap_note = f", below anchored VWAP {avwap:.2f}" if avwap is not None else ""
                     trend_note = (
                         f", 200-day trend {trend_slope:+.3%}/day" if trend_slope is not None else ""
@@ -257,11 +335,17 @@ class MeanReversionStrategy(Strategy):
                     signals.append(
                         StrategySignal(
                             instrument_id=instrument.id,
+                            # The dislocation score *is* the conviction. Still not
+                            # read by sizing — the risk engine works from ATR and
+                            # equity alone — but it is at least now a number that
+                            # means something rather than a restatement of the
+                            # band break.
+                            conviction=entry_score,
                             side=OrderSide.BUY,
-                            conviction=conviction,
                             reason=(
-                                f"Mean reversion: close {last:.2f} <= lower band "
-                                f"{lower:.2f}, RSI {rsi:.0f} (<= {rsi_oversold:.0f}), "
+                                f"Mean reversion: entry score {entry_score:.2f} "
+                                f"(>= {entry_threshold:.2f}) — close {last:.2f} vs lower band "
+                                f"{lower:.2f}, RSI {rsi:.0f}, "
                                 f"ATR {atr_pct:.1%} of price (>= {min_atr_pct:.1%})"
                                 f"{avwap_note}{trend_note}"
                             ),

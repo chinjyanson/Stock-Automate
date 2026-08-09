@@ -137,16 +137,21 @@ def _ramp(start: float, end: float, n: int) -> list[float]:
 _UPTREND_SELLOFF = [*_ramp(60.0, 98.0, 220), *_SELLOFF]
 _DOWNTREND_SELLOFF = [*_ramp(160.0, 102.0, 220), *_SELLOFF]
 
-#: The sell-off above lands RSI at ~38.7. Pinned in the fixture rather than
-#: relying on the configured default, so retuning the strategy cannot silently
-#: change what these tests prove.
+#: The sell-off above scores 0.751 on the entry blend: a full band break (1.000),
+#: RSI 38.7 (0.378) and a >10% discount to the 20-day average (1.000). Threshold
+#: and weights are pinned in the fixture rather than taken from the configured
+#: defaults, so retuning the strategy cannot silently change what these tests
+#: prove — they are about the gates, not about the tuning.
 _ENTRY_PARAMS = {
     "bb_period": 20,
     "bb_std": 2.0,
     "rsi_period": 14,
-    "rsi_oversold": 40.0,
     "atr_period": 14,
     "min_atr_pct": 0.02,
+    "entry_weight_band": 0.45,
+    "entry_weight_rsi": 0.40,
+    "entry_weight_discount": 0.15,
+    "entry_threshold": 0.60,
 }
 
 
@@ -306,17 +311,42 @@ class TestMeanReversion:
         await db.commit()  # type: ignore[attr-defined]
         assert summary.signals == 1
 
-    async def test_rsi_can_veto_a_band_break(self, db: object) -> None:
-        """Price below the band is not enough — momentum must be washed out too.
+    async def test_neither_rsi_nor_the_band_can_veto_on_its_own(self, db: object) -> None:
+        """The entry blend has no individual vetoes, and that is the point.
 
-        This is the "cheap and still falling" case a band break alone cannot
-        distinguish from a snapback candidate.
+        RSI is 38.7 on these bars — under the old all-or-nothing rules a
+        threshold of 35 refused the trade outright, however violent the break.
+        Now it contributes 0.378 and the band break and discount carry the total
+        to 0.751, comfortably clear. Weight RSI at zero and the entry still
+        fires, which is what "not a veto" has to mean.
         """
         await _risk_config(db)
-        instrument = await _instrument(db, "FALLING")
+        instrument = await _instrument(db, "NOVETO")
         await _upsert(db, instrument, Interval.D1, _SELLOFF)
-        # Same bars, but demanding a far more oversold RSI than this move produced.
-        config = _config(instrument, "meanrev-rsi-veto", rsi_oversold=20.0)
+        config = _config(instrument, "meanrev-no-rsi-veto", entry_weight_rsi=0.0)
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        summary = await StrategyEngine(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).run(config)
+        await db.commit()  # type: ignore[attr-defined]
+        assert summary.signals == 1
+
+    async def test_a_weak_dislocation_is_refused_by_the_threshold(self, db: object) -> None:
+        """Removing the vetoes must not mean removing the trigger.
+
+        The recovered fixture is back above its 20-day average: band position
+        0.384, RSI 52.3 (nothing), no discount — a blended 0.173. Something still
+        has to say "now", and without a threshold this strategy would buy every
+        ranked name on the first evening and churn it straight back out at the
+        middle-band exit.
+        """
+        await _risk_config(db)
+        instrument = await _instrument(db, "WEAK")
+        await _upsert(db, instrument, Interval.D1, _RECOVERED)
+        config = _config(instrument, "meanrev-weak")
         db.add(config)  # type: ignore[attr-defined]
         await db.flush()  # type: ignore[attr-defined]
 
@@ -326,6 +356,83 @@ class TestMeanReversion:
         ).run(config)
         await db.commit()  # type: ignore[attr-defined]
         assert summary.signals == 0
+
+    async def test_the_threshold_is_what_decides(self, db: object) -> None:
+        """The same bars, admitted at 0.60 and refused at 0.80."""
+        await _risk_config(db)
+        instrument = await _instrument(db, "STRICT")
+        await _upsert(db, instrument, Interval.D1, _SELLOFF)
+        config = _config(instrument, "meanrev-strict", entry_threshold=0.80)
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        summary = await StrategyEngine(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).run(config)
+        await db.commit()  # type: ignore[attr-defined]
+        assert summary.signals == 0
+
+    async def test_the_score_is_recorded_and_becomes_the_conviction(self, db: object) -> None:
+        """A number that decides a trade has to be visible afterwards."""
+        await _risk_config(db)
+        instrument = await _instrument(db, "SCORED")
+        await _upsert(db, instrument, Interval.D1, _SELLOFF)
+        config = _config(instrument, "meanrev-scored")
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        await StrategyEngine(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).run(config)
+        await db.commit()  # type: ignore[attr-defined]
+
+        decision = (
+            (await db.execute(select(StrategyDecision)))  # type: ignore[attr-defined]
+            .scalars()
+            .one()
+        )
+        assert decision.metrics is not None
+        score = float(decision.metrics["entry_score"])
+        assert score == pytest.approx(0.751, abs=0.01)
+        assert float(decision.conviction) == pytest.approx(score, abs=1e-6)
+        assert "entry score" in decision.reason
+
+    async def test_a_missing_component_renormalises_rather_than_scoring_zero(
+        self, db: object
+    ) -> None:
+        """Weights are relative, so they need not sum to 1.
+
+        Halving every weight must not halve the score — otherwise a config that
+        looked like a rescaling would quietly become a much stricter screen.
+        """
+        await _risk_config(db)
+        instrument = await _instrument(db, "RENORM")
+        await _upsert(db, instrument, Interval.D1, _SELLOFF)
+        config = _config(
+            instrument,
+            "meanrev-renorm",
+            entry_weight_band=0.225,
+            entry_weight_rsi=0.20,
+            entry_weight_discount=0.075,
+        )
+        db.add(config)  # type: ignore[attr-defined]
+        await db.flush()  # type: ignore[attr-defined]
+
+        await StrategyEngine(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).run(config)
+        await db.commit()  # type: ignore[attr-defined]
+
+        decision = (
+            (await db.execute(select(StrategyDecision)))  # type: ignore[attr-defined]
+            .scalars()
+            .one()
+        )
+        assert decision.metrics is not None
+        assert float(decision.metrics["entry_score"]) == pytest.approx(0.751, abs=0.01)
 
     async def test_atr_can_veto_a_band_break(self, db: object) -> None:
         """A stock too quiet to be worth trading is filtered out by ATR.

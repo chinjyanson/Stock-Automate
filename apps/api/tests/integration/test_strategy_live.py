@@ -174,7 +174,6 @@ async def _entry_config(db: object, instrument: Instrument) -> StrategyConfigura
             "bb_period": 20,
             "bb_std": 2.0,
             "rsi_period": 14,
-            "rsi_oversold": 40.0,
             "atr_period": 14,
             "min_atr_pct": 0.02,
         },
