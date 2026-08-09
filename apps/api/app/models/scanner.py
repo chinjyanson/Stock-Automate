@@ -107,8 +107,8 @@ class ScannerConfiguration(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     trading212_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     # -- Scoring (§6) -------------------------------------------------------
-    #: Weights of the five scoring groups, summing to 100 — value 32 /
-    #: cheapness 30 / insider 16 / quality 13 / sector 9 by default. See
+    #: Weights of the five scoring groups, summing to 100 — value 30 /
+    #: cheapness 24 / insider 18 / quality 18 / sector 10 by default. See
     #: scoring.DEFAULT_WEIGHTS.
     weights: Mapped[dict[str, Any] | None] = mapped_column()
     #: Band thresholds, e.g. {"screening": 75, "watchlist": 60}.

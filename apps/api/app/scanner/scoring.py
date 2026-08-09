@@ -53,27 +53,43 @@ from app.models.scanner import Classification
 
 # -- Default group weights. Sum to 100. -------------------------------------
 #
-# Fundamentals-first: intrinsic value and price cheapness lead, with insider
-# buying, business/market soundness and sector health in support.
+# Fundamentals-first, and deliberately less cheapness-led than the first cut:
+# intrinsic value leads, with insider buying and business soundness given equal
+# second billing, then price level, then sector health.
+#
+# Retuned 2026-08-09. Cheapness fell 30 -> 24 and quality rose 13 -> 18 to close
+# the gap the old weights left open: a stock that is cheap *because the business
+# is deteriorating* scored far too close to a sound one. Measured on a value trap
+# (cheapness 90, quality 35) against a compounder (cheapness 45, quality 85), the
+# trap's lead halved from +13.8 to +7.1 points.
 DEFAULT_WEIGHTS: dict[str, float] = {
     # Graham margin of safety, earnings yield, price-to-book, PEG, dividend
     # yield. The heaviest group, and the one most instruments lack entirely —
     # which is why a missing group must renormalise rather than score zero.
-    "value": 32.0,
-    # Where the price sits against its own year. This is the group that rewards
-    # being *at* a low, which is what the mean-reversion entry downstream needs.
-    "cheapness": 30.0,
+    "value": 30.0,
+    # Where the price sits against its own year. Still substantial, because this
+    # is the group that rewards being *at* a low, which is what the
+    # mean-reversion entry downstream needs — but no longer able to carry a
+    # failing business into the top ranks on price alone.
+    "cheapness": 24.0,
     # Insider *buying* only; selling is a penalty, not a group (see
-    # DEFAULT_INSIDER_SELL_PENALTY). Held here because this is the one group
-    # absent for most instruments — Form 4 has no UK equivalent, so ~60% of a
-    # Trading 212 universe can never carry it — and raising it further would let
-    # a single buy signal lift an otherwise ordinary company over a better one
-    # that simply files in the wrong jurisdiction.
-    "insider": 16.0,
-    # Is this a sound business in a sound market, or a falling knife?
-    "quality": 13.0,
+    # DEFAULT_INSIDER_SELL_PENALTY).
+    #
+    # Note what this weight means in practice: the group holds a *single*
+    # measurement, so 18 points rest on one lookup — 2.25x the next-heaviest
+    # per-measurement weight, and 21x one risk signal. It can swing a score by
+    # 18 points end to end. That is intended, but it makes *having US filings at
+    # all* a real differentiator, since Form 4 has no UK equivalent and ~60% of a
+    # Trading 212 universe can never carry this group. Watch the top ranks for a
+    # US skew; `test_buying_cannot_dominate_the_ranking` pins the absent-vs-best
+    # gap under 12 points (currently 7.2).
+    "insider": 18.0,
+    # Is this a sound business in a sound market, or a falling knife? Raised to
+    # match insider: the falling-knife question deserves as much say as the
+    # is-anyone-buying one.
+    "quality": 18.0,
     # Health of the instrument's own industry, via its sector ETF.
-    "sector": 9.0,
+    "sector": 10.0,
 }
 
 DEFAULT_THRESHOLDS: dict[str, float] = {"screening": 75.0, "watchlist": 60.0}
@@ -246,16 +262,18 @@ def score_series(
     risk_signals = _score_risk(closes, rates, sentiment, metrics)
     liquidity_signals = _score_liquidity(closes, volumes, metrics)
 
+    # A partial `weights` dict falls back to the defaults key by key, rather than
+    # to a literal repeated here — two copies of a weight would eventually
+    # disagree, and the one that lost would do so silently.
+    def _w(name: str) -> float:
+        return weights.get(name, DEFAULT_WEIGHTS[name])
+
     groups: dict[str, GroupScore] = {
-        "value": _group("value", _score_value(fundamentals), weights.get("value", 32.0)),
-        "cheapness": _group(
-            "cheapness", _score_cheapness(closes, metrics), weights.get("cheapness", 30.0)
-        ),
-        "insider": _insider_group(insider, weights.get("insider", 16.0)),
-        "quality": _quality_group(
-            fundamentals, risk_signals, liquidity_signals, weights.get("quality", 13.0)
-        ),
-        "sector": _group("sector", _score_sector(sector, metrics), weights.get("sector", 9.0)),
+        "value": _group("value", _score_value(fundamentals), _w("value")),
+        "cheapness": _group("cheapness", _score_cheapness(closes, metrics), _w("cheapness")),
+        "insider": _insider_group(insider, _w("insider")),
+        "quality": _quality_group(fundamentals, risk_signals, liquidity_signals, _w("quality")),
+        "sector": _group("sector", _score_sector(sector, metrics), _w("sector")),
     }
 
     # Unscored context for the results table. Computed last so it cannot be

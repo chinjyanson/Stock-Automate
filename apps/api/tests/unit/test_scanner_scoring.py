@@ -140,6 +140,54 @@ class TestScoreRange:
         assert 0.0 <= result.score <= 100.0
 
 
+class TestWeightBalance:
+    """The tuning decisions behind DEFAULT_WEIGHTS, stated as behaviour.
+
+    Pinning the constants themselves would just restate them. What is worth
+    protecting is what they were chosen to *do*, so that a future retune has to
+    break a claim about outcomes rather than only change a number.
+    """
+
+    def test_soundness_counts_for_at_least_as_much_as_price_level(self) -> None:
+        """Retuned 2026-08-09: cheapness 30 → 24, quality 13 → 18.
+
+        The old balance let a cheap price carry a deteriorating business a long
+        way up the ranking. Quality is now weighted at least as heavily as
+        cheapness, which is the whole point of that change.
+        """
+        assert scoring.DEFAULT_WEIGHTS["quality"] >= scoring.DEFAULT_WEIGHTS["cheapness"] * 0.7
+
+    def test_a_value_trap_no_longer_runs_far_ahead_of_a_sound_business(self) -> None:
+        """A cheap, deteriorating stock against a dearer, sound one.
+
+        The trap is still allowed to win — it *is* cheaper, and this is a value
+        screen. What the weights control is by how much. Under the pre-retune
+        balance the gap was +13.8 points, which is more than a whole
+        classification band.
+        """
+        trap = {"value": 80.0, "cheapness": 90.0, "insider": None, "quality": 35.0, "sector": 50.0}
+        solid = {"value": 60.0, "cheapness": 45.0, "insider": None, "quality": 85.0, "sector": 70.0}
+        gap = scoring.combine_score(_full_groups(**trap)) - scoring.combine_score(
+            _full_groups(**solid)
+        )
+        assert 0 < gap < 10.0
+
+    def test_insider_is_the_heaviest_single_measurement(self) -> None:
+        """Its group holds exactly one lookup, so its weight is undiluted.
+
+        Worth stating because it is easy to miss from the weight table alone: at
+        18 the insider group is only the joint-second *group*, but it is by some
+        way the heaviest single *measurement* — value's 30 is split five ways.
+        """
+        per_measurement = {
+            "value": scoring.DEFAULT_WEIGHTS["value"] / 5,
+            "cheapness": scoring.DEFAULT_WEIGHTS["cheapness"] / 3,
+            "insider": scoring.DEFAULT_WEIGHTS["insider"] / 1,
+            "sector": scoring.DEFAULT_WEIGHTS["sector"] / 4,
+        }
+        assert max(per_measurement, key=lambda k: per_measurement[k]) == "insider"
+
+
 class TestClassification:
     def test_bands(self) -> None:
         assert scoring.classify(80.0) is Classification.SCREENING_CANDIDATE

@@ -49,7 +49,7 @@ _DROPPED_RESULT_COLUMNS: tuple[tuple[str, bool], ...] = (
 #: The five-group default (scoring.DEFAULT_WEIGHTS). Written over whatever the
 #: old six-category `weights` held, since the key names no longer exist.
 _NEW_WEIGHTS = (
-    '{"value": 32.0, "cheapness": 30.0, "insider": 16.0, "quality": 13.0, "sector": 9.0}'
+    '{"value": 30.0, "cheapness": 24.0, "insider": 18.0, "quality": 18.0, "sector": 10.0}'
 )
 
 _OLD_WEIGHTS = (

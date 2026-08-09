@@ -411,31 +411,31 @@ export default function ScannerPage() {
                 </th>
                 <th
                   className="px-4 py-2 text-right font-medium"
-                  title="Intrinsic value (weight 32): Graham margin-of-safety, earnings yield, P/B, PEG, dividend yield"
+                  title="Intrinsic value (weight 30): Graham margin-of-safety, earnings yield, P/B, PEG, dividend yield"
                 >
                   Intr.
                 </th>
                 <th
                   className="px-4 py-2 text-right font-medium"
-                  title="Price cheapness (weight 30): pullback from the 52-week high, position in range, discount to the 200-day average"
+                  title="Price cheapness (weight 24): pullback from the 52-week high, position in range, discount to the 200-day average"
                 >
                   Cheap
                 </th>
                 <th
                   className="px-4 py-2 text-right font-medium"
-                  title="Insider buying (weight 16): SEC Form 4, 50 = neutral. Blank for non-US listings, which file no Form 4"
+                  title="Insider buying (weight 18): SEC Form 4, 50 = neutral. Blank for non-US listings, which file no Form 4"
                 >
                   Ins.
                 </th>
                 <th
                   className="px-4 py-2 text-right font-medium"
-                  title="Quality / soundness (weight 13): margins, growth, low debt, low volatility, liquidity"
+                  title="Quality / soundness (weight 18): margins, growth, low debt, low volatility, liquidity"
                 >
                   Qual.
                 </th>
                 <th
                   className="px-4 py-2 text-right font-medium"
-                  title="Sector health (weight 9): is the stock's own industry (its sector ETF) strengthening?"
+                  title="Sector health (weight 10): is the stock's own industry (its sector ETF) strengthening?"
                 >
                   Sec.
                 </th>
