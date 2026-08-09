@@ -57,11 +57,15 @@ from app.models.scanner import Classification
 # intrinsic value leads, with insider buying and business soundness given equal
 # second billing, then price level, then sector health.
 #
-# Retuned 2026-08-09. Cheapness fell 30 -> 24 and quality rose 13 -> 18 to close
-# the gap the old weights left open: a stock that is cheap *because the business
-# is deteriorating* scored far too close to a sound one. Measured on a value trap
-# (cheapness 90, quality 35) against a compounder (cheapness 45, quality 85), the
-# trap's lead halved from +13.8 to +7.1 points.
+# Retuned 2026-08-09, in two passes. Cheapness fell 30 -> 24 and quality rose
+# 13 -> 21 to close the gap the original weights left open: a stock that is cheap
+# *because the business is deteriorating* scored far too close to a sound one.
+# Measured on a value trap (cheapness 90, quality 35) against a compounder
+# (cheapness 45, quality 85), the trap's lead fell from +13.8 to +5.1 points.
+#
+# The second pass also took insider back from 18 to 15, because a single lookup
+# carrying 18 points made *having US filings at all* too strong a differentiator
+# — see the note on that key below.
 DEFAULT_WEIGHTS: dict[str, float] = {
     # Graham margin of safety, earnings yield, price-to-book, PEG, dividend
     # yield. The heaviest group, and the one most instruments lack entirely —
@@ -76,18 +80,23 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     # DEFAULT_INSIDER_SELL_PENALTY).
     #
     # Note what this weight means in practice: the group holds a *single*
-    # measurement, so 18 points rest on one lookup — 2.25x the next-heaviest
-    # per-measurement weight, and 21x one risk signal. It can swing a score by
-    # 18 points end to end. That is intended, but it makes *having US filings at
-    # all* a real differentiator, since Form 4 has no UK equivalent and ~60% of a
-    # Trading 212 universe can never carry this group. Watch the top ranks for a
-    # US skew; `test_buying_cannot_dominate_the_ranking` pins the absent-vs-best
-    # gap under 12 points (currently 7.2).
-    "insider": 18.0,
-    # Is this a sound business in a sound market, or a falling knife? Raised to
-    # match insider: the falling-knife question deserves as much say as the
-    # is-anyone-buying one.
-    "quality": 18.0,
+    # measurement, so all 15 points rest on one lookup — still the heaviest
+    # per-measurement weight in the system, at 1.9x cheapness and 15x one risk
+    # signal, and able to swing a score 15 points end to end.
+    #
+    # That is why it came back down from 18. Form 4 has no UK equivalent, so
+    # ~60% of a Trading 212 universe can never carry this group at all; the
+    # heavier this key, the more the ranking rewards *being US-listed* rather
+    # than being a good business. `test_buying_cannot_dominate_the_ranking` pins
+    # the absent-vs-best gap under 12 points (currently 6.0). Still worth
+    # watching the top ranks for a US skew.
+    "insider": 15.0,
+    # Is this a sound business in a sound market, or a falling knife? The
+    # heaviest group after value, and deliberately ahead of both cheapness and
+    # insider: whether the business is deteriorating decides whether a low price
+    # is an opportunity or a warning, so it should outrank both the price itself
+    # and who happens to be buying.
+    "quality": 21.0,
     # Health of the instrument's own industry, via its sector ETF.
     "sector": 10.0,
 }

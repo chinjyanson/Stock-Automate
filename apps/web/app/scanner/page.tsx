@@ -423,13 +423,13 @@ export default function ScannerPage() {
                 </th>
                 <th
                   className="px-4 py-2 text-right font-medium"
-                  title="Insider buying (weight 18): SEC Form 4, 50 = neutral. Blank for non-US listings, which file no Form 4"
+                  title="Insider buying (weight 15): SEC Form 4, 50 = neutral. Blank for non-US listings, which file no Form 4"
                 >
                   Ins.
                 </th>
                 <th
                   className="px-4 py-2 text-right font-medium"
-                  title="Quality / soundness (weight 18): margins, growth, low debt, low volatility, liquidity"
+                  title="Quality / soundness (weight 21): margins, growth, low debt, low volatility, liquidity"
                 >
                   Qual.
                 </th>

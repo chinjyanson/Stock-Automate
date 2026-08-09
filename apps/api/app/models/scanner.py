@@ -108,7 +108,7 @@ class ScannerConfiguration(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     # -- Scoring (§6) -------------------------------------------------------
     #: Weights of the five scoring groups, summing to 100 — value 30 /
-    #: cheapness 24 / insider 18 / quality 18 / sector 10 by default. See
+    #: cheapness 24 / insider 15 / quality 21 / sector 10 by default. See
     #: scoring.DEFAULT_WEIGHTS.
     weights: Mapped[dict[str, Any] | None] = mapped_column()
     #: Band thresholds, e.g. {"screening": 75, "watchlist": 60}.

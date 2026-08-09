@@ -149,11 +149,11 @@ class TestWeightBalance:
     """
 
     def test_soundness_counts_for_at_least_as_much_as_price_level(self) -> None:
-        """Retuned 2026-08-09: cheapness 30 → 24, quality 13 → 18.
+        """Retuned 2026-08-09: cheapness 30 → 24, quality 13 → 21.
 
         The old balance let a cheap price carry a deteriorating business a long
-        way up the ranking. Quality is now weighted at least as heavily as
-        cheapness, which is the whole point of that change.
+        way up the ranking. Quality is now weighted comparably to cheapness — in
+        fact above it — which is the whole point of that change.
         """
         assert scoring.DEFAULT_WEIGHTS["quality"] >= scoring.DEFAULT_WEIGHTS["cheapness"] * 0.7
 
@@ -171,6 +171,26 @@ class TestWeightBalance:
             _full_groups(**solid)
         )
         assert 0 < gap < 10.0
+
+    def test_the_migration_seeds_exactly_these_weights(self) -> None:
+        """The migration writes `weights` as a JSON literal; it must not drift.
+
+        `_config_values` reads the stored dict in preference to the constant, so
+        a literal left behind after a retune would keep the *old* weights in
+        production while every test here passed against the new ones. Silent, and
+        only visible as scores that disagree with the code.
+        """
+        import importlib.util
+        import json
+        from pathlib import Path
+
+        path = next(Path(__file__).parents[2].glob("alembic/versions/*_scanner_single_score.py"))
+        spec = importlib.util.spec_from_file_location("_mig", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        assert json.loads(module._NEW_WEIGHTS) == scoring.DEFAULT_WEIGHTS
 
     def test_insider_is_the_heaviest_single_measurement(self) -> None:
         """Its group holds exactly one lookup, so its weight is undiluted.
