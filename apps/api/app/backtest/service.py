@@ -53,13 +53,31 @@ class BacktestService:
         config: ReplayConfig | None = None,
         *,
         history_bars: int = DEFAULT_HISTORY_BARS,
+        min_bars: int | None = None,
     ) -> tuple[PortfolioResult, list[InstrumentRun]]:
-        """Replay `rules` over every instrument that has enough stored history.
+        """Replay `rules` over every instrument with enough stored history.
 
         An instrument with too few bars is skipped rather than counted as a run
         that found nothing — the two are different facts, and conflating them
         would let a thin sample masquerade as a strategy that does not trade.
+
+        **`min_bars` is what makes a sweep apples-to-apples.** Eligibility
+        otherwise derives from `rules`, so two configurations being compared
+        could silently be measured over different instruments — and the one that
+        happened to admit a few more thinly-covered names would look different
+        for a reason that has nothing to do with the rule being tested. Pass the
+        same `min_bars` to every configuration in a comparison and the samples
+        are identical by construction.
+
+        It also fixes a subtler mismatch: eligibility used to be checked against
+        `required_bars` (~21) while `replay` starts at the warmup (~260), so
+        instruments between the two were admitted and then contributed nothing
+        at all, padding the denominator with rows that never traded.
         """
+        config = config or ReplayConfig()
+        warmup = config.warmup_bars if config.warmup_bars is not None else rules.preferred_bars
+        threshold = min_bars if min_bars is not None else max(warmup, rules.required_bars) + 1
+
         per_instrument: dict[str, BacktestResult] = {}
         runs: list[InstrumentRun] = []
 
@@ -67,7 +85,7 @@ class BacktestService:
             candles = await self._store.get_candles(
                 instrument.id, Interval.D1, limit=history_bars, closed_only=True
             )
-            if len(candles) < rules.required_bars + 1:
+            if len(candles) < threshold:
                 continue
             series = candles_to_series(candles)
             try:

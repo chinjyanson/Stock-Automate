@@ -34,20 +34,41 @@ from app.models.instrument import Instrument
 from app.strategies.mean_reversion import EntryRules
 
 
+def _standard_error_r(pooled: PortfolioResult) -> float | None:
+    """Standard error of the mean R, so a bucket can be read with its noise.
+
+    Every comparison in the first run of this harness came back inside its own
+    error bars, and reporting expectancy without this invites reading a rounding
+    difference as a finding.
+    """
+    trades = pooled.combined.trades
+    n = len(trades)
+    if n < 2:
+        return None
+    mean = sum(t.r_multiple for t in trades) / n
+    variance = sum((t.r_multiple - mean) ** 2 for t in trades) / (n - 1)
+    return float((variance / n) ** 0.5)
+
+
 def _print_result(label: str, pooled: PortfolioResult, *, instruments: int) -> None:
     combined = pooled.combined
     if combined.trade_count == 0:
-        print(f"  {label:<28} no trades over {instruments} instrument(s)")
+        print(f"  {label:<24} no trades over {instruments} instrument(s)")
         return
     pf = combined.profit_factor
+    se = _standard_error_r(pooled)
+    # +/- two standard errors. A bucket whose interval spans zero has not
+    # demonstrated anything, however good its point estimate looks.
+    band = f"+/-{2 * se:.2f}" if se is not None else "  n/a"
+    verdict = "" if se is None else ("  *" if abs(combined.expectancy_r) > 2 * se else "")
     print(
-        f"  {label:<28} {combined.trade_count:>5} trades  "
+        f"  {label:<24} {combined.trade_count:>5} trades  "
         f"win {combined.win_rate:>6.1%}  "
-        f"exp {combined.expectancy_r:>+6.2f}R  "
+        f"exp {combined.expectancy_r:>+6.2f}R {band}  "
         f"total {combined.total_r:>+8.1f}R  "
         f"maxDD {combined.max_drawdown_r:>6.1f}R  "
         f"PF {('  n/a' if pf is None else f'{pf:>5.2f}')}  "
-        f"held {combined.avg_bars_held:>5.1f}d"
+        f"held {combined.avg_bars_held:>5.1f}d{verdict}"
     )
 
 
@@ -88,6 +109,14 @@ async def _universe(service: BacktestService, size: int) -> tuple[list[Instrumen
 
 async def _run(size: int, sweep: str | None, warmup: int | None) -> None:
     config = ReplayConfig(warmup_bars=warmup)
+    baseline = EntryRules()
+    effective_warmup = warmup if warmup is not None else baseline.preferred_bars
+    # One eligibility bar for every configuration in the run, computed from the
+    # baseline rules rather than from each bucket's own. Otherwise two buckets
+    # could be measured over different instruments, and the one that happened to
+    # admit a few extra thinly-covered names would differ for a reason that has
+    # nothing to do with the rule under test.
+    min_bars = max(effective_warmup, baseline.required_bars) + 1
 
     async with session_scope() as session:
         service = BacktestService(session)
@@ -95,19 +124,34 @@ async def _run(size: int, sweep: str | None, warmup: int | None) -> None:
         if not instruments:
             print("No instruments to replay. Ingest candles or run a scan first.")
             return
-        print(f"Universe: {len(instruments)} instrument(s) from {source}")
-        print(f"Warmup:   {warmup if warmup is not None else EntryRules().preferred_bars} bars\n")
+
+        async def measure(rules: EntryRules) -> tuple[PortfolioResult, list[InstrumentRun]]:
+            return await service.run(instruments, rules, config, min_bars=min_bars)
+
+        print(f"Universe:   {len(instruments)} instrument(s) from {source}")
+        print(f"Warmup:     {effective_warmup} bars")
+        print(f"Eligible:   >= {min_bars} stored bars, applied identically to every bucket")
+        print("Marked *:   expectancy is more than two standard errors from zero\n")
 
         if sweep == "threshold":
             # 0.71 is where the old "band break AND RSI <= 35" rules sat on this
             # scale, so it is the honest comparison for the change that replaced
             # them — not an arbitrary point on a grid.
+            # Extended past 0.80 on both sides on purpose. The first run of this
+            # sweep stopped at 0.80 and 0.80 was the only positive bucket — which
+            # is unreadable, because a boundary bucket has no neighbour to show
+            # whether the apparent edge continues or reverses. Any bucket that
+            # looks good here should be interrogated the same way: if it sits at
+            # an end, extend the range rather than believing it.
             print("Entry threshold sweep (0.71 = the old all-or-nothing equivalent)")
-            for threshold in (0.45, 0.50, 0.55, 0.60, 0.65, 0.71, 0.80):
-                pooled, runs = await service.run(
-                    instruments, EntryRules(entry_threshold=threshold), config
-                )
+            for threshold in (0.35, 0.45, 0.50, 0.55, 0.60, 0.65, 0.71, 0.80, 0.88, 0.94):
+                pooled, _ = await measure(EntryRules(entry_threshold=threshold))
                 _print_result(f"threshold {threshold:.2f}", pooled, instruments=len(instruments))
+            print(
+                "\n  A bucket at either end of this range is the least trustworthy result\n"
+                "  in it: there is no neighbour beyond it to show whether the apparent\n"
+                "  edge continues or reverses. Extend the sweep before believing one."
+            )
             return
 
         if sweep == "trend":
@@ -117,18 +161,25 @@ async def _run(size: int, sweep: str | None, warmup: int | None) -> None:
                 ("gate on (default)", EntryRules(trend_slope_min=0.0)),
                 ("gate strict", EntryRules(trend_slope_min=0.0005)),
             ):
-                pooled, runs = await service.run(instruments, rules, config)
+                pooled, _ = await measure(rules)
                 _print_result(label, pooled, instruments=len(instruments))
+            print(
+                "\n  Read with care: these trade sets are overlapping, not nested. Only one\n"
+                "  position is held at a time, so a looser gate is in a trade more often and\n"
+                "  therefore *misses* entries a stricter gate would have taken. The buckets\n"
+                "  are not the same trades plus extras."
+            )
             return
 
-        rules = EntryRules()
-        pooled, runs = await service.run(instruments, rules, config)
+        pooled, runs = await measure(baseline)
         print("Shipping configuration")
         _print_result("default", pooled, instruments=len(instruments))
         _print_exits(pooled)
         replayed = [r for r in runs if r.result.bars_replayed]
+        bars = sum(r.result.bars_replayed for r in runs)
         print(
-            f"\n  {len(replayed)} of {len(instruments)} instrument(s) had enough history to replay"
+            f"\n  {len(replayed)} of {len(instruments)} instrument(s) eligible, "
+            f"{bars:,} bars replayed"
         )
         _print_top(runs)
 

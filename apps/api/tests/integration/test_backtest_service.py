@@ -144,6 +144,71 @@ class TestReplayFromTheStore:
         assert loose.combined.trade_count > strict.combined.trade_count
 
 
+class TestEligibilityIsApplesToApples:
+    """Two configurations in a sweep must be measured over the same sample.
+
+    Without this, a bucket could differ from its neighbour because it happened
+    to admit a couple of extra thinly-covered instruments — a difference that has
+    nothing whatever to do with the rule being tested, and which reads exactly
+    like a finding.
+    """
+
+    async def test_eligibility_defaults_to_the_warmup_not_the_indicator_minimum(
+        self, db: AsyncSession
+    ) -> None:
+        """An instrument that clears the indicators but not the warmup trades nothing.
+
+        It used to be admitted anyway — the check was against `required_bars`
+        (~21) while the replay starts at the warmup — so it padded the "N
+        instruments replayed" denominator with rows that could never trade.
+        """
+        middling = await _instrument(db, "MIDDLING", _cyclical(1))  # ~37 bars
+        await db.commit()
+
+        rules = EntryRules()
+        assert middling is not None
+        # Comfortably past the indicator minimum...
+        assert rules.required_bars < 37
+        # ...but nowhere near a 100-bar warmup, so it must not be counted.
+        pooled, runs = await BacktestService(db).run(
+            [middling], rules, ReplayConfig(warmup_bars=100)
+        )
+        assert runs == []
+        assert pooled.per_instrument == {}
+
+    async def test_the_same_min_bars_admits_the_same_sample_for_every_config(
+        self, db: AsyncSession
+    ) -> None:
+        """The guarantee a sweep depends on: identical instruments, every bucket."""
+        deep = await _instrument(db, "DEEP", _cyclical(8))
+        shallow = await _instrument(db, "SHALLOW", _cyclical(2))
+        await db.commit()
+        service = BacktestService(db)
+        universe = [deep, shallow]
+
+        samples = []
+        for threshold in (0.45, 0.60, 0.95):
+            _, runs = await service.run(
+                universe, EntryRules(entry_threshold=threshold), _SHORT_WARMUP, min_bars=120
+            )
+            samples.append({r.instrument_id for r in runs})
+
+        assert all(s == samples[0] for s in samples)
+        assert samples[0] == {deep.id}  # shallow is below 120 bars and excluded throughout
+
+    async def test_an_explicit_min_bars_overrides_the_rules(self, db: AsyncSession) -> None:
+        """So a caller can hold the sample fixed while sweeping a rule that would
+        otherwise move the eligibility bar underneath it."""
+        instrument = await _instrument(db, "FIXED", _cyclical(3))
+        await db.commit()
+        service = BacktestService(db)
+
+        _, admitted = await service.run([instrument], EntryRules(), _SHORT_WARMUP, min_bars=50)
+        _, excluded = await service.run([instrument], EntryRules(), _SHORT_WARMUP, min_bars=100_000)
+        assert len(admitted) == 1
+        assert excluded == []
+
+
 class TestUniverseSelection:
     async def test_it_replays_the_scanner_ranking_not_the_whole_catalogue(
         self, db: AsyncSession
