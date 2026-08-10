@@ -113,6 +113,65 @@ class TestSplitDetection:
         assert worst_daily_ratio(_series([100.0])) == 1.0
 
 
+class TestRecordedFields:
+    """Diagnostic fields must be populated on *every* exit path.
+
+    They were not: `reward_risk` was threaded through the stop, time and
+    unclosed constructions but missed on the target one, so all 1,066 winning
+    trades defaulted to 0.0 while losers carried real values. Bucketing outcomes
+    by that field then produced a spectacular and entirely spurious finding —
+    the low bucket won 62% and every higher bucket won under 15%, which was
+    nothing but winners and losers sorted into different columns.
+
+    A field with a default is exactly the shape of bug that hides: nothing
+    errors, and the number looks like a discovery.
+    """
+
+    #: Dislocates and never recovers, so the position is stopped out rather than
+    #: reaching its target — the loser side of the comparison.
+    def _falling(self) -> list[float]:
+        base = [100 + (3 if i % 2 else -3) for i in range(60)]
+        return [*base, 94.0, 88.0, 84.0, *(84.0 - i * 1.5 for i in range(30))]
+
+    def _trades_by_reason(self) -> dict[ExitReason, list[BacktestTrade]]:
+        runs = [
+            replay(_series(_cyclical(10)), _RULES, _SHORT_WARMUP),  # targets
+            replay(_series(self._falling()), _RULES, ReplayConfig(warmup_bars=40)),  # stops
+            replay(  # time exits
+                _series(_cyclical(10)),
+                _RULES,
+                ReplayConfig(warmup_bars=40, max_holding_bars=2),
+            ),
+        ]
+        by_reason: dict[ExitReason, list[BacktestTrade]] = {}
+        for run in runs:
+            for trade in run.trades:
+                by_reason.setdefault(trade.exit_reason, []).append(trade)
+        return by_reason
+
+    def test_every_exit_path_records_the_reward_risk(self) -> None:
+        by_reason = self._trades_by_reason()
+        assert len(by_reason) >= 2, "fixtures should exercise several exit paths"
+        for reason, trades in by_reason.items():
+            assert any(t.reward_risk != 0.0 for t in trades), (
+                f"{reason.value} exits never carry a reward_risk — a construction "
+                f"is missing the field and is silently defaulting"
+            )
+
+    def test_winners_and_losers_both_carry_it(self) -> None:
+        """The specific asymmetry that produced the false finding.
+
+        Winners defaulted to 0.0 while losers held real values, so bucketing by
+        the field sorted outcomes rather than measuring them.
+        """
+        trades = [t for group in self._trades_by_reason().values() for t in group]
+        wins = [t for t in trades if t.is_win]
+        losses = [t for t in trades if not t.is_win]
+        assert wins and losses, "fixtures should produce both"
+        assert any(t.reward_risk != 0.0 for t in wins)
+        assert any(t.reward_risk != 0.0 for t in losses)
+
+
 class TestConcentration:
     """One trade must not be able to carry a headline unnoticed."""
 

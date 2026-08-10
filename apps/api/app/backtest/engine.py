@@ -384,6 +384,7 @@ def replay(
                             exit_price=float(series.open[i + 1]),
                             initial_stop=position.initial_stop,
                             entry_score=position.entry_score,
+                            reward_risk=position.reward_risk,
                             exit_reason=ExitReason.TARGET,
                         )
                     )
