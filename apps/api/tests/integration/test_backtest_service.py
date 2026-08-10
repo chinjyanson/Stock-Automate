@@ -31,10 +31,16 @@ _SHORT_WARMUP = ReplayConfig(warmup_bars=40)
 
 
 def _cyclical(cycles: int = 8) -> list[float]:
+    """Oscillate, then a dislocation deep enough for the entry to want it.
+
+    Six bars down to RSI ~34, matching the unit-test fixture: with the Bollinger
+    component removed the score is RSI-driven, and a shallow dip is correctly
+    declined.
+    """
     closes: list[float] = []
     for _ in range(cycles):
         closes.extend(100 + (3 if i % 2 else -3) for i in range(30))
-        closes.extend([94.0, 88.0, 84.0, 88.0, 94.0, 99.0, 101.0])
+        closes.extend([94.0, 86.0, 78.0, 72.0, 68.0, 66.0, 72.0, 82.0, 92.0, 99.0, 101.0])
     return closes
 
 

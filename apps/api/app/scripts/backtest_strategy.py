@@ -171,6 +171,76 @@ async def _run(size: int, sweep: str | None, warmup: int | None) -> None:
             )
             return
 
+        if sweep == "stopbands":
+            # Two separate changes, measured together because the last
+            # combination predicted to work did not. The bands appear twice —
+            # as an entry component and as the profit target — so both are
+            # varied, and the stop is widened across each.
+            print("Stop width x band usage, both folds")
+            # The band weight is stated explicitly on every row. It now defaults
+            # to 0.0, so a variant relying on the default would silently compare
+            # "no bands" against "no bands" — which this sweep did once, and the
+            # two halves of the table came out identical.
+            combos = [
+                (
+                    "bands in, stop 2x",
+                    EntryRules(weight_band=0.45, atr_stop_multiplier=2.0),
+                    None,
+                ),
+                (
+                    "bands in, stop 3x",
+                    EntryRules(weight_band=0.45, atr_stop_multiplier=3.0),
+                    None,
+                ),
+                (
+                    "bands in, stop 5x",
+                    EntryRules(weight_band=0.45, atr_stop_multiplier=5.0),
+                    None,
+                ),
+                (
+                    "no band entry, stop 2x",
+                    EntryRules(weight_band=0.0, atr_stop_multiplier=2.0),
+                    None,
+                ),
+                (
+                    "no band entry, stop 3x",
+                    EntryRules(weight_band=0.0, atr_stop_multiplier=3.0),
+                    None,
+                ),
+                (
+                    "no band entry, stop 5x",
+                    EntryRules(weight_band=0.0, atr_stop_multiplier=5.0),
+                    None,
+                ),
+                (
+                    "no bands at all, stop 5x",
+                    EntryRules(weight_band=0.0, atr_stop_multiplier=5.0),
+                    20,
+                ),
+            ]
+            for fold in ("fit", "confirm"):
+                half = service.split(instruments, fold=fold)
+                print(f"\n  {fold.upper()} fold — {len(half)} instruments")
+                for label, entry_rules, hold in combos:
+                    pooled, _, _ = await service.run(
+                        half,
+                        entry_rules,
+                        ReplayConfig(
+                            warmup_bars=warmup,
+                            atr_stop_multiplier=entry_rules.atr_stop_multiplier,
+                            hold_bars=hold,
+                            trail_stops=hold is None,
+                        ),
+                        min_bars=min_bars,
+                    )
+                    _print_result(label, pooled, instruments=len(half))
+            print(
+                "\n  'no bands at all' also replaces the middle-band profit target with a\n"
+                "  20-day hold, since removing the bands from the entry does not remove\n"
+                "  them from the exit."
+            )
+            return
+
         if sweep == "norsi":
             # Does removing RSI help? It is the component the forward-return test
             # rated highest (+3.08% at 20d over 11,000 observations), so this is
@@ -457,7 +527,17 @@ def main() -> None:
     parser.add_argument("--size", type=int, default=40, help="Instruments to replay.")
     parser.add_argument(
         "--sweep",
-        choices=["threshold", "trend", "exits", "target", "rr", "fixes", "stopcost", "norsi"],
+        choices=[
+            "threshold",
+            "trend",
+            "exits",
+            "target",
+            "rr",
+            "fixes",
+            "stopcost",
+            "norsi",
+            "stopbands",
+        ],
         help="Compare configurations instead of reporting the shipping one.",
     )
     parser.add_argument(

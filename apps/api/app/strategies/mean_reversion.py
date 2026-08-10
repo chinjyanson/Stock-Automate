@@ -131,7 +131,15 @@ class EntryRules:
     rsi_period: int = 14
     atr_period: int = 14
     min_atr_pct: float = 0.02
-    weight_band: float = 0.45
+    #: Bollinger position, **off by default**.
+    #:
+    #: Measured on both folds: including it lowers the profit factor (1.30 -> 1.20
+    #: fit, 1.15 -> 1.00 confirm) and roughly doubles the worst losing streak. It
+    #: fires on nearly every candidate, so it added volume rather than quality —
+    #: and it was measuring the same quantity as the other two components anyway,
+    #: which is why the blend never beat RSI alone. Kept as a settable weight
+    #: rather than deleted so the comparison stays reproducible.
+    weight_band: float = 0.0
     weight_rsi: float = 0.40
     weight_discount: float = 0.15
     entry_threshold: float = 0.60
@@ -139,7 +147,7 @@ class EntryRules:
     #: Multiple of ATR the risk engine will place the stop at. Mirrored here so
     #: the entry can weigh what it stands to make against what it stands to lose;
     #: the strategy still sizes nothing.
-    atr_stop_multiplier: float = 2.0
+    atr_stop_multiplier: float = 5.0
     #: Refuse a setup offering less than this reward per unit of risk. 0 disables.
     #:
     #: Measured across 2,088 replayed trades, the *median* setup risks 1.0 to make

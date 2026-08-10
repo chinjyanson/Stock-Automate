@@ -280,6 +280,10 @@ async def seed_strategy_configurations() -> int:
                 "rsi_period": 14,
                 "atr_period": 14,
                 "min_atr_pct": 0.02,
+                # Bollinger position off — see EntryRules.weight_band. The bands
+                # still define the profit target; only their vote on *entry* is
+                # removed.
+                "entry_weight_band": 0.0,
             },
             # Populated nightly from the scanner ranking by
             # `worker.jobs.strategy.sync_strategy_universe`.

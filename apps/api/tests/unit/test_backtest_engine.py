@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 from app.backtest.engine import (
+    DEFAULT_ATR_STOP_MULTIPLIER,
     BacktestResult,
     BacktestTrade,
     ExitReason,
@@ -51,12 +52,19 @@ def _series(
 
 #: Repeated oscillate-then-crash-then-recover cycles, long enough to clear the
 #: 260-bar warmup and still leave room for several complete round trips.
+#:
+#: The slide is six bars deep on purpose. A three-bar dip only reaches RSI ~42,
+#: which the entry correctly declines now that RSI carries the score — the
+#: Bollinger component used to drag such a setup over the line, and removing it
+#: is the point. A fixture the strategy would not actually trade cannot test the
+#: strategy, so this one is a dislocation it genuinely wants: RSI ~34, ~29% below
+#: the 20-day average.
 def _cyclical(cycles: int = 12) -> list[float]:
     closes: list[float] = []
     for _ in range(cycles):
         closes.extend(100 + (3 if i % 2 else -3) for i in range(30))
-        closes.extend([94.0, 88.0, 84.0])  # the dislocation
-        closes.extend([88.0, 94.0, 99.0, 101.0])  # the reversion
+        closes.extend([94.0, 86.0, 78.0, 72.0, 68.0, 66.0])  # the dislocation
+        closes.extend([72.0, 82.0, 92.0, 99.0, 101.0])  # the reversion
     return closes
 
 
@@ -111,6 +119,38 @@ class TestSplitDetection:
 
     def test_a_series_too_short_to_compare_is_not_flagged(self) -> None:
         assert worst_daily_ratio(_series([100.0])) == 1.0
+
+
+class TestStopMultipliersAgree:
+    """One quantity, three homes — they must not drift apart.
+
+    `RiskConfiguration.atr_stop_multiplier` places the real stop,
+    `EntryRules.atr_stop_multiplier` lets the entry weigh reward against risk,
+    and `DEFAULT_ATR_STOP_MULTIPLIER` is the replay's fallback. When the first
+    two moved to 5.0 and the third was left at 2.0, the entry filtered on a
+    reward:risk the simulation never used and the gate silently became 2.5x
+    stricter — 454 trades fell to 22 with no error anywhere.
+    """
+
+    def test_the_three_stop_multipliers_agree(self) -> None:
+        from app.models.risk import RiskConfiguration
+
+        column = RiskConfiguration.__table__.c.atr_stop_multiplier
+        live_default = float(column.default.arg)  # type: ignore[union-attr]
+        assert EntryRules().atr_stop_multiplier == pytest.approx(live_default)
+        assert pytest.approx(live_default) == DEFAULT_ATR_STOP_MULTIPLIER
+
+    def test_the_replay_uses_the_configured_multiplier(self) -> None:
+        """A wider stop must actually place a wider stop, not just be recorded."""
+        closes = _cyclical(6)
+        tight = replay(
+            _series(closes), EntryRules(), ReplayConfig(warmup_bars=40, atr_stop_multiplier=2.0)
+        )
+        wide = replay(
+            _series(closes), EntryRules(), ReplayConfig(warmup_bars=40, atr_stop_multiplier=6.0)
+        )
+        assert tight.trades and wide.trades
+        assert wide.trades[0].risk > tight.trades[0].risk * 2
 
 
 class TestRecordedFields:
@@ -308,10 +348,11 @@ class TestExecutionIsPessimistic:
         bigger than 1R. Assuming the stop price would be honoured is a standard
         and material over-statement.
         """
-        # Build a setup that enters, then gaps violently down.
-        closes = [*(100 + (3 if i % 2 else -3) for i in range(60)), 94.0, 88.0, 84.0, 50.0, 49.0]
-        opens = [*closes[:-2], 50.0, 49.0]
-        lows = [c * 0.99 for c in closes[:-2]] + [49.0, 48.0]
+        # A setup deep enough to enter (RSI ~34), then a violent gap down.
+        base = [100 + (3 if i % 2 else -3) for i in range(60)]
+        closes = [*base, 94.0, 86.0, 78.0, 72.0, 68.0, 66.0, 30.0, 29.0]
+        opens = [*closes[:-2], 30.0, 29.0]
+        lows = [c * 0.99 for c in closes[:-2]] + [29.0, 28.0]
         series = _series(closes, opens=opens, lows=lows)
         result = replay(series, _RULES, ReplayConfig(warmup_bars=40))
 
@@ -340,15 +381,17 @@ class TestUnclosedPositions:
         A rule whose winners close quickly and whose losers are still open when
         the sample ends looks wonderful if the open ones simply vanish.
         """
-        # Enter near the end and never recover.
-        closes = [*(100 + (3 if i % 2 else -3) for i in range(60)), 94.0, 88.0, 84.0, 83.0, 82.5]
+        # Enter near the end and never recover, so the run ends holding it.
+        base = [100 + (3 if i % 2 else -3) for i in range(60)]
+        closes = [*base, 94.0, 86.0, 78.0, 72.0, 68.0, 66.0, 65.0, 64.5]
         result = replay(_series(closes), _RULES, ReplayConfig(warmup_bars=40))
         assert any(t.exit_reason is ExitReason.UNCLOSED for t in result.trades)
 
 
 class TestExits:
     def test_the_time_stop_closes_a_position_that_never_reverts(self) -> None:
-        closes = [*(100 + (3 if i % 2 else -3) for i in range(60)), 94.0, 88.0, *([84.0] * 40)]
+        base = [100 + (3 if i % 2 else -3) for i in range(60)]
+        closes = [*base, 94.0, 86.0, 78.0, 72.0, 68.0, 66.0, *([66.0] * 40)]
         capped = replay(_series(closes), _RULES, ReplayConfig(warmup_bars=40, max_holding_bars=5))
         assert any(t.exit_reason is ExitReason.TIME for t in capped.trades)
 

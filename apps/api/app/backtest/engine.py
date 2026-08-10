@@ -46,7 +46,15 @@ from app.strategies.mean_reversion import EntryRules, read_entry
 #: Multiple of ATR the risk engine places the stop at. Mirrored here rather than
 #: read from `RiskConfiguration` so the replay stays pure; pass the live value in
 #: if it has been tuned away from the default.
-DEFAULT_ATR_STOP_MULTIPLIER = 2.0
+#:
+#: **Must track `RiskConfiguration.atr_stop_multiplier` and
+#: `EntryRules.atr_stop_multiplier`.** All three describe one quantity. When this
+#: was left at 2.0 while the other two moved to 5.0, the entry weighed reward
+#: against a 5x stop while the replay placed a 2x one — so the reward:risk gate
+#: filtered on a number the simulation never used, and quietly became 2.5x
+#: stricter than intended (454 trades -> 22). Pinned by
+#: `test_the_three_stop_multipliers_agree`.
+DEFAULT_ATR_STOP_MULTIPLIER = 5.0
 
 #: A single-bar close ratio beyond this is a corporate action or bad data, not a
 #: price move, and the series is not a continuous record of what a holder would
