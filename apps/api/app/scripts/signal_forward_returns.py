@@ -27,10 +27,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime as dt
 import math
 import random
+import uuid
 
 import numpy as np
+from sqlalchemy import select
 
 from app.backtest.engine import is_continuous
 from app.backtest.service import BacktestService
@@ -38,6 +41,7 @@ from app.data.store import CandleStore
 from app.db import session_scope
 from app.indicators.series import PriceSeries, candles_to_series
 from app.models.enums import Interval
+from app.models.scanner import ScannerResult, ScannerRun, ScannerRunStatus
 from app.strategies.mean_reversion import EntryRules, read_entry
 
 #: Horizons to measure, in trading days. The strategy's median hold is ~7 days,
@@ -171,12 +175,123 @@ async def _run(size: int, seed: int) -> None:
     )
 
 
+async def _scanner(seed: int) -> None:
+    """Does a high scanner score precede better returns?
+
+    The largest untested piece of the system. Unlike the strategy signals this
+    cannot be replayed from candles — a scanner score depends on fundamentals,
+    and only the *current* snapshot is stored, so recomputing a historical score
+    would leak information that was not available at the time.
+
+    Instead it uses the scores as they were actually computed: `scanner_results`
+    rows carry their run's date, so each is a genuine point-in-time reading. The
+    cost is sample depth — the scan history is days rather than years, so only
+    short horizons have enough forward data to measure.
+    """
+    rng = random.Random(seed)
+    by_score: dict[str, dict[int, list[float]]] = {}
+    baseline: dict[int, list[float]] = {h: [] for h in HORIZONS}
+    buckets = (
+        ("score < 40", 0.0, 40.0),
+        ("40-55", 40.0, 55.0),
+        ("55-70", 55.0, 70.0),
+        ("score >= 70", 70.0, 1e9),
+    )
+    for label, _, _ in buckets:
+        by_score[label] = {h: [] for h in HORIZONS}
+
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(
+                    ScannerResult.instrument_id,
+                    ScannerResult.primary_score,
+                    ScannerRun.started_at,
+                )
+                .join(ScannerRun, ScannerRun.id == ScannerResult.run_id)
+                .where(ScannerRun.status == ScannerRunStatus.COMPLETED)
+                .where(ScannerRun.is_ad_hoc.is_(False))
+            )
+        ).all()
+        if not rows:
+            print("No scanner history to measure.")
+            return
+
+        per_instrument: dict[uuid.UUID, list[tuple[float, dt.date]]] = {}
+        for instrument_id, score, started_at in rows:
+            per_instrument.setdefault(instrument_id, []).append((float(score), started_at.date()))
+
+        store = CandleStore(session)
+        used = 0
+        for instrument_id, scored in per_instrument.items():
+            candles = await store.get_candles(
+                instrument_id, Interval.D1, limit=2000, closed_only=True
+            )
+            if len(candles) < 60:
+                continue
+            series = candles_to_series(candles)
+            if not is_continuous(series):
+                continue
+            used += 1
+            closes = series.close
+            dates = [c.timestamp.date() for c in candles]
+
+            for score, scan_date in scored:
+                # First bar at or after the scan — the earliest price anyone
+                # acting on that score could have paid.
+                idx = next((i for i, d in enumerate(dates) if d >= scan_date), None)
+                if idx is None:
+                    continue
+                label = next(lbl for lbl, lo, hi in buckets if lo <= score < hi)
+                for horizon in HORIZONS:
+                    forward = _forward_return(closes, idx, horizon)
+                    if forward is not None:
+                        by_score[label][horizon].append(forward)
+
+            span = series.length - max(HORIZONS) - 1
+            if span > 20:
+                for _ in range(min(span, 60)):
+                    i = rng.randrange(0, span)
+                    for horizon in HORIZONS:
+                        forward = _forward_return(closes, i, horizon)
+                        if forward is not None:
+                            baseline[horizon].append(forward)
+
+    print(f"Instruments: {used} with both a score and usable candles")
+    print("Scores:      as computed at the time — genuine point-in-time readings")
+    print("Baseline:    random bars from the same instruments\n")
+    for label, _, _ in buckets:
+        print(f"  {label}")
+        for horizon in HORIZONS:
+            _print_row(f"{horizon}d", by_score[label][horizon], baseline[horizon])
+        print()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Forward returns after each signal.")
     parser.add_argument("--size", type=int, default=400, help="Instruments to scan.")
     parser.add_argument("--seed", type=int, default=20260810, help="Baseline sampling seed.")
+    parser.add_argument(
+        "--what",
+        choices=["signals", "scanner", "both"],
+        default="both",
+        help="Which layer to measure.",
+    )
     args = parser.parse_args()
-    asyncio.run(_run(size=args.size, seed=args.seed))
+
+    async def _go() -> None:
+        if args.what in ("signals", "both"):
+            print("=" * 78)
+            print("STRATEGY SIGNALS — forward returns after each entry condition")
+            print("=" * 78)
+            await _run(size=args.size, seed=args.seed)
+        if args.what in ("scanner", "both"):
+            print("\n" + "=" * 78)
+            print("SCANNER — forward returns by primary_score")
+            print("=" * 78)
+            await _scanner(seed=args.seed)
+
+    asyncio.run(_go())
 
 
 if __name__ == "__main__":

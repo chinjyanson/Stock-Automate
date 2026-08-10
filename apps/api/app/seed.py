@@ -270,11 +270,14 @@ async def seed_strategy_configurations() -> int:
             "kind": StrategyKind.MEAN_REVERSION,
             "name": "Daily mean reversion",
             "interval": Interval.D1,
+            # `rsi_oversold` is gone: RSI is a weighted component of the entry
+            # score now, not a hard veto, so a threshold on it means nothing. A
+            # stale key here would be silently ignored rather than error, which
+            # is worse than absent — it reads like a setting that does something.
             "params": {
                 "bb_period": 20,
                 "bb_std": 2.0,
                 "rsi_period": 14,
-                "rsi_oversold": 35.0,
                 "atr_period": 14,
                 "min_atr_pct": 0.02,
             },

@@ -293,6 +293,14 @@ class ReplayConfig:
     #: 0 disables the time stop, matching `RiskConfiguration.max_holding_days`.
     max_holding_bars: int = 0
     trail_stops: bool = True
+    #: Hold for exactly this many bars, ignoring the band target entirely. The
+    #: stop still applies — this is "wait for the move", not "wait no matter what".
+    #:
+    #: Exists because the measured edge builds over ~20 days (RSI <= 30 precedes
+    #: +0.77% at 5d, +1.79% at 10d, +3.08% at 20d) while the band exit closes the
+    #: position after ~7. The strategy was collecting roughly a third of a real
+    #: move and calling it a day.
+    hold_bars: int | None = None
     #: Take profit at `entry + fixed_target_r * risk`, fixed at entry, instead of
     #: at the live middle band. None keeps the band.
     #:
@@ -366,9 +374,33 @@ def replay(
                 position = None
                 continue
 
-            # 2. Target reached — the thesis played out. Decided on this close,
-            #    filled on the next open. A fixed target is frozen at entry; the
-            #    band target moves with the average and is read fresh each bar.
+            # 2a. Fixed holding period — exit on schedule rather than on a price
+            #     level, so a slow-building edge is given time to arrive.
+            if config.hold_bars is not None:
+                if (i - position.entry_index) >= config.hold_bars and i + 1 < length:
+                    trades.append(
+                        BacktestTrade(
+                            entry_index=position.entry_index,
+                            exit_index=i + 1,
+                            entry_price=position.entry_price,
+                            exit_price=float(series.open[i + 1]),
+                            initial_stop=position.initial_stop,
+                            entry_score=position.entry_score,
+                            reward_risk=position.reward_risk,
+                            exit_reason=ExitReason.TIME,
+                        )
+                    )
+                    position = None
+                    continue
+                if config.trail_stops and reading is not None:
+                    candidate = float(series.close[i]) - reading.atr * multiplier
+                    if candidate > position.stop:
+                        position.stop = candidate
+                continue
+
+            # 2b. Target reached — the thesis played out. Decided on this close,
+            #     filled on the next open. A fixed target is frozen at entry; the
+            #     band target moves with the average and is read fresh each bar.
             target = (
                 position.entry_price + config.fixed_target_r * position.risk_distance
                 if config.fixed_target_r is not None
@@ -431,11 +463,10 @@ def replay(
                     initial_stop=stop,
                     stop=stop,
                     entry_score=reading.score,
-                    reward_risk=(
-                        (reading.middle - entry_price) / (entry_price - stop)
-                        if entry_price > stop
-                        else 0.0
-                    ),
+                    # From the reading, not recomputed: the gate and the record
+                    # must be the same number or a filtered run would be measured
+                    # against a subtly different quantity than it filtered on.
+                    reward_risk=reading.reward_risk,
                 )
 
     # A position still open when the data runs out is recorded rather than

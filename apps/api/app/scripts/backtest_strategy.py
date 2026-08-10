@@ -171,6 +171,163 @@ async def _run(size: int, sweep: str | None, warmup: int | None) -> None:
             )
             return
 
+        if sweep == "norsi":
+            # Does removing RSI help? It is the component the forward-return test
+            # rated highest (+3.08% at 20d over 11,000 observations), so this is
+            # a check on that rather than a foregone conclusion. Weights are
+            # relative and renormalise, so zeroing one simply redistributes.
+            print("With and without RSI, on both folds")
+            entry_variants = [
+                ("all three", EntryRules()),
+                ("no RSI", EntryRules(weight_rsi=0.0)),
+                ("no bands", EntryRules(weight_band=0.0)),
+                ("RSI only", EntryRules(weight_band=0.0, weight_discount=0.0)),
+                ("bands only", EntryRules(weight_rsi=0.0, weight_discount=0.0)),
+            ]
+            for fold in ("fit", "confirm"):
+                half = service.split(instruments, fold=fold)
+                print(f"\n  {fold.upper()} fold — {len(half)} instruments")
+                for label, entry_rules in entry_variants:
+                    pooled, _, _ = await service.run(half, entry_rules, config, min_bars=min_bars)
+                    _print_result(label, pooled, instruments=len(half))
+            return
+
+        if sweep == "stopcost":
+            # The forward-return test says RSI <= 30 precedes +3.08% at 20 days,
+            # yet holding 20 days does not pay. The obvious explanation is that
+            # the average includes paths that first fall far enough to trigger any
+            # sensible stop — the edge would then be real but unharvestable with a
+            # stop in place. Widening the stop toward "none" tests exactly that.
+            print("Is the 20-day edge reachable with a stop in the way?")
+            for label, mult in (
+                ("stop 2x ATR", 2.0),
+                ("stop 3x ATR", 3.0),
+                ("stop 5x ATR", 5.0),
+                ("stop 10x ATR", 10.0),
+                ("stop 25x (≈none)", 25.0),
+            ):
+                for fold in ("fit", "confirm"):
+                    half = service.split(instruments, fold=fold)
+                    pooled, _, _ = await service.run(
+                        half,
+                        EntryRules(atr_stop_multiplier=mult),
+                        ReplayConfig(
+                            warmup_bars=warmup,
+                            hold_bars=20,
+                            atr_stop_multiplier=mult,
+                            trail_stops=False,
+                        ),
+                        min_bars=min_bars,
+                    )
+                    _print_result(f"{label} [{fold}]", pooled, instruments=len(half))
+            print(
+                "\n  R is measured against each run's own stop, so these are not directly\n"
+                "  comparable in R — read the win rate and profit factor instead. A wide\n"
+                "  stop is not a proposal; it is a diagnostic."
+            )
+            return
+
+        if sweep == "fixes":
+            # The three fixes the forward-return test pointed at, applied one at a
+            # time and then together, on both folds. The measured edge builds to
+            # ~20 days while the band exit fires at ~7, so "hold" is the headline;
+            # "less jumpy" stops noise ejecting the position before the move
+            # arrives; "good odds" refuses the sub-1:1 setups.
+            variants = [
+                ("0. shipping today", ReplayConfig(warmup_bars=warmup), EntryRules()),
+                (
+                    "1. hold 20d",
+                    ReplayConfig(warmup_bars=warmup, hold_bars=20),
+                    EntryRules(),
+                ),
+                (
+                    "2. + less jumpy",
+                    ReplayConfig(
+                        warmup_bars=warmup,
+                        hold_bars=20,
+                        atr_stop_multiplier=3.0,
+                        trail_stops=False,
+                    ),
+                    EntryRules(atr_stop_multiplier=3.0),
+                ),
+                (
+                    "3. + good odds",
+                    ReplayConfig(
+                        warmup_bars=warmup,
+                        hold_bars=20,
+                        atr_stop_multiplier=3.0,
+                        trail_stops=False,
+                    ),
+                    EntryRules(atr_stop_multiplier=3.0, min_reward_risk=1.0),
+                ),
+                (
+                    "4. + choosier entry",
+                    ReplayConfig(
+                        warmup_bars=warmup,
+                        hold_bars=20,
+                        atr_stop_multiplier=3.0,
+                        trail_stops=False,
+                    ),
+                    EntryRules(
+                        atr_stop_multiplier=3.0,
+                        min_reward_risk=1.0,
+                        entry_threshold=0.80,
+                    ),
+                ),
+                (
+                    "5. hold 40d, all fixes",
+                    ReplayConfig(
+                        warmup_bars=warmup,
+                        hold_bars=40,
+                        atr_stop_multiplier=3.0,
+                        trail_stops=False,
+                    ),
+                    EntryRules(
+                        atr_stop_multiplier=3.0,
+                        min_reward_risk=1.0,
+                        entry_threshold=0.80,
+                    ),
+                ),
+            ]
+            print("The three fixes, cumulative, on both folds")
+            for fold in ("fit", "confirm"):
+                half = service.split(instruments, fold=fold)
+                print(f"\n  {fold.upper()} fold — {len(half)} instruments")
+                for label, cfg, entry_rules in variants:
+                    pooled, _, _ = await service.run(half, entry_rules, cfg, min_bars=min_bars)
+                    _print_result(label, pooled, instruments=len(half))
+            print(
+                "\n  A fix that helps on one fold and not the other was fitted to noise.\n"
+                "  The stop is still live throughout — a fixed hold waits for the move,\n"
+                "  it does not sit through an unlimited loss."
+            )
+            return
+
+        if sweep == "rr":
+            # The one change with a mechanical argument behind it: the median
+            # setup risks 1.0 to make 0.90, which at a 50% win rate loses by
+            # arithmetic. Fitted on one half of the instruments and confirmed on
+            # the other, because selecting the best gate from the same trades it
+            # was measured on is how a backtest manufactures an edge.
+            print("Reward:risk gate, fitted on one half and confirmed on the other")
+            for fold in ("fit", "confirm"):
+                half = service.split(instruments, fold=fold)
+                print(f"\n  {fold.upper()} fold — {len(half)} instruments")
+                for minimum in (0.0, 0.8, 1.0, 1.2, 1.5, 2.0):
+                    pooled, _, _ = await service.run(
+                        half,
+                        EntryRules(min_reward_risk=minimum),
+                        config,
+                        min_bars=min_bars,
+                    )
+                    label = "off" if minimum == 0.0 else f">= {minimum:.1f}"
+                    _print_result(f"R:R {label}", pooled, instruments=len(half))
+            print(
+                "\n  A gate that helps on the fit fold and not on the confirm fold was\n"
+                "  fitted to noise. Only a change that holds on both is worth adopting."
+            )
+            return
+
         if sweep == "target":
             # The band target is a 20-day average that follows price down while a
             # position waits, so it drifts toward the entry: target exits average
@@ -204,7 +361,7 @@ async def _run(size: int, sweep: str | None, warmup: int | None) -> None:
             # three knobs already exist in ReplayConfig; nothing new is being
             # invented, which is what makes this the honest first experiment.
             print("Exit mechanics: where is the 0.14R going?")
-            variants = [
+            exit_variants = [
                 ("baseline", ReplayConfig(warmup_bars=warmup)),
                 ("no trailing stop", ReplayConfig(warmup_bars=warmup, trail_stops=False)),
                 (
@@ -228,7 +385,7 @@ async def _run(size: int, sweep: str | None, warmup: int | None) -> None:
                     ReplayConfig(warmup_bars=warmup, max_holding_bars=20),
                 ),
             ]
-            for label, variant in variants:
+            for label, variant in exit_variants:
                 pooled, _, _ = await service.run(instruments, baseline, variant, min_bars=min_bars)
                 _print_result(label, pooled, instruments=len(instruments))
             print(
@@ -300,7 +457,7 @@ def main() -> None:
     parser.add_argument("--size", type=int, default=40, help="Instruments to replay.")
     parser.add_argument(
         "--sweep",
-        choices=["threshold", "trend", "exits", "target"],
+        choices=["threshold", "trend", "exits", "target", "rr", "fixes", "stopcost", "norsi"],
         help="Compare configurations instead of reporting the shipping one.",
     )
     parser.add_argument(

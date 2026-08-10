@@ -136,6 +136,19 @@ class EntryRules:
     weight_discount: float = 0.15
     entry_threshold: float = 0.60
     trend_slope_min: float = 0.0
+    #: Multiple of ATR the risk engine will place the stop at. Mirrored here so
+    #: the entry can weigh what it stands to make against what it stands to lose;
+    #: the strategy still sizes nothing.
+    atr_stop_multiplier: float = 2.0
+    #: Refuse a setup offering less than this reward per unit of risk. 0 disables.
+    #:
+    #: Measured across 2,088 replayed trades, the *median* setup risks 1.0 to make
+    #: 0.90, and at a 50% win rate that loses by arithmetic — 0.5 x 0.9 - 0.5 x 1.0
+    #: = -0.05R, against a measured -0.04R for the sub-1:1 bucket. More than half
+    #: of all entries took odds that could not win. This gate exists to refuse
+    #: them, and needs no statistical support to justify: a below-even payoff on a
+    #: coin flip is a losing bet whatever a backtest says.
+    min_reward_risk: float = 0.0
     avwap_enabled: bool = False
     avwap_anchor_period: int = ind.TRADING_DAYS_PER_YEAR
 
@@ -172,14 +185,23 @@ class EntryReading:
     atr_pct: float
     trend_slope: float | None
     avwap: float | None
+    #: Distance to the middle-band target over distance to the stop, at entry.
+    reward_risk: float
     score_ok: bool
     atr_ok: bool
     trend_ok: bool
     avwap_ok: bool
+    reward_risk_ok: bool
 
     @property
     def admits(self) -> bool:
-        return self.score_ok and self.atr_ok and self.trend_ok and self.avwap_ok
+        return (
+            self.score_ok
+            and self.atr_ok
+            and self.trend_ok
+            and self.avwap_ok
+            and self.reward_risk_ok
+        )
 
 
 def read_entry(series: PriceSeries, rules: EntryRules) -> EntryReading | None:
@@ -246,6 +268,13 @@ def read_entry(series: PriceSeries, rules: EntryRules) -> EntryReading | None:
         if anchor is not None:
             avwap = ind.anchored_vwap(series.high, series.low, closes, series.volume, anchor)
 
+    # What this setup stands to make against what it stands to lose. The target
+    # is the middle band and the stop is a multiple of ATR below entry, so both
+    # are known at entry — and roughly half of all setups turn out to offer less
+    # than 1:1, which is the single clearest defect measurement has found.
+    stop_distance = atr * rules.atr_stop_multiplier
+    reward_risk = (middle - last) / stop_distance if stop_distance > 0 else 0.0
+
     return EntryReading(
         score=score,
         lower=lower,
@@ -256,10 +285,12 @@ def read_entry(series: PriceSeries, rules: EntryRules) -> EntryReading | None:
         atr_pct=atr_pct,
         trend_slope=trend_slope,
         avwap=avwap,
+        reward_risk=reward_risk,
         score_ok=score >= rules.entry_threshold,
         atr_ok=atr_pct >= rules.min_atr_pct,
         trend_ok=trend_slope is None or trend_slope >= rules.trend_slope_min,
         avwap_ok=avwap is None or last <= avwap,
+        reward_risk_ok=reward_risk >= rules.min_reward_risk,
     )
 
 
@@ -303,6 +334,8 @@ class MeanReversionStrategy(Strategy):
             weight_discount=float(self.param("entry_weight_discount", 0.15)),
             entry_threshold=float(self.param("entry_threshold", 0.60)),
             trend_slope_min=float(self.param("trend_slope_min", 0.0)),
+            atr_stop_multiplier=float(self.param("atr_stop_multiplier", 2.0)),
+            min_reward_risk=float(self.param("min_reward_risk", 0.0)),
             avwap_enabled=bool(self.param("avwap_enabled", False)),
             avwap_anchor_period=int(self.param("avwap_anchor_period", ind.TRADING_DAYS_PER_YEAR)),
         )

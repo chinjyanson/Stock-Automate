@@ -142,6 +142,27 @@ class BacktestService:
             Skipped(too_short=too_short, discontinuous=discontinuous, failed=failed),
         )
 
+    @staticmethod
+    def split(instruments: list[Instrument], *, fold: str) -> list[Instrument]:
+        """Deterministic half of the universe, for fitting vs confirming.
+
+        Split by a stable hash of the instrument id, so the same name lands in
+        the same fold on every run and across sweeps — a split that moved would
+        let a parameter be fitted and confirmed on overlapping data without
+        anyone noticing.
+
+        Splitting by *instrument* rather than by date is the right choice here:
+        the sample is barely a year deep, so a date split would leave each half
+        covering a different market regime and confound the comparison with
+        whatever happened in those months.
+        """
+        if fold not in ("fit", "confirm", "all"):
+            raise ValueError(f"unknown fold {fold!r}")
+        if fold == "all":
+            return instruments
+        want = 0 if fold == "fit" else 1
+        return [i for i in instruments if (int(i.id) & 0xFFFF) % 2 == want]
+
     async def top_ranked_instruments(self, limit: int) -> list[Instrument]:
         """The universe the strategy would actually have been given.
 
