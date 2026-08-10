@@ -78,10 +78,19 @@ def _print_result(label: str, pooled: PortfolioResult, *, instruments: int) -> N
 
 
 def _print_exits(pooled: PortfolioResult) -> None:
-    breakdown = pooled.combined.exit_breakdown()
-    if breakdown:
-        parts = ", ".join(f"{k} {v}" for k, v in sorted(breakdown.items()))
-        print(f"  {'exits':<28} {parts}")
+    combined = pooled.combined
+    rows = combined.r_by_exit()
+    if not rows:
+        return
+    print("\n  where the money goes, by exit")
+    for reason, (count, mean_r) in rows.items():
+        share = count / combined.trade_count
+        print(f"    {reason:<10} {count:>5} ({share:>5.1%})   mean {mean_r:>+6.2f}R")
+    print(
+        f"    {'':<10} avg win {combined.avg_win_r:>+5.2f}R   "
+        f"avg loss {-combined.avg_loss_r:>+5.2f}R   "
+        f"payoff {(combined.avg_win_r / combined.avg_loss_r if combined.avg_loss_r else 0):.2f}"
+    )
 
 
 def _print_top(runs: list[InstrumentRun], limit: int = 5) -> None:
@@ -162,6 +171,73 @@ async def _run(size: int, sweep: str | None, warmup: int | None) -> None:
             )
             return
 
+        if sweep == "target":
+            # The band target is a 20-day average that follows price down while a
+            # position waits, so it drifts toward the entry: target exits average
+            # +0.73R against a structural ~1.3R. A target frozen at entry pays
+            # what the setup promised. This is a mechanical fix for a measured
+            # defect, not a knob turned until the number improved.
+            print("Profit target: moving band vs frozen at entry")
+            for label, cfg in (
+                ("band (ships)", ReplayConfig(warmup_bars=warmup)),
+                ("fixed 1.0R", ReplayConfig(warmup_bars=warmup, fixed_target_r=1.0)),
+                ("fixed 1.5R", ReplayConfig(warmup_bars=warmup, fixed_target_r=1.5)),
+                ("fixed 2.0R", ReplayConfig(warmup_bars=warmup, fixed_target_r=2.0)),
+                ("fixed 3.0R", ReplayConfig(warmup_bars=warmup, fixed_target_r=3.0)),
+                (
+                    "fixed 1.5R, stop 3x",
+                    ReplayConfig(warmup_bars=warmup, fixed_target_r=1.5, atr_stop_multiplier=3.0),
+                ),
+                (
+                    "fixed 1.5R, no trail",
+                    ReplayConfig(warmup_bars=warmup, fixed_target_r=1.5, trail_stops=False),
+                ),
+            ):
+                pooled, _, _ = await service.run(instruments, baseline, cfg, min_bars=min_bars)
+                _print_result(label, pooled, instruments=len(instruments))
+            return
+
+        if sweep == "exits":
+            # The entry offers ~1.3:1 at a 50% win rate, which should return
+            # about +0.15R. It returns +0.01R, and the implied average win is
+            # only 1.04x the average loss — so wins are being truncated. These
+            # three knobs already exist in ReplayConfig; nothing new is being
+            # invented, which is what makes this the honest first experiment.
+            print("Exit mechanics: where is the 0.14R going?")
+            variants = [
+                ("baseline", ReplayConfig(warmup_bars=warmup)),
+                ("no trailing stop", ReplayConfig(warmup_bars=warmup, trail_stops=False)),
+                (
+                    "stop 1.5x ATR",
+                    ReplayConfig(warmup_bars=warmup, atr_stop_multiplier=1.5),
+                ),
+                (
+                    "stop 3.0x ATR",
+                    ReplayConfig(warmup_bars=warmup, atr_stop_multiplier=3.0),
+                ),
+                (
+                    "stop 3.0x, no trail",
+                    ReplayConfig(warmup_bars=warmup, atr_stop_multiplier=3.0, trail_stops=False),
+                ),
+                (
+                    "give up after 10d",
+                    ReplayConfig(warmup_bars=warmup, max_holding_bars=10),
+                ),
+                (
+                    "give up after 20d",
+                    ReplayConfig(warmup_bars=warmup, max_holding_bars=20),
+                ),
+            ]
+            for label, variant in variants:
+                pooled, _, _ = await service.run(instruments, baseline, variant, min_bars=min_bars)
+                _print_result(label, pooled, instruments=len(instruments))
+            print(
+                "\n  Trailing is the prime suspect: it ratchets on every bar, so a position\n"
+                "  that dips before reverting is closed at a fraction of its target. The\n"
+                "  live StopService trails identically, so anything found here is real."
+            )
+            return
+
         if sweep == "trend":
             print("200-day trend gate: does the falling-knife filter earn its place?")
             for label, rules in (
@@ -180,6 +256,31 @@ async def _run(size: int, sweep: str | None, warmup: int | None) -> None:
             return
 
         pooled, runs, skipped = await measure(baseline)
+        trades = pooled.combined.trades
+        if trades:
+            rr = sorted(t.reward_risk for t in trades)
+            n = len(rr)
+            print("Reward:risk actually offered at entry (target vs stop distance)")
+            for label, idx in (("p10", n // 10), ("median", n // 2), ("p90", 9 * n // 10)):
+                print(f"    {label:<8} {rr[min(idx, n - 1)]:.2f}")
+            # Split the same trades by their entry R:R. If selecting for a better
+            # ratio does not lift expectancy, an R:R filter is not the fix.
+            print("\n  outcome by entry reward:risk")
+            for lo, hi in ((0.0, 1.0), (1.0, 1.5), (1.5, 2.5), (2.5, 1e9)):
+                bucket = [t for t in trades if lo <= t.reward_risk < hi]
+                if len(bucket) < 30:
+                    continue
+                mean = sum(t.r_multiple for t in bucket) / len(bucket)
+                wins = sum(1 for t in bucket if t.is_win) / len(bucket)
+                var = sum((t.r_multiple - mean) ** 2 for t in bucket) / (len(bucket) - 1)
+                se = (var / len(bucket)) ** 0.5
+                tag = "  *" if abs(mean) > 2 * se else ""
+                hi_label = "+" if hi > 1e8 else f"{hi:.1f}"
+                print(
+                    f"    R:R {lo:.1f}-{hi_label:<4} {len(bucket):>5} trades  "
+                    f"win {wins:>5.1%}  exp {mean:>+6.2f}R +/-{2 * se:.2f}{tag}"
+                )
+            print()
         print("Shipping configuration")
         _print_result("default", pooled, instruments=len(instruments))
         _print_exits(pooled)
@@ -199,7 +300,7 @@ def main() -> None:
     parser.add_argument("--size", type=int, default=40, help="Instruments to replay.")
     parser.add_argument(
         "--sweep",
-        choices=["threshold", "trend"],
+        choices=["threshold", "trend", "exits", "target"],
         help="Compare configurations instead of reporting the shipping one.",
     )
     parser.add_argument(

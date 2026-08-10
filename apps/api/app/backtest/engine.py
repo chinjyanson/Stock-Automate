@@ -112,6 +112,11 @@ class BacktestTrade:
     initial_stop: float
     entry_score: float
     exit_reason: ExitReason
+    #: Distance to the middle-band target divided by distance to the stop, as
+    #: seen at entry. Recorded rather than inferred: extrapolating it from a
+    #: handful of fixtures produced a confident and wrong claim about where this
+    #: strategy's expectancy was going.
+    reward_risk: float = 0.0
 
     @property
     def bars_held(self) -> int:
@@ -208,6 +213,29 @@ class BacktestResult:
         return sum(t.bars_held for t in self.trades) / self.trade_count if self.trades else 0.0
 
     @property
+    def avg_win_r(self) -> float:
+        wins = [t.r_multiple for t in self.trades if t.is_win]
+        return sum(wins) / len(wins) if wins else 0.0
+
+    @property
+    def avg_loss_r(self) -> float:
+        """Mean loss as a positive number, so it reads beside `avg_win_r`."""
+        losses = [t.r_multiple for t in self.trades if not t.is_win]
+        return -sum(losses) / len(losses) if losses else 0.0
+
+    def r_by_exit(self) -> dict[str, tuple[int, float]]:
+        """(count, mean R) per exit reason — the exit-side diagnostic.
+
+        Where the leakage is. An entry offering ~1.3:1 at a 50% win rate should
+        return about +0.15R; if the realised figure is near zero, the difference
+        is being given back somewhere in this table rather than in the entry.
+        """
+        buckets: dict[str, list[float]] = {}
+        for trade in self.trades:
+            buckets.setdefault(trade.exit_reason.value, []).append(trade.r_multiple)
+        return {k: (len(v), sum(v) / len(v)) for k, v in sorted(buckets.items())}
+
+    @property
     def profit_factor(self) -> float | None:
         """Gross winning R over gross losing R. None when nothing lost."""
         losses = -sum(t.r_multiple for t in self.trades if not t.is_win)
@@ -250,6 +278,11 @@ class _OpenPosition:
     initial_stop: float
     stop: float
     entry_score: float
+    reward_risk: float = 0.0
+
+    @property
+    def risk_distance(self) -> float:
+        return self.entry_price - self.initial_stop
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +293,15 @@ class ReplayConfig:
     #: 0 disables the time stop, matching `RiskConfiguration.max_holding_days`.
     max_holding_bars: int = 0
     trail_stops: bool = True
+    #: Take profit at `entry + fixed_target_r * risk`, fixed at entry, instead of
+    #: at the live middle band. None keeps the band.
+    #:
+    #: The band is a 20-day moving average, so it follows price *down* while a
+    #: position waits to revert — the target drifts toward the entry and a winner
+    #: is paid less than the setup promised. Measured: target exits average
+    #: +0.73R against a structural ~1.3R at entry, which is most of the reason
+    #: expectancy sits at zero. Freezing the target is the direct fix.
+    fixed_target_r: float | None = None
     #: Bars to skip before trading. Defaults to `EntryRules.preferred_bars`,
     #: because below that the 200-day slope cannot be computed and its gate reads
     #: as satisfied — so an earlier start would silently replay a *different*,
@@ -317,15 +359,22 @@ def replay(
                         exit_price=fill,
                         initial_stop=position.initial_stop,
                         entry_score=position.entry_score,
+                        reward_risk=position.reward_risk,
                         exit_reason=ExitReason.STOP,
                     )
                 )
                 position = None
                 continue
 
-            # 2. Recovered to the middle band — the thesis played out. Decided on
-            #    this close, filled on the next open.
-            if reading is not None and float(series.close[i]) >= reading.middle:
+            # 2. Target reached — the thesis played out. Decided on this close,
+            #    filled on the next open. A fixed target is frozen at entry; the
+            #    band target moves with the average and is read fresh each bar.
+            target = (
+                position.entry_price + config.fixed_target_r * position.risk_distance
+                if config.fixed_target_r is not None
+                else (reading.middle if reading is not None else None)
+            )
+            if target is not None and float(series.close[i]) >= target:
                 if i + 1 < length:
                     trades.append(
                         BacktestTrade(
@@ -355,6 +404,7 @@ def replay(
                         exit_price=float(series.open[i + 1]),
                         initial_stop=position.initial_stop,
                         entry_score=position.entry_score,
+                        reward_risk=position.reward_risk,
                         exit_reason=ExitReason.TIME,
                     )
                 )
@@ -380,6 +430,11 @@ def replay(
                     initial_stop=stop,
                     stop=stop,
                     entry_score=reading.score,
+                    reward_risk=(
+                        (reading.middle - entry_price) / (entry_price - stop)
+                        if entry_price > stop
+                        else 0.0
+                    ),
                 )
 
     # A position still open when the data runs out is recorded rather than
@@ -394,6 +449,7 @@ def replay(
                 exit_price=float(series.close[length - 1]),
                 initial_stop=position.initial_stop,
                 entry_score=position.entry_score,
+                reward_risk=position.reward_risk,
                 exit_reason=ExitReason.UNCLOSED,
             )
         )
