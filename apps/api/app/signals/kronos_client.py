@@ -21,9 +21,11 @@ Install with:  uv sync --extra kronos     (torch, huggingface-hub, pandas)
 
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -91,7 +93,27 @@ def is_available() -> bool:
 
 
 class KronosUnavailableError(RuntimeError):
-    """Raised when inference is attempted without the extra installed."""
+    """Raised when inference is attempted without Kronos available."""
+
+
+def _resolve_repo_path() -> Path | None:
+    """Where the Kronos checkout lives, or None if unconfigured."""
+    from app.config import get_settings
+
+    configured = get_settings().kronos_repo_path
+    if not configured:
+        return None
+    path = Path(configured).expanduser()
+    return path if (path / "model").is_dir() else None
+
+
+def repo_is_present() -> bool:
+    """Whether the Kronos source is where the settings say it is.
+
+    Separate from `is_available`, which only answers whether torch is installed.
+    Both must hold, and they fail for different reasons worth telling apart.
+    """
+    return _resolve_repo_path() is not None
 
 
 class KronosClient:
@@ -114,7 +136,7 @@ class KronosClient:
             raise ValueError(f"unknown model {model_name!r}; choose from {sorted(MODELS)}")
 
         # Deliberately inside __init__ — see the module docstring.
-        import torch  # type: ignore[import-not-found]
+        import torch
 
         self._torch = torch
         self.model_name = model_name
@@ -132,7 +154,20 @@ class KronosClient:
                 device = "cpu"
         self.device = device
 
-        from model import Kronos, KronosPredictor, KronosTokenizer  # type: ignore[import-not-found]
+        # Kronos ships no package: the repo is cloned and `model` imported from
+        # the checkout. Prepending rather than appending so a stray `model`
+        # module elsewhere on the path cannot shadow it.
+        repo_path = _resolve_repo_path()
+        if repo_path is not None and str(repo_path) not in sys.path:
+            sys.path.insert(0, str(repo_path))
+
+        try:
+            from model import Kronos, KronosPredictor, KronosTokenizer
+        except ImportError as exc:
+            raise KronosUnavailableError(
+                "Could not import Kronos's `model` package. Clone the repository "
+                "and set KRONOS_REPO_PATH: python -m app.scripts.setup_kronos"
+            ) from exc
 
         tokenizer = KronosTokenizer.from_pretrained(tokenizer_repo, cache_dir=cache_dir)
         model = Kronos.from_pretrained(repo, cache_dir=cache_dir)

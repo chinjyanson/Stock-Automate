@@ -42,6 +42,22 @@ dev = [
     "respx>=0.22.0",
 ]
 
+# Local Kronos inference. Deliberately optional and deliberately not installed
+# on the deployment box: torch is ~250-300MB resident on import alone, against a
+# 448MB worker limit on the free-tier VM. Everything that touches Kronos treats
+# its absence as "no prediction today", so the stack runs identically without it.
+#
+# Kronos itself is NOT installable — it has no PyPI package and no setup.py. The
+# repository is cloned and its `model` package imported from the checkout; see
+# `app.scripts.setup_kronos` and `settings.kronos_repo_path`.
+kronos = [
+    "torch>=2.4.0",
+    "huggingface-hub>=0.26.0",
+    "einops>=0.8.0",
+    "safetensors>=0.4.5",
+    "tqdm>=4.67.0",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -88,6 +104,14 @@ plugins = ["pydantic.mypy"]
 [[tool.mypy.overrides]]
 # These ship without type stubs.
 module = ["yfinance.*", "pandas_market_calendars.*", "argon2.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Kronos is optional and its `model` package is imported from a git checkout
+# rather than installed, so neither is importable in a default environment.
+# Configured here rather than with inline ignores because those flip between
+# "unused" and "required" depending on whether the extra happens to be present.
+module = ["torch.*", "model.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

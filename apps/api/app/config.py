@@ -139,6 +139,27 @@ class Settings(BaseSettings):
     eodhd_daily_operational_limit: int = 18
     eodhd_daily_emergency_reserve: int = 2
 
+    # -- Kronos (local inference only) --------------------------------------
+    #: Path to a clone of https://github.com/shiyu-coder/Kronos.
+    #:
+    #: A path rather than a package because Kronos publishes no PyPI package and
+    #: carries no setup.py — the repository is cloned and its `model` package
+    #: imported from the checkout. `app.scripts.setup_kronos` does the clone.
+    #:
+    #: Unset means Kronos does not run, which is the normal state on the
+    #: deployment box: torch does not fit in a 448MB worker, so predictions are
+    #: generated on a machine that has the memory and read from a table.
+    kronos_repo_path: str | None = None
+    #: Which variant to load: kronos-mini (4.1M, 2048-bar context), kronos-small
+    #: (24.7M, 512) or kronos-base (102.3M, 512).
+    kronos_model: str = "kronos-small"
+    #: Paths sampled per instrument. Each is a separate generation call, so this
+    #: multiplies runtime directly — see `signals.kronos_client`.
+    kronos_sample_count: int = 8
+    #: Forecast horizon in trading days. Matches the horizon the feature ranking
+    #: measures against, so a Kronos feature is comparable with the rest.
+    kronos_horizon_days: int = 20
+
     # -- News: Finnhub (sentiment) ------------------------------------------
     #: Unset means the sentiment sweep does not run and the signal is simply
     #: unavailable — which the scanner and the risk engine both already treat as
