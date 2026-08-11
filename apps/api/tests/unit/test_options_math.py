@@ -114,3 +114,84 @@ class TestImpliedVolatility:
 
     def test_none_on_a_worthless_quote(self) -> None:
         assert om.implied_vol(0.0, 100.0, 100.0, 0.5, is_call=True) is None
+
+
+class TestCharm:
+    """Charm, verified against a finite difference of `delta`.
+
+    Deliberately not checked against a transcribed closed form. Charm's sign
+    convention — with respect to calendar time, or with respect to time to
+    expiry — flips the answer, and a transcription error would agree with
+    itself forever. `delta` is already tested independently, so differencing it
+    numerically is an oracle that cannot share the mistake.
+    """
+
+    @staticmethod
+    def _numerical_charm(
+        spot: float, strike: float, t: float, vol: float, *, is_call: bool, rate: float, q: float
+    ) -> float:
+        """Central difference of delta with respect to *calendar* time."""
+        h = 1e-6
+        up = om.delta(spot, strike, t + h, vol, is_call=is_call, rate=rate, dividend=q)
+        down = om.delta(spot, strike, t - h, vol, is_call=is_call, rate=rate, dividend=q)
+        assert up is not None and down is not None
+        # Calendar time runs opposite to time-to-expiry, hence the negation.
+        return -(up - down) / (2 * h)
+
+    @pytest.mark.parametrize("is_call", [True, False])
+    @pytest.mark.parametrize("strike", [70.0, 90.0, 100.0, 110.0, 130.0])
+    @pytest.mark.parametrize("t", [0.05, 0.25, 1.0, 2.0])
+    @pytest.mark.parametrize(("rate", "q"), [(0.0, 0.0), (0.04, 0.0), (0.04, 0.02)])
+    def test_matches_a_finite_difference_of_delta(
+        self, is_call: bool, strike: float, t: float, rate: float, q: float
+    ) -> None:
+        analytic = om.charm(100.0, strike, t, 0.25, is_call=is_call, rate=rate, dividend=q)
+        numerical = self._numerical_charm(100.0, strike, t, 0.25, is_call=is_call, rate=rate, q=q)
+        assert analytic is not None
+        assert analytic == pytest.approx(numerical, abs=1e-4, rel=1e-4)
+
+    def test_calls_and_puts_agree_without_a_dividend(self) -> None:
+        # Same reason gamma is shared: the dividend term is the only difference.
+        call = om.charm(100.0, 105.0, 0.5, 0.3, is_call=True, rate=0.03)
+        put = om.charm(100.0, 105.0, 0.5, 0.3, is_call=False, rate=0.03)
+        assert call is not None and put is not None
+        assert call == pytest.approx(put)
+
+    def test_they_diverge_once_a_dividend_is_paid(self) -> None:
+        call = om.charm(100.0, 105.0, 0.5, 0.3, is_call=True, rate=0.03, dividend=0.05)
+        put = om.charm(100.0, 105.0, 0.5, 0.3, is_call=False, rate=0.03, dividend=0.05)
+        assert call is not None and put is not None
+        assert call != pytest.approx(put)
+
+    def test_an_at_the_money_option_has_almost_no_delta_decay(self) -> None:
+        # Its delta sits near 0.5 and stays there; the drift is in the wings.
+        atm = om.charm(100.0, 100.0, 0.25, 0.2, is_call=True)
+        otm = om.charm(100.0, 120.0, 0.25, 0.2, is_call=True)
+        assert atm is not None and otm is not None
+        assert abs(atm) < abs(otm)
+
+    def test_an_out_of_the_money_call_loses_delta_as_expiry_approaches(self) -> None:
+        # It is running out of time to travel, so its delta decays toward zero.
+        value = om.charm(100.0, 120.0, 0.25, 0.2, is_call=True)
+        assert value is not None
+        assert value < 0
+
+    def test_an_in_the_money_call_gains_delta_as_expiry_approaches(self) -> None:
+        # Increasingly certain to be exercised, so its delta climbs toward one.
+        value = om.charm(100.0, 80.0, 0.25, 0.2, is_call=True)
+        assert value is not None
+        assert value > 0
+
+    @pytest.mark.parametrize(
+        ("spot", "strike", "t", "vol"),
+        [
+            (0.0, 100.0, 1.0, 0.2),
+            (100.0, 0.0, 1.0, 0.2),
+            (100.0, 100.0, 0.0, 0.2),
+            (100.0, 100.0, 1.0, 0.0),
+        ],
+    )
+    def test_none_on_inputs_that_cannot_support_an_answer(
+        self, spot: float, strike: float, t: float, vol: float
+    ) -> None:
+        assert om.charm(spot, strike, t, vol, is_call=True) is None

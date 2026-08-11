@@ -38,8 +38,19 @@ class KronosPrediction(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """One instrument's forecast, as of one date."""
 
     __tablename__ = "kronos_predictions"
+    #: Keyed by model and horizon as well as instrument and date, so a run with
+    #: different weights or a different horizon lands beside the existing row
+    #: rather than overwriting it. Two variants disagreeing about the same day
+    #: is exactly the comparison that decides which to keep; a narrower key
+    #: would silently destroy it. Readers filter to the variant they want.
     __table_args__ = (
-        UniqueConstraint("instrument_id", "as_of", name="uq_kronos_predictions_instrument_date"),
+        UniqueConstraint(
+            "instrument_id",
+            "as_of",
+            "model_name",
+            "horizon_days",
+            name="uq_kronos_predictions_instrument_date_model",
+        ),
         Index("ix_kronos_predictions_as_of", "as_of"),
     )
 

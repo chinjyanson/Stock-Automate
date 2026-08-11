@@ -42,6 +42,7 @@ from app.models.instrument import (
     Watchlist,
     WatchlistInstrument,
 )
+from app.models.kronos import KronosPrediction
 from app.models.market_data import (
     Candle,
     CorporateAction,
@@ -77,6 +78,7 @@ from app.models.strategy import (
     StrategyDecision,
     StrategyRun,
 )
+from app.models.strategy_model import StrategyModel
 from app.models.system import (
     BrokerCredential,
     LiveArmingSession,
@@ -111,6 +113,7 @@ __all__ = [
     "Instrument",
     "InstrumentKind",
     "Interval",
+    "KronosPrediction",
     "LifecycleState",
     "LiveArmingSession",
     "MarketDataMapping",
@@ -144,6 +147,7 @@ __all__ = [
     "StrategyDecision",
     "StrategyDecisionOutcome",
     "StrategyKind",
+    "StrategyModel",
     "StrategyRun",
     "StrategyRunStatus",
     "SystemSetting",

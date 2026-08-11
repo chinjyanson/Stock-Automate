@@ -166,3 +166,144 @@ class TestExpiryChoice:
 
     def test_none_when_everything_is_too_near(self) -> None:
         assert sx._pick_expiry(["2026-08-07", "2026-08-08"], _AS_OF) is None
+
+
+class TestScaleFreeTilt:
+    """The reading that survives the `^SPX` -> `SPY` fallback.
+
+    This is the class that matters most for the index history, because the
+    corruption it guards against is permanent. The chain is read from `^SPX`
+    when it answers and `SPY` when it does not, and a gamma *exposure* goes as
+    `open interest x spot` — so the two proxies report several-fold different
+    numbers for identical positioning. Accumulated into one series that step is
+    indistinguishable from a regime shift, and a model fitted on it would learn
+    the fallback schedule.
+
+    Worth being precise about the size, because the intuitive answer is wrong.
+    Gamma itself goes as `1/S`, so the `S^2` in the exposure formula does not
+    survive: one factor of `S` cancels. The step is therefore the contract-count
+    ratio over ten, a few-fold effect rather than the hundred-fold one the `S^2`
+    suggests — small enough to pass for a market move, which is precisely what
+    makes it dangerous rather than obvious.
+    """
+
+    #: SPY's option open interest against SPX's, in contracts. Nowhere near
+    #: the ten-times ratio that would coincidentally cancel the spot factor.
+    SCALE_SPY = 40.0
+
+    @staticmethod
+    def _chain(spot: float, scale: float) -> list[sx.OptionQuote]:
+        """The same positioning, expressed at a different index level.
+
+        `scale` multiplies open interest while spot and the strikes move
+        independently, which is what changing proxy actually does: SPY trades
+        near a tenth of SPX's level and carries far more contracts.
+
+        The exact arithmetic matters here. Gamma goes as `1/S`, so a gamma
+        *exposure* — which multiplies by `S^2` — goes as `open interest x S`,
+        not as `S^2`. A proxy switch therefore moves the reading by the ratio
+        of contract counts divided by ten, and only an open interest exactly
+        ten times larger would leave it unchanged. `SCALE_SPY` below is set to a
+        realistic contract ratio rather than that knife edge.
+        """
+        t = _DAYS / 365.0
+        quotes = []
+        for moneyness, oi_call, oi_put in (
+            (0.95, 800.0, 1500.0),
+            (1.0, 2000.0, 2000.0),
+            (1.05, 1200.0, 600.0),
+        ):
+            strike = spot * moneyness
+            for is_call, oi in ((True, oi_call), (False, oi_put)):
+                price = om.bs_price(spot, strike, t, 0.20, is_call=is_call)
+                assert price is not None
+                quotes.append(
+                    sx.OptionQuote(
+                        strike=strike,
+                        last_price=price,
+                        open_interest=oi * scale,
+                        is_call=is_call,
+                        provider_iv=0.20,
+                    )
+                )
+        return quotes
+
+    def _reading(self, spot: float, scale: float, symbol: str) -> sx.IndexOptionsReading:
+        reading = sx.compute_reading(
+            as_of=_AS_OF,
+            symbol=symbol,
+            spot=spot,
+            quotes=self._chain(spot, scale),
+            expiry_days=_DAYS,
+        )
+        assert reading is not None
+        return reading
+
+    def test_the_raw_exposure_is_not_comparable_across_proxies(self) -> None:
+        """The bug being fixed, asserted so it cannot be called a small effect."""
+        spx = self._reading(5000.0, 1.0, "^SPX")
+        spy = self._reading(500.0, self.SCALE_SPY, "SPY")
+        assert spx.gamma_exposure is not None and spy.gamma_exposure is not None
+        # Identical positioning, four-fold different number: 40x the contracts
+        # against a tenth of the level. Small enough to look like a market move
+        # and large enough to dominate anything fitted on the series.
+        assert abs(spy.gamma_exposure / spx.gamma_exposure) == pytest.approx(4.0, rel=1e-6)
+
+    def test_the_tilt_is_identical_across_proxies(self) -> None:
+        """And the fix: a net-to-gross ratio cancels both spot and contract count."""
+        spx = self._reading(5000.0, 1.0, "^SPX")
+        spy = self._reading(500.0, self.SCALE_SPY, "SPY")
+        assert spx.gamma_tilt is not None and spy.gamma_tilt is not None
+        assert spx.gamma_tilt == pytest.approx(spy.gamma_tilt, abs=1e-9)
+
+    def test_the_charm_tilt_is_identical_across_proxies(self) -> None:
+        spx = self._reading(5000.0, 1.0, "^SPX")
+        spy = self._reading(500.0, self.SCALE_SPY, "SPY")
+        assert spx.charm_tilt is not None and spy.charm_tilt is not None
+        assert spx.charm_tilt == pytest.approx(spy.charm_tilt, abs=1e-9)
+
+    def test_the_tilt_is_unchanged_by_open_interest_alone(self) -> None:
+        base = self._reading(5000.0, 1.0, "^SPX")
+        busier = self._reading(5000.0, 37.0, "^SPX")
+        assert base.gamma_tilt is not None and busier.gamma_tilt is not None
+        assert base.gamma_tilt == pytest.approx(busier.gamma_tilt, abs=1e-9)
+
+    def test_the_tilt_is_bounded(self) -> None:
+        reading = self._reading(5000.0, 1.0, "^SPX")
+        assert reading.gamma_tilt is not None and reading.charm_tilt is not None
+        assert -1.0 <= reading.gamma_tilt <= 1.0
+        assert -1.0 <= reading.charm_tilt <= 1.0
+
+    def test_calls_only_tilts_fully_long(self) -> None:
+        reading = _read([_quote(5000, is_call=True, oi=1000), _quote(5100, is_call=True, oi=500)])
+        assert reading is not None
+        assert reading.gamma_tilt == pytest.approx(1.0)
+
+    def test_puts_only_tilts_fully_short(self) -> None:
+        reading = _read([_quote(5000, is_call=False, oi=1000), _quote(4900, is_call=False, oi=500)])
+        assert reading is not None
+        assert reading.gamma_tilt == pytest.approx(-1.0)
+
+    def test_tilt_is_none_when_nothing_carried_open_interest(self) -> None:
+        reading = _read([_quote(5000, is_call=True, oi=0.0)])
+        assert reading is not None
+        assert reading.gamma_tilt is None
+        assert reading.charm_tilt is None
+
+
+class TestCharmExposure:
+    def test_it_is_produced_alongside_gamma(self) -> None:
+        reading = _read([_quote(5100, is_call=True, oi=1000)])
+        assert reading is not None
+        assert reading.charm_exposure is not None
+        assert reading.charm_tilt is not None
+
+    def test_it_follows_the_same_dealer_sign_convention_as_gamma(self) -> None:
+        """One book, assembled one way — not two differently-signed readings."""
+        call = _read([_quote(5100, is_call=True, oi=1000)])
+        put = _read([_quote(5100, is_call=False, oi=1000)])
+        assert call is not None and put is not None
+        assert call.charm_exposure is not None and put.charm_exposure is not None
+        # Charm is identical for a call and a put at the same strike without a
+        # dividend, so only the assumed dealer side separates these.
+        assert call.charm_exposure == pytest.approx(-put.charm_exposure)

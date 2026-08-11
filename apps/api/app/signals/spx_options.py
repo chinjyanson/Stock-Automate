@@ -99,11 +99,43 @@ class IndexOptionsReading:
     #: Positive = dealers long gamma = volatility dampened. Sign depends on
     #: DEALER_CALL_SIGN / DEALER_PUT_SIGN.
     gamma_exposure: float | None = None
+    #: Net dealer gamma as a fraction of gross, in [-1, +1]. **This is the
+    #: figure a model should use, not `gamma_exposure`** — see `_tilt`.
+    gamma_tilt: float | None = None
+    #: Net dealer charm, in billions of currency delta per year. Positive =
+    #: dealers must buy as expiry approaches, all else equal.
+    charm_exposure: float | None = None
+    #: Net dealer charm as a fraction of gross, in [-1, +1]. The model's figure.
+    charm_tilt: float | None = None
     #: 25-delta put IV minus 25-delta call IV. Positive = downside is dearer.
     skew_25delta: float | None = None
     #: Implied volatility at the strike nearest spot.
     atm_iv: float | None = None
     contracts_used: int = 0
+
+
+def _tilt(net: float, gross: float) -> float | None:
+    """Net positioning as a fraction of gross — the scale-free reading.
+
+    **Why a ratio and not a division by spot.** These readings are taken from
+    `^SPX` when it answers and `SPY` when it does not, and the two are on
+    different scales. The arithmetic is worth doing carefully, because the
+    obvious answer is wrong: gamma goes as `1/S`, so the `S^2` in the exposure
+    formula loses one factor and a gamma *exposure* goes as
+    `open interest x S`. SPX trades near ten times SPY's level while SPY carries
+    far more contracts, and those two do not cancel — the reading jumps by the
+    contract ratio over ten on the day a fallback fires. Dividing by spot
+    removes the wrong factor and would look scale-free while still jumping.
+
+    A net-to-gross ratio removes both, because the same open interest and the
+    same multiplier appear above and below. What survives is the only part that
+    was ever comparable: *which way the book is tilted, and how one-sided it
+    is*. Bounded in [-1, +1], which also makes it a well-behaved regression
+    input, and stationary in a way a currency figure is not.
+    """
+    if gross <= 0:
+        return None
+    return net / gross
 
 
 def _usable_iv(quote: OptionQuote, spot: float, t: float) -> float | None:
@@ -142,6 +174,9 @@ def compute_reading(
     t = expiry_days / _TRADING_DAYS_PER_YEAR
 
     gamma_sum = 0.0
+    gamma_gross = 0.0
+    charm_sum = 0.0
+    charm_gross = 0.0
     used = 0
     atm_iv: float | None = None
     atm_distance = float("inf")
@@ -161,11 +196,19 @@ def compute_reading(
             atm_distance, atm_iv = distance, iv
 
         if quote.open_interest >= MIN_OPEN_INTEREST:
+            sign = DEALER_CALL_SIGN if quote.is_call else DEALER_PUT_SIGN
             g = om.gamma(spot, quote.strike, t, iv)
             if g is not None:
-                sign = DEALER_CALL_SIGN if quote.is_call else DEALER_PUT_SIGN
                 gamma_sum += sign * g * quote.open_interest
+                gamma_gross += abs(g) * quote.open_interest
                 used += 1
+            # Charm rides the same open interest and the same dealer-sign
+            # convention as gamma, so that the two readings describe one book
+            # rather than two differently-assembled ones.
+            c = om.charm(spot, quote.strike, t, iv, is_call=quote.is_call)
+            if c is not None:
+                charm_sum += sign * c * quote.open_interest
+                charm_gross += abs(c) * quote.open_interest
 
         d = om.delta(spot, quote.strike, t, iv, is_call=quote.is_call)
         if d is not None:
@@ -180,6 +223,10 @@ def compute_reading(
     # to "currency of dealer hedging flow per 1% index move", the form GEX is
     # conventionally quoted in, then /1e9 to report in billions.
     gamma_exposure = gamma_sum * CONTRACT_MULTIPLIER * spot * spot * 0.01 / 1e9 if used else None
+    # Charm is a delta drift per year, so it scales by spot once rather than
+    # twice — one factor converts contracts to currency, and there is no 1%
+    # move to normalise against.
+    charm_exposure = charm_sum * CONTRACT_MULTIPLIER * spot / 1e9 if used else None
     skew = best_put[1] - best_call[1] if best_put and best_call else None
 
     return IndexOptionsReading(
@@ -188,6 +235,9 @@ def compute_reading(
         spot=spot,
         expiry_days=expiry_days,
         gamma_exposure=gamma_exposure,
+        gamma_tilt=_tilt(gamma_sum, gamma_gross),
+        charm_exposure=charm_exposure,
+        charm_tilt=_tilt(charm_sum, charm_gross),
         skew_25delta=skew,
         atm_iv=atm_iv,
         contracts_used=used,

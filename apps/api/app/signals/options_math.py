@@ -120,6 +120,53 @@ def gamma(
     return math.exp(-dividend * t) * _norm_pdf(d1) / (spot * vol * math.sqrt(t))
 
 
+def charm(
+    spot: float,
+    strike: float,
+    t: float,
+    vol: float,
+    *,
+    is_call: bool,
+    rate: float = 0.0,
+    dividend: float = 0.0,
+) -> float | None:
+    """Drift in delta caused purely by the passage of time — "delta decay".
+
+    **Sign convention, which is the whole difficulty.** This is the derivative
+    with respect to *calendar time*, not with respect to time to expiry: it
+    answers "how does this option's delta change tomorrow if nothing moves?",
+    so a positive charm means delta is rising as expiry approaches. Since `t`
+    here is time to expiry, that makes this `-d(delta)/dt`, and the sign is
+    the one thing about charm that is easy to get backwards and impossible to
+    notice later. `tests/unit/test_options_math.py` pins it against a finite
+    difference of `delta` rather than against this formula, so the test is the
+    specification and this is only an efficient way to evaluate it.
+
+    Why it is worth having alongside gamma: gamma says how much a dealer must
+    re-hedge when spot moves, charm says how much they must re-hedge when it
+    does *not*. That flow is mechanical and concentrated into expiry, which is
+    why it is a candidate for reading index drift rather than a stock's.
+
+    Units are delta per year. Calls and puts differ only by the dividend term,
+    so with no dividend they are identical — the same way gamma is.
+    """
+    pair = _d1_d2(spot, strike, t, vol, rate, dividend)
+    if pair is None:
+        return None
+    d1, d2 = pair
+
+    # d(d1)/dT, where T is time to expiry.
+    root_t = math.sqrt(t)
+    dd1_dt = (2.0 * (rate - dividend) * t - d2 * vol * root_t) / (2.0 * t * vol * root_t)
+
+    carry = math.exp(-dividend * t)
+    # The dividend term differs between calls and puts because delta itself does;
+    # the density term is shared.
+    if is_call:
+        return carry * (dividend * _norm_cdf(d1) - _norm_pdf(d1) * dd1_dt)
+    return carry * (-dividend * _norm_cdf(-d1) - _norm_pdf(d1) * dd1_dt)
+
+
 def implied_vol(
     price: float,
     spot: float,

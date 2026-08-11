@@ -45,21 +45,32 @@ class IndexOptionsService:
         return await self.record(reading)
 
     async def record(self, reading: IndexOptionsReading) -> IndexOptionsSnapshot:
-        """Upsert by date, so re-running the job converges rather than duplicating."""
+        """Upsert by (date, symbol), so re-running the job converges.
+
+        Keyed on the symbol as well as the date because the reading falls back
+        from `^SPX` to `SPY`. Overwriting one proxy's row with the other's would
+        put two incomparable scales in one series under one timestamp, and no
+        later query could tell them apart.
+        """
         existing = (
             (
                 await self._session.execute(
-                    select(IndexOptionsSnapshot).where(IndexOptionsSnapshot.as_of == reading.as_of)
+                    select(IndexOptionsSnapshot).where(
+                        IndexOptionsSnapshot.as_of == reading.as_of,
+                        IndexOptionsSnapshot.symbol == reading.symbol,
+                    )
                 )
             )
             .scalars()
             .first()
         )
-        snapshot = existing or IndexOptionsSnapshot(as_of=reading.as_of)
-        snapshot.symbol = reading.symbol
+        snapshot = existing or IndexOptionsSnapshot(as_of=reading.as_of, symbol=reading.symbol)
         snapshot.spot = _dec(reading.spot)
         snapshot.expiry_days = reading.expiry_days
         snapshot.gamma_exposure = _dec(reading.gamma_exposure)
+        snapshot.gamma_tilt = _dec(reading.gamma_tilt)
+        snapshot.charm_exposure = _dec(reading.charm_exposure)
+        snapshot.charm_tilt = _dec(reading.charm_tilt)
         snapshot.skew_25delta = _dec(reading.skew_25delta)
         snapshot.atm_iv = _dec(reading.atm_iv)
         snapshot.contracts_used = reading.contracts_used
@@ -67,6 +78,29 @@ class IndexOptionsService:
             self._session.add(snapshot)
         await self._session.flush()
         return snapshot
+
+    async def history(self, *, symbol: str, limit: int = 500) -> list[IndexOptionsSnapshot]:
+        """Readings for one proxy, oldest first.
+
+        Filtered to a single symbol on purpose, and there is no unfiltered
+        variant. A series that mixes `^SPX` and `SPY` rows carries a ten-to-one
+        step wherever the fallback fired, which is indistinguishable from a
+        regime shift once it reaches a model — so the option to make that
+        mistake is simply not offered.
+        """
+        rows = (
+            (
+                await self._session.execute(
+                    select(IndexOptionsSnapshot)
+                    .where(IndexOptionsSnapshot.symbol == symbol)
+                    .order_by(IndexOptionsSnapshot.as_of.desc())
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return list(reversed(rows))
 
     async def latest(self) -> IndexOptionsSnapshot | None:
         """The most recent reading, or None if it is too old to describe today."""

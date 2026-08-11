@@ -193,15 +193,20 @@ async def _run(
         )
 
     if dump:
-        import csv
-
-        with open(dump, "w", newline="") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(
-                ["kronos_return", "prob_up", "dispersion", BASELINE_FEATURE, "forward_return"]
-            )
-            writer.writerows(block.tolist())
+        await asyncio.to_thread(_write_csv, dump, block.tolist())
         print(f"\n  raw rows written to {dump} — re-analysable without re-running Kronos")
+
+
+def _write_csv(path: str, rows: list[list[float]]) -> None:
+    """Off the event loop: a blocking write inside a coroutine stalls it."""
+    import csv
+
+    with open(path, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            ["kronos_return", "prob_up", "dispersion", BASELINE_FEATURE, "forward_return"]
+        )
+        writer.writerows(rows)
 
 
 def main() -> None:

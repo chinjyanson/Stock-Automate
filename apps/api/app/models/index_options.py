@@ -21,7 +21,13 @@ class IndexOptionsSnapshot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """
 
     __tablename__ = "index_options_snapshots"
-    __table_args__ = (UniqueConstraint("as_of", name="uq_index_options_snapshots_as_of"),)
+    #: Unique per (day, symbol) rather than per day. The reading falls back from
+    #: `^SPX` to `SPY`, and the two are on incomparable scales — so a day-only
+    #: key would let one series silently contain both, which is exactly the
+    #: corruption a model fitted on this history could never recover from.
+    __table_args__ = (
+        UniqueConstraint("as_of", "symbol", name="uq_index_options_snapshots_as_of_symbol"),
+    )
 
     as_of: Mapped[date] = mapped_column(Date, nullable=False, index=True)
     #: Which proxy produced the reading (`^SPX`, or `SPY` when it fell back).
@@ -36,6 +42,18 @@ class IndexOptionsSnapshot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     #: amplified. The sign rests on an assumed dealer position — see
     #: `app.signals.spx_options`.
     gamma_exposure: Mapped[Decimal | None] = mapped_column(Numeric(16, 4))
+    #: Net dealer gamma as a fraction of gross, in [-1, +1]. **This is the
+    #: column a model reads**, not `gamma_exposure`: it is the only one of the
+    #: two that means the same thing whichever proxy produced the row, because
+    #: open interest and the contract multiplier cancel out of a ratio.
+    gamma_tilt: Mapped[Decimal | None] = mapped_column(Numeric(8, 6))
+    #: Net dealer charm in billions of currency delta per year — how much the
+    #: book's delta drifts on the passage of time alone, which dealers must
+    #: hedge even on a day the index does not move.
+    charm_exposure: Mapped[Decimal | None] = mapped_column(Numeric(16, 4))
+    #: Net dealer charm as a fraction of gross, in [-1, +1]. The model's column,
+    #: for the same reason as `gamma_tilt`.
+    charm_tilt: Mapped[Decimal | None] = mapped_column(Numeric(8, 6))
     #: 25-delta put IV minus 25-delta call IV. Positive = downside protection
     #: costs more than upside, and a steepening is the market pricing tail risk.
     skew_25delta: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
