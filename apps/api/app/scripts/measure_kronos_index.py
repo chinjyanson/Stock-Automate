@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import math
+from typing import Any
 
 import numpy as np
 from sqlalchemy import select
@@ -59,7 +60,13 @@ def _rank(values: np.ndarray) -> np.ndarray:
 
 
 async def _run(
-    symbol: str, horizon: int, samples: int, model: str, limit: int, dump: str | None
+    symbol: str,
+    horizon: int,
+    samples: int,
+    model: str,
+    limit: int,
+    dump: str | None,
+    repeat: int,
 ) -> None:
     from app.signals.kronos_client import KronosClient, is_available, repo_is_present
 
@@ -113,6 +120,35 @@ async def _run(
     print(f"Model:      {model}, {samples} paths per forecast\n")
 
     client = KronosClient(model)
+    passes: list[np.ndarray] = []
+    for attempt in range(1, repeat + 1):
+        if repeat > 1:
+            print(f"--- pass {attempt} of {repeat} ---")
+        block = _collect(client, series, timestamps, features, forward, indices, horizon, samples)
+        if block is None:
+            return
+        passes.append(block)
+        _report(block, horizon)
+
+    if repeat > 1:
+        _compare(passes)
+
+    if dump:
+        await asyncio.to_thread(_write_csv, dump, passes[0].tolist())
+        print(f"\n  raw rows written to {dump} — re-analysable without re-running Kronos")
+
+
+def _collect(
+    client: Any,
+    series: Any,
+    timestamps: list[Any],
+    features: dict[str, Any],
+    forward: np.ndarray,
+    indices: list[int],
+    horizon: int,
+    samples: int,
+) -> np.ndarray | None:
+    """One full sweep of the sampled windows."""
     rows: list[tuple[float, float, float, float, float]] = []
     for n, i in enumerate(indices, start=1):
         if not (np.isfinite(forward[i]) and np.isfinite(features[BASELINE_FEATURE][i])):
@@ -144,13 +180,15 @@ async def _run(
 
     if len(rows) < 30:
         print(f"\nOnly {len(rows)} usable windows — too few to read.")
-        return
+        return None
+    return np.asarray(rows, dtype=np.float64)
 
-    block = np.asarray(rows, dtype=np.float64)
+
+def _report(block: np.ndarray, horizon: int) -> None:
     y = block[:, 4]
-    error = 2.0 / math.sqrt(max(len(rows) - 3, 1))
+    error = 2.0 / math.sqrt(max(len(block) - 3, 1))
 
-    print(f"\n  {len(rows)} independent windows")
+    print(f"\n  {len(block)} independent windows")
     print(f"  mean {horizon}-day return over the sample: {y.mean():+.2%}")
     print(f"\n  {'feature':<24} {'IC':>8}  {'+/- 2 se':>9}")
     for label, column in (
@@ -192,9 +230,36 @@ async def _run(
             f"t = {t_stat:+.2f} -> {verdict}"
         )
 
-    if dump:
-        await asyncio.to_thread(_write_csv, dump, block.tolist())
-        print(f"\n  raw rows written to {dump} — re-analysable without re-running Kronos")
+
+def _compare(passes: list[np.ndarray]) -> None:
+    """Whether identical settings produced the same answer twice.
+
+    The reason this flag exists. Kronos samples its forecast, so two runs over
+    the same windows with the same settings need not agree — and at 4 paths they
+    did not, giving ICs of +0.144 and +0.095 while the deterministic baseline
+    came back bit-identical. That control is the whole test: it proves the
+    difference was the model's own sampling noise rather than anything else
+    moving. A feature that unstable contributes noise to a regression, so the
+    spread here is worth knowing before fitting on it rather than after.
+    """
+    print("\n=== reproducibility across passes ===")
+    header = "".join(f"{'pass ' + str(i + 1):>10}" for i in range(len(passes)))
+    print(f"  {'feature':<26}{header}{'spread':>10}")
+    for label, column in (
+        ("kronos_return", 0),
+        ("kronos_prob_up", 1),
+        ("kronos_dispersion", 2),
+        (f"{BASELINE_FEATURE} (control)", 3),
+    ):
+        ics = [_spearman(block[:, column], block[:, 4]) for block in passes]
+        spread = max(ics) - min(ics)
+        cells = "".join(f"{ic:>+10.4f}" for ic in ics)
+        print(f"  {label:<26}{cells}{spread:>10.4f}")
+    print(
+        "\n  The control is deterministic, so its spread must read 0.0000. Anything\n"
+        "  else there means the passes did not see the same data, and the Kronos\n"
+        "  rows above are measuring something other than sampling noise."
+    )
 
 
 def _write_csv(path: str, rows: list[list[float]]) -> None:
@@ -213,10 +278,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Measure Kronos on one liquid instrument.")
     parser.add_argument("--symbol", default="SPY", help="Provider symbol, e.g. SPY or VUAG.L.")
     parser.add_argument("--horizon", type=int, default=10, help="Forward-return horizon.")
-    parser.add_argument("--samples", type=int, default=4, help="Paths per forecast.")
+    parser.add_argument("--samples", type=int, default=32, help="Paths per forecast.")
     parser.add_argument("--model", default="kronos-small", help="Variant.")
     parser.add_argument("--limit", type=int, default=150, help="Cap on windows sampled.")
     parser.add_argument("--dump", help="Write the raw rows to this CSV.")
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="Run the whole measurement this many times and compare. Use 2 to "
+        "answer whether the model is reproducible at this sample count.",
+    )
     args = parser.parse_args()
     asyncio.run(
         _run(
@@ -226,6 +298,7 @@ def main() -> None:
             model=args.model,
             limit=args.limit,
             dump=args.dump,
+            repeat=max(args.repeat, 1),
         )
     )
 

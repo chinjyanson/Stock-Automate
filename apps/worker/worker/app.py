@@ -43,6 +43,10 @@ app = Celery(
         "worker.jobs.index_options",
         "worker.jobs.earnings",
         "worker.jobs.sentiment",
+        # Registered so the task can be invoked by name, and deliberately given
+        # no `beat_schedule` entry below — running it needs torch, which does
+        # not fit this box. Importing the module is free; only calling it pays.
+        "worker.jobs.kronos",
     ],
 )
 

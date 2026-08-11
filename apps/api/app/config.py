@@ -155,7 +155,16 @@ class Settings(BaseSettings):
     kronos_model: str = "kronos-small"
     #: Paths sampled per instrument. Each is a separate generation call, so this
     #: multiplies runtime directly — see `signals.kronos_client`.
-    kronos_sample_count: int = 8
+    #:
+    #: 32 is a stabilisation, not a preference. At 4 paths the model was measured
+    #: to be *not reproducible*: two identical runs over the same SPY windows
+    #: gave rank correlations of +0.144 and +0.095 against the same forward
+    #: returns, while a deterministic control feature returned bit-identical
+    #: numbers both times — so the difference was Kronos's own sampling noise and
+    #: nothing else. A feature that changes that much between runs contributes
+    #: noise to a regression, and more paths is the only lever that reduces it.
+    #: The cost is linear: ~0.37s per path, so a forecast is ~12s.
+    kronos_sample_count: int = 32
     #: Forecast horizon in trading days. Matches the horizon the feature ranking
     #: measures against, so a Kronos feature is comparable with the rest.
     kronos_horizon_days: int = 20
