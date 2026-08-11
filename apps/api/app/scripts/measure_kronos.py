@@ -67,7 +67,9 @@ def _ic_error(n: int) -> float:
     return 1.0 / math.sqrt(max(n - 3, 1))
 
 
-async def _run(instruments_wanted: int, points: int, horizon: int, samples: int) -> None:
+async def _run(
+    instruments_wanted: int, points: int, horizon: int, samples: int, model: str
+) -> None:
     from app.signals.kronos_client import KronosClient, is_available, repo_is_present
 
     if not is_available():
@@ -77,7 +79,7 @@ async def _run(instruments_wanted: int, points: int, horizon: int, samples: int)
         print("Kronos source not found. Run:  python -m app.scripts.setup_kronos")
         return
 
-    client = KronosClient()
+    client = KronosClient(model)
     print(f"Model:     {client.model_name} on {client.device}")
     print(f"Sampling:  {points} dates x {instruments_wanted} instruments x {samples} paths")
     print(f"Horizon:   {horizon} trading days")
@@ -199,6 +201,11 @@ def main() -> None:
     parser.add_argument("--points", type=int, default=12, help="Evaluation dates each.")
     parser.add_argument("--horizon", type=int, default=20, help="Forward-return horizon.")
     parser.add_argument("--samples", type=int, default=4, help="Kronos paths per forecast.")
+    parser.add_argument(
+        "--model",
+        default="kronos-small",
+        help="kronos-mini (4.1M), kronos-small (24.7M) or kronos-base (102.3M).",
+    )
     args = parser.parse_args()
     asyncio.run(
         _run(
@@ -206,6 +213,7 @@ def main() -> None:
             points=args.points,
             horizon=args.horizon,
             samples=args.samples,
+            model=args.model,
         )
     )
 
