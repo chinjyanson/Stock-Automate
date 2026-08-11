@@ -40,6 +40,12 @@ from app.models.market_data import Candle, DataQualityEvent
 
 log = structlog.get_logger(__name__)
 
+#: Candles per INSERT. PostgreSQL refuses a statement with more than 32,767 bind
+#: parameters, and each candle row binds 19 columns — so the hard ceiling is
+#: ~1,724. 1,000 leaves headroom for a column being added without silently
+#: reintroducing a limit that only appears on deep backfills.
+_MAX_ROWS_PER_INSERT = 1_000
+
 #: Bar durations, used for closed-ness and gap arithmetic.
 INTERVAL_DURATION: dict[Interval, timedelta] = {
     Interval.M1: timedelta(minutes=1),
@@ -115,24 +121,31 @@ class CandleStore:
             for candle in candles
         ]
 
-        stmt = pg_insert(Candle).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=["instrument_id", "interval", "timestamp", "data_series_type"],
-            set_={
-                "open": stmt.excluded.open,
-                "high": stmt.excluded.high,
-                "low": stmt.excluded.low,
-                "close": stmt.excluded.close,
-                "adjusted_close": stmt.excluded.adjusted_close,
-                "volume": stmt.excluded.volume,
-                "is_closed": stmt.excluded.is_closed,
-                "quality_status": stmt.excluded.quality_status,
-                "provider": stmt.excluded.provider,
-                "provider_symbol": stmt.excluded.provider_symbol,
-                "retrieved_at": stmt.excluded.retrieved_at,
-            },
-        )
-        await self._session.execute(stmt)
+        # Chunked because PostgreSQL caps a statement at 32,767 bind parameters
+        # and each row here binds 19. A single statement therefore breaks at
+        # ~1,724 candles — which no incremental refresh ever reaches, so this
+        # sat latent until a fifteen-year backfill hit it and failed the whole
+        # ingest rather than the overflowing part.
+        for start in range(0, len(rows), _MAX_ROWS_PER_INSERT):
+            chunk = rows[start : start + _MAX_ROWS_PER_INSERT]
+            stmt = pg_insert(Candle).values(chunk)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["instrument_id", "interval", "timestamp", "data_series_type"],
+                set_={
+                    "open": stmt.excluded.open,
+                    "high": stmt.excluded.high,
+                    "low": stmt.excluded.low,
+                    "close": stmt.excluded.close,
+                    "adjusted_close": stmt.excluded.adjusted_close,
+                    "volume": stmt.excluded.volume,
+                    "is_closed": stmt.excluded.is_closed,
+                    "quality_status": stmt.excluded.quality_status,
+                    "provider": stmt.excluded.provider,
+                    "provider_symbol": stmt.excluded.provider_symbol,
+                    "retrieved_at": stmt.excluded.retrieved_at,
+                },
+            )
+            await self._session.execute(stmt)
         await self._session.flush()
 
         log.info(
