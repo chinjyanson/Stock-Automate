@@ -27,9 +27,13 @@ strategy nobody runs.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+import numpy as np
+
+from app.backtest.features import compute
 from app.indicators import functions as ind
+from app.indicators.functions import FloatArray
 from app.indicators.series import PriceSeries
 from app.models_ml.logistic import FittedModel
 
@@ -129,15 +133,18 @@ class EveryBarReader:
         return BarReading(atr=atr, target=target, score=0.0, reward_risk=reward_risk, admits=True)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass
 class ModelReader:
     """Admits when the fitted model's probability clears `threshold`.
 
-    The same `read_features` the live strategy calls, on the same fitted model,
-    so a swept threshold here is a swept threshold there. Kronos is absent from
-    a historical replay unless supplied per bar, and imputes to its training
-    mean — which is the same thing that happens live on a night the forecast job
-    did not run.
+    The same features the live strategy reads, on the same fitted model, so a
+    swept threshold here is a swept threshold there. Kronos is absent from a
+    historical replay — generating a forecast at every bar would take weeks — so
+    its features impute to their training means, which is the same thing that
+    happens live on a night the forecasting job did not run.
+
+    **Stateful, unlike `EveryBarReader`.** `prepare` computes the feature matrix
+    once per instrument; see it for why that is both necessary and safe.
     """
 
     model: FittedModel
@@ -147,6 +154,7 @@ class ModelReader:
     bb_std: float = DEFAULT_BB_STD
     atr_period: int = DEFAULT_ATR_PERIOD
     atr_stop_multiplier: float = DEFAULT_ATR_STOP_MULTIPLIER
+    _columns: dict[str, FloatArray] = field(default_factory=dict, repr=False)
 
     @property
     def required_bars(self) -> int:
@@ -156,9 +164,28 @@ class ModelReader:
     def preferred_bars(self) -> int:
         return 300
 
-    def __call__(self, series: PriceSeries) -> BarReading | None:
-        from app.strategies.logistic_stock import read_features
+    def prepare(self, series: PriceSeries) -> None:
+        """Compute the feature matrix once, for the whole series.
 
+        `replay` walks a series by calling its reader with `head(start)`,
+        `head(start + 1)`, and so on. Recomputing every feature column on each
+        of those calls is quadratic in the series length — about 1.4M column
+        evaluations for a 1,200-bar instrument, per threshold — which turns a
+        routine sweep into twenty minutes.
+
+        Computing once over the full series and indexing at `length - 1` gives
+        **identical** numbers, because every feature is point-in-time: bar `i`'s
+        value depends on bars up to `i` and none after it. That is asserted
+        rather than assumed — `TestTrainServeIdentity` pins that the two paths
+        agree to floating point, and `test_rewriting_the_future_cannot_change
+        _the_present` pins the property they depend on. If that ever stopped
+        holding, this would be wrong and so would the live strategy.
+
+        Optional: a reader without this method is simply called per bar.
+        """
+        self._columns = compute(series.open, series.high, series.low, series.close, series.volume)
+
+    def __call__(self, series: PriceSeries) -> BarReading | None:
         base = _base_reading(
             series,
             bb_period=self.bb_period,
@@ -170,7 +197,7 @@ class ModelReader:
             return None
         atr, target, reward_risk = base
 
-        probability = self.model.probability(read_features(series, None))
+        probability = self.model.probability(self._features(series))
         atr_ok = atr / float(series.close[-1]) >= self.min_atr_pct
         return BarReading(
             atr=atr,
@@ -179,3 +206,22 @@ class ModelReader:
             reward_risk=reward_risk,
             admits=probability >= self.threshold and atr_ok,
         )
+
+    def _features(self, series: PriceSeries) -> dict[str, float]:
+        from app.strategies.logistic_stock import PRICE_FEATURES, read_features
+
+        # Un-prepared — a direct call rather than a replay. Correct either way;
+        # only the cost differs.
+        if not self._columns:
+            return read_features(series, None)
+
+        index = series.length - 1
+        out: dict[str, float] = {}
+        for name in PRICE_FEATURES:
+            column = self._columns.get(name)
+            if column is None or index >= column.size:
+                continue
+            value = float(column[index])
+            if np.isfinite(value):
+                out[name] = value
+        return out

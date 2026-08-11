@@ -72,6 +72,14 @@ class IndexConditions:
 
     regime_factor: float = 1.0
     gamma_exposure: float | None = None
+    #: Net dealer gamma as a fraction of gross, in [-1, +1]. **The figure a model
+    #: reads**, because it means the same thing whichever proxy produced the row
+    #: — open interest and the contract multiplier cancel out of a ratio, and
+    #: `gamma_exposure` does not.
+    gamma_tilt: float | None = None
+    charm_exposure: float | None = None
+    #: Net dealer charm as a fraction of gross. The model's figure, as above.
+    charm_tilt: float | None = None
     skew_25delta: float | None = None
     atm_iv: float | None = None
     contracts_used: int = 0

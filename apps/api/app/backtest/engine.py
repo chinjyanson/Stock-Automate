@@ -361,6 +361,12 @@ def replay(
     )
     multiplier = config.atr_stop_multiplier
 
+    # Readers that can precompute do so once, over the whole series. Optional
+    # by design: a reader without  is simply called per bar.
+    prepare = getattr(reader, "prepare", None)
+    if callable(prepare):
+        prepare(series)
+
     trades: list[BacktestTrade] = []
     position: _OpenPosition | None = None
     unreadable = 0

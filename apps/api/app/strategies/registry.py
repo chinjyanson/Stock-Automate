@@ -14,10 +14,12 @@ from __future__ import annotations
 from app.models.enums import StrategyKind
 from app.models.strategy import StrategyConfiguration
 from app.strategies.base import Strategy
+from app.strategies.logistic_index import LogisticIndexStrategy
 from app.strategies.logistic_stock import LogisticStockStrategy
 
 _REGISTRY: dict[StrategyKind, type[Strategy]] = {
     StrategyKind.LOGISTIC_STOCK: LogisticStockStrategy,
+    StrategyKind.LOGISTIC_INDEX: LogisticIndexStrategy,
 }
 
 

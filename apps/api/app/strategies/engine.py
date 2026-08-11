@@ -538,6 +538,9 @@ class StrategyEngine:
         return IndexConditions(
             regime_factor=regime,
             gamma_exposure=_f(snapshot.gamma_exposure),
+            gamma_tilt=_f(snapshot.gamma_tilt),
+            charm_exposure=_f(snapshot.charm_exposure),
+            charm_tilt=_f(snapshot.charm_tilt),
             skew_25delta=_f(snapshot.skew_25delta),
             atm_iv=_f(snapshot.atm_iv),
             contracts_used=int(snapshot.contracts_used or 0),

@@ -258,9 +258,19 @@ async def seed_strategy_configurations() -> int:
     auto-trade before a human has turned it on. Parameters are the documented
     defaults; idempotent per name.
 
-    One strategy, because that is what the product runs. The universe is not
-    seeded and is not meant to be edited by hand — it is rewritten nightly from
-    the scanner's ranking by `worker.jobs.strategy.sync_strategy_universe`.
+    Two strategies, one per layer, both deciding with a fitted model rather
+    than hand-chosen weights. Neither carries coefficients here: those live in
+    `strategy_models`, fitted offline and loaded at run time. What is seeded is
+    only what the model does not decide — the probability worth acting on, and
+    the absolute gates no probability may overrule.
+
+    The stock universe is not seeded and is not meant to be edited by hand: it
+    is rewritten nightly from the scanner's ranking by
+    `worker.jobs.strategy.sync_strategy_universe`. The index universe is a
+    single tracker and is set once, by hand.
+
+    Both are seeded inactive. A fresh install must never auto-trade before a
+    human has mapped a universe, fitted a model and turned it on.
     """
     from app.models.enums import Interval, StrategyKind
     from app.models.strategy import StrategyConfiguration
@@ -292,6 +302,27 @@ async def seed_strategy_configurations() -> int:
                 "bb_std": 2.0,
                 "atr_period": 14,
             },
+            "universe": {"instrument_ids": []},
+        },
+        {
+            "kind": StrategyKind.LOGISTIC_INDEX,
+            "name": "Index exposure model",
+            "interval": Interval.D1,
+            "params": {
+                # A band rather than one number. Exposure that flipped on a
+                # probability wobbling either side of a single threshold would
+                # trade the noise in the estimate rather than the market, and
+                # every flip pays a spread.
+                "entry_probability": 0.55,
+                "exit_probability": 0.45,
+                # A model that likes the market cannot overrule a risk-off
+                # regime, for the same reason the stock model cannot buy past
+                # its ATR floor.
+                "regime_floor": 0.5,
+            },
+            # Set to the S&P tracker being timed. Deliberately not populated by
+            # the nightly scanner sync, which ranks individual stocks — this
+            # strategy holds one instrument by design.
             "universe": {"instrument_ids": []},
         },
     ]
