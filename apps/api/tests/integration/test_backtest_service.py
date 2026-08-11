@@ -18,14 +18,28 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.backtest.engine import ReplayConfig
+from app.backtest.entries import EveryBarReader, ModelReader
 from app.backtest.service import BacktestService
 from app.data.types import Candle as CandleDTO
 from app.models.enums import InstrumentKind, PriceUnit, ProviderKind
 from app.models.instrument import Exchange, Instrument, MarketDataMapping
 from app.models.scanner import Classification, ScannerResult, ScannerRun, ScannerRunStatus
-from app.strategies.mean_reversion import EntryRules
 
 pytestmark = pytest.mark.asyncio
+
+
+def _reader(threshold: float) -> ModelReader:
+    """A model keyed on rsi_14 alone, so a threshold has a predictable effect."""
+    import numpy as np
+
+    from app.models_ml.logistic import Prior, fit
+
+    rng = np.random.default_rng(0)
+    x = rng.normal(50.0, 15.0, (2_000, 1))
+    y = (x[:, 0] < 50.0).astype(float)
+    model = fit(x, y, ["rsi_14"], priors={"rsi_14": Prior(0.0, 2.0)}, label_definition="toy")
+    return ModelReader(model=model, threshold=threshold, min_atr_pct=0.0)
+
 
 _SHORT_WARMUP = ReplayConfig(warmup_bars=40)
 
@@ -110,7 +124,9 @@ class TestReplayFromTheStore:
         instrument = await _instrument(db, "CYCLE", _cyclical())
         await db.commit()
 
-        pooled, runs, _ = await BacktestService(db).run([instrument], EntryRules(), _SHORT_WARMUP)
+        pooled, runs, _ = await BacktestService(db).run(
+            [instrument], EveryBarReader(), _SHORT_WARMUP
+        )
         assert len(runs) == 1
         assert runs[0].bars > 200
         assert pooled.combined.trade_count > 0
@@ -125,8 +141,8 @@ class TestReplayFromTheStore:
         await db.commit()
         service = BacktestService(db)
 
-        first, _, _ = await service.run([instrument], EntryRules(), _SHORT_WARMUP)
-        second, _, _ = await service.run([instrument], EntryRules(), _SHORT_WARMUP)
+        first, _, _ = await service.run([instrument], EveryBarReader(), _SHORT_WARMUP)
+        second, _, _ = await service.run([instrument], EveryBarReader(), _SHORT_WARMUP)
         assert first.combined.trade_count == second.combined.trade_count
         assert first.combined.total_r == pytest.approx(second.combined.total_r)
 
@@ -136,7 +152,7 @@ class TestReplayFromTheStore:
         thin = await _instrument(db, "THIN", [100.0 + i for i in range(10)])
         await db.commit()
 
-        pooled, runs, _ = await BacktestService(db).run([thin], EntryRules(), _SHORT_WARMUP)
+        pooled, runs, _ = await BacktestService(db).run([thin], EveryBarReader(), _SHORT_WARMUP)
         assert runs == []
         assert pooled.per_instrument == {}
 
@@ -145,12 +161,8 @@ class TestReplayFromTheStore:
         await db.commit()
         service = BacktestService(db)
 
-        loose, _, _ = await service.run(
-            [instrument], EntryRules(entry_threshold=0.50), _SHORT_WARMUP
-        )
-        strict, _, _ = await service.run(
-            [instrument], EntryRules(entry_threshold=0.95), _SHORT_WARMUP
-        )
+        loose, _, _ = await service.run([instrument], _reader(0.20), _SHORT_WARMUP)
+        strict, _, _ = await service.run([instrument], _reader(0.99), _SHORT_WARMUP)
         assert loose.combined.trade_count > strict.combined.trade_count
 
 
@@ -175,13 +187,13 @@ class TestEligibilityIsApplesToApples:
         middling = await _instrument(db, "MIDDLING", _cyclical(1))  # ~37 bars
         await db.commit()
 
-        rules = EntryRules()
+        reader = EveryBarReader()
         assert middling is not None
         # Comfortably past the indicator minimum...
-        assert rules.required_bars < 37
+        assert reader.required_bars < 37
         # ...but nowhere near a 100-bar warmup, so it must not be counted.
         pooled, runs, _ = await BacktestService(db).run(
-            [middling], rules, ReplayConfig(warmup_bars=100)
+            [middling], reader, ReplayConfig(warmup_bars=100)
         )
         assert runs == []
         assert pooled.per_instrument == {}
@@ -199,23 +211,25 @@ class TestEligibilityIsApplesToApples:
         samples = []
         for threshold in (0.45, 0.60, 0.95):
             _, runs, _ = await service.run(
-                universe, EntryRules(entry_threshold=threshold), _SHORT_WARMUP, min_bars=120
+                universe, _reader(threshold), _SHORT_WARMUP, min_bars=120
             )
             samples.append({r.instrument_id for r in runs})
 
         assert all(s == samples[0] for s in samples)
         assert samples[0] == {deep.id}  # shallow is below 120 bars and excluded throughout
 
-    async def test_an_explicit_min_bars_overrides_the_rules(self, db: AsyncSession) -> None:
+    async def test_an_explicit_min_bars_overrides_the_reader(self, db: AsyncSession) -> None:
         """So a caller can hold the sample fixed while sweeping a rule that would
         otherwise move the eligibility bar underneath it."""
         instrument = await _instrument(db, "FIXED", _cyclical(3))
         await db.commit()
         service = BacktestService(db)
 
-        _, admitted, _ = await service.run([instrument], EntryRules(), _SHORT_WARMUP, min_bars=50)
+        _, admitted, _ = await service.run(
+            [instrument], EveryBarReader(), _SHORT_WARMUP, min_bars=50
+        )
         _, excluded, _ = await service.run(
-            [instrument], EntryRules(), _SHORT_WARMUP, min_bars=100_000
+            [instrument], EveryBarReader(), _SHORT_WARMUP, min_bars=100_000
         )
         assert len(admitted) == 1
         assert excluded == []

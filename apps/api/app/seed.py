@@ -267,26 +267,31 @@ async def seed_strategy_configurations() -> int:
 
     defaults: list[dict[str, object]] = [
         {
-            "kind": StrategyKind.MEAN_REVERSION,
-            "name": "Daily mean reversion",
+            "kind": StrategyKind.LOGISTIC_STOCK,
+            "name": "Daily logistic stock model",
             "interval": Interval.D1,
-            # `rsi_oversold` is gone: RSI is a weighted component of the entry
-            # score now, not a hard veto, so a threshold on it means nothing. A
-            # stale key here would be silently ignored rather than error, which
-            # is worse than absent — it reads like a setting that does something.
+            # No weights here any more: the model carries its own coefficients,
+            # fitted offline and loaded from `strategy_models`. What remains are
+            # the two things the model deliberately does not decide — the
+            # probability at which a signal is worth acting on, and the absolute
+            # safety gates a probability must never overrule.
             "params": {
+                # Swept, not chosen: see `app.scripts.backtest_strategy`.
+                "entry_probability": 0.55,
+                # Tradeability, not prediction. A stock whose true range is a
+                # rounding error has no move worth trading and would get a
+                # meaningless stop from the risk engine.
+                "min_atr_pct": 0.02,
+                # A dip the market is still repricing is not a dip. Comes from
+                # the earnings table, so the price features cannot see it.
+                "pead_veto_below": 40.0,
+                # Exit tunables, unchanged from the strategy this replaces.
+                "insider_sell_veto": 0.10,
+                "insider_exit_max_drop_atr": 1.0,
                 "bb_period": 20,
                 "bb_std": 2.0,
-                "rsi_period": 14,
                 "atr_period": 14,
-                "min_atr_pct": 0.02,
-                # Bollinger position off — see EntryRules.weight_band. The bands
-                # still define the profit target; only their vote on *entry* is
-                # removed.
-                "entry_weight_band": 0.0,
             },
-            # Populated nightly from the scanner ranking by
-            # `worker.jobs.strategy.sync_strategy_universe`.
             "universe": {"instrument_ids": []},
         },
     ]

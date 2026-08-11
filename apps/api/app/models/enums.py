@@ -231,26 +231,31 @@ class HaltScope(StrEnum):
 class StrategyKind(StrEnum):
     """The trading strategy (§8). Long-only.
 
-    One member, deliberately. Trend-following and pie-rebalancing were removed
-    once the product settled on a single approach — the scanner decides *what*
-    is worth owning and mean reversion decides *when*. Carrying two unused
-    strategies meant two sets of parameters that were never tuned, two paths
-    through the engine that were never exercised in anger, and a strategies
-    screen that implied a choice nobody was making.
+    Two members, one per layer, and both decide with a fitted logistic model
+    rather than hand-chosen weights. The layers are kept apart because they
+    answer different questions: "is this cheap relative to its own range?" is
+    meaningful for a stock and meaningless for an index fund, whose price
+    falling *is* the market falling rather than a dislocation within it.
+
+    The kinds they replaced — `mean_reversion` and `index_timing` — summed
+    hand-tuned weights against hand-tuned thresholds. Nine months of sweeping
+    those one at a time produced no measurable edge, which is the argument for
+    fitting them instead of guessing again.
     """
 
-    #: Daily mean reversion over the scanner's top-ranked names. Renamed from
-    #: `sp500_mean_reversion`: the strategy is index-agnostic, and a kind naming
-    #: an index it must not trade is a trap for whoever reads it next.
-    MEAN_REVERSION = "mean_reversion"
+    #: Individual stocks from the scanner's top-ranked names. A logistic model
+    #: over price features and a Kronos forecast estimates the probability that
+    #: a trade reaches its target before its stop, and that probability is the
+    #: entry decision. Every feature it uses is measured, so it carries no
+    #: informative priors.
+    LOGISTIC_STOCK = "logistic_stock"
 
     #: Timed exposure to an S&P 500 tracker, driven by index-level options
-    #: signals rather than the tracker's own price. A second kind, after the
-    #: docstring above argued against carrying unused ones — the difference is
-    #: that this one answers a question mean reversion cannot: "is this cheap
-    #: relative to its own range?" is meaningless for an index fund, whose
-    #: price falling *is* the market falling rather than a dislocation in it.
-    INDEX_TIMING = "index_timing"
+    #: signals rather than the tracker's own price. Its dealer-gamma and charm
+    #: features cannot be backfilled — an option chain is only published for
+    #: today — so they ship carried by priors and converge onto evidence as the
+    #: daily job accumulates rows.
+    LOGISTIC_INDEX = "logistic_index"
 
 
 class StrategyRunStatus(StrEnum):

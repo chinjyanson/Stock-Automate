@@ -28,8 +28,9 @@ from app.backtest.engine import (
     replay,
     worst_daily_ratio,
 )
+from app.backtest.entries import EveryBarReader, ModelReader
 from app.indicators.series import PriceSeries
-from app.strategies.mean_reversion import EntryRules, read_entry
+from app.models_ml.logistic import Prior, fit
 
 
 def _series(
@@ -68,7 +69,7 @@ def _cyclical(cycles: int = 12) -> list[float]:
     return closes
 
 
-_RULES = EntryRules()
+_READER = EveryBarReader()
 _SHORT_WARMUP = ReplayConfig(warmup_bars=40)
 
 
@@ -125,10 +126,10 @@ class TestStopMultipliersAgree:
     """One quantity, three homes — they must not drift apart.
 
     `RiskConfiguration.atr_stop_multiplier` places the real stop,
-    `EntryRules.atr_stop_multiplier` lets the entry weigh reward against risk,
-    and `DEFAULT_ATR_STOP_MULTIPLIER` is the replay's fallback. When the first
-    two moved to 5.0 and the third was left at 2.0, the entry filtered on a
-    reward:risk the simulation never used and the gate silently became 2.5x
+    `entries.DEFAULT_ATR_STOP_MULTIPLIER` sizes the reader's reward:risk, and
+    `engine.DEFAULT_ATR_STOP_MULTIPLIER` is the replay's fallback. When the
+    first two moved to 5.0 and the third was left at 2.0, the entry filtered on
+    a reward:risk the simulation never used and the gate silently became 2.5x
     stricter — 454 trades fell to 22 with no error anywhere.
     """
 
@@ -137,17 +138,19 @@ class TestStopMultipliersAgree:
 
         column = RiskConfiguration.__table__.c.atr_stop_multiplier
         live_default = float(column.default.arg)  # type: ignore[union-attr]
-        assert EntryRules().atr_stop_multiplier == pytest.approx(live_default)
+        from app.backtest.entries import DEFAULT_ATR_STOP_MULTIPLIER as READER_DEFAULT
+
+        assert pytest.approx(live_default) == READER_DEFAULT
         assert pytest.approx(live_default) == DEFAULT_ATR_STOP_MULTIPLIER
 
     def test_the_replay_uses_the_configured_multiplier(self) -> None:
         """A wider stop must actually place a wider stop, not just be recorded."""
         closes = _cyclical(6)
         tight = replay(
-            _series(closes), EntryRules(), ReplayConfig(warmup_bars=40, atr_stop_multiplier=2.0)
+            _series(closes), _READER, ReplayConfig(warmup_bars=40, atr_stop_multiplier=2.0)
         )
         wide = replay(
-            _series(closes), EntryRules(), ReplayConfig(warmup_bars=40, atr_stop_multiplier=6.0)
+            _series(closes), _READER, ReplayConfig(warmup_bars=40, atr_stop_multiplier=6.0)
         )
         assert tight.trades and wide.trades
         assert wide.trades[0].risk > tight.trades[0].risk * 2
@@ -175,11 +178,11 @@ class TestRecordedFields:
 
     def _trades_by_reason(self) -> dict[ExitReason, list[BacktestTrade]]:
         runs = [
-            replay(_series(_cyclical(10)), _RULES, _SHORT_WARMUP),  # targets
-            replay(_series(self._falling()), _RULES, ReplayConfig(warmup_bars=40)),  # stops
+            replay(_series(_cyclical(10)), _READER, _SHORT_WARMUP),  # targets
+            replay(_series(self._falling()), _READER, ReplayConfig(warmup_bars=40)),  # stops
             replay(  # time exits
                 _series(_cyclical(10)),
-                _RULES,
+                _READER,
                 ReplayConfig(warmup_bars=40, max_holding_bars=2),
             ),
         ]
@@ -304,8 +307,8 @@ class TestNoLookAhead:
         looks like from the outside, and is otherwise invisible.
         """
         closes = _cyclical()
-        full = replay(_series(closes), _RULES, _SHORT_WARMUP)
-        truncated = replay(_series(closes[:-30]), _RULES, _SHORT_WARMUP)
+        full = replay(_series(closes), _READER, _SHORT_WARMUP)
+        truncated = replay(_series(closes[:-30]), _READER, _SHORT_WARMUP)
 
         # Every trade the shorter run took must appear identically in the longer
         # one — the extra data may add trades at the end, never change earlier ones.
@@ -317,17 +320,18 @@ class TestNoLookAhead:
             assert short.entry_price == pytest.approx(long.entry_price)
             assert short.exit_price == pytest.approx(long.exit_price)
 
-    def test_head_gives_the_rules_only_the_past(self) -> None:
+    def test_head_gives_the_reader_only_the_past(self) -> None:
         closes = _cyclical(2)
         series = _series(closes)
-        at_bar = read_entry(series.head(120), _RULES)
+        at_bar = _READER(series.head(120))
         # Rewriting everything after bar 119 cannot change what bar 119 knew.
         mutated = list(closes)
         for i in range(120, len(mutated)):
             mutated[i] = 1_000.0
-        after = read_entry(_series(mutated).head(120), _RULES)
+        after = _READER(_series(mutated).head(120))
         assert at_bar is not None and after is not None
-        assert at_bar.score == pytest.approx(after.score)
+        assert at_bar.target == pytest.approx(after.target)
+        assert at_bar.atr == pytest.approx(after.atr)
 
 
 class TestExecutionIsPessimistic:
@@ -336,7 +340,7 @@ class TestExecutionIsPessimistic:
         close it just read. Filling there is worth free money that is not real."""
         closes = _cyclical(4)
         series = _series(closes)
-        result = replay(series, _RULES, _SHORT_WARMUP)
+        result = replay(series, _READER, _SHORT_WARMUP)
         assert result.trade_count > 0
         for trade in result.trades:
             assert trade.entry_price == pytest.approx(float(series.open[trade.entry_index]))
@@ -354,7 +358,7 @@ class TestExecutionIsPessimistic:
         opens = [*closes[:-2], 30.0, 29.0]
         lows = [c * 0.99 for c in closes[:-2]] + [29.0, 28.0]
         series = _series(closes, opens=opens, lows=lows)
-        result = replay(series, _RULES, ReplayConfig(warmup_bars=40))
+        result = replay(series, _READER, ReplayConfig(warmup_bars=40))
 
         stopped = [t for t in result.trades if t.exit_reason is ExitReason.STOP]
         assert stopped, "expected the gap to trigger the stop"
@@ -365,7 +369,7 @@ class TestExecutionIsPessimistic:
     def test_stops_are_checked_before_targets(self) -> None:
         """A daily bar cannot say which came first, so assume the worse one."""
         closes = _cyclical(4)
-        result = replay(_series(closes), _RULES, _SHORT_WARMUP)
+        result = replay(_series(closes), _READER, _SHORT_WARMUP)
         # No trade may record a target exit on a bar whose low broke its stop;
         # if the ordering were reversed some would.
         assert all(
@@ -384,7 +388,7 @@ class TestUnclosedPositions:
         # Enter near the end and never recover, so the run ends holding it.
         base = [100 + (3 if i % 2 else -3) for i in range(60)]
         closes = [*base, 94.0, 86.0, 78.0, 72.0, 68.0, 66.0, 65.0, 64.5]
-        result = replay(_series(closes), _RULES, ReplayConfig(warmup_bars=40))
+        result = replay(_series(closes), _READER, ReplayConfig(warmup_bars=40))
         assert any(t.exit_reason is ExitReason.UNCLOSED for t in result.trades)
 
 
@@ -392,64 +396,99 @@ class TestExits:
     def test_the_time_stop_closes_a_position_that_never_reverts(self) -> None:
         base = [100 + (3 if i % 2 else -3) for i in range(60)]
         closes = [*base, 94.0, 86.0, 78.0, 72.0, 68.0, 66.0, *([66.0] * 40)]
-        capped = replay(_series(closes), _RULES, ReplayConfig(warmup_bars=40, max_holding_bars=5))
+        capped = replay(_series(closes), _READER, ReplayConfig(warmup_bars=40, max_holding_bars=5))
         assert any(t.exit_reason is ExitReason.TIME for t in capped.trades)
 
     def test_trailing_only_ever_raises_the_stop(self) -> None:
         """Mirrors StopService, which ratchets up and never down."""
         closes = _cyclical(6)
-        trailed = replay(_series(closes), _RULES, ReplayConfig(warmup_bars=40, trail_stops=True))
-        fixed = replay(_series(closes), _RULES, ReplayConfig(warmup_bars=40, trail_stops=False))
+        trailed = replay(_series(closes), _READER, ReplayConfig(warmup_bars=40, trail_stops=True))
+        fixed = replay(_series(closes), _READER, ReplayConfig(warmup_bars=40, trail_stops=False))
         # Trailing can only close trades earlier or at the same time, never later.
         assert trailed.trade_count >= fixed.trade_count
 
     def test_a_reverting_stock_exits_at_the_target(self) -> None:
-        result = replay(_series(_cyclical(6)), _RULES, _SHORT_WARMUP)
+        result = replay(_series(_cyclical(6)), _READER, _SHORT_WARMUP)
         assert result.exit_breakdown().get("target", 0) > 0
 
 
-class TestRulesAreShared:
-    def test_the_replay_uses_the_live_entry_threshold(self) -> None:
-        """Raising the threshold must reduce trades, or the rules are not shared."""
-        closes = _cyclical(8)
-        loose = replay(_series(closes), EntryRules(entry_threshold=0.50), _SHORT_WARMUP)
-        strict = replay(_series(closes), EntryRules(entry_threshold=0.95), _SHORT_WARMUP)
+def _toy_model(coefficient: float = 2.0):  # type: ignore[no-untyped-def]
+    """A model keyed on `rsi_14` alone, so its decisions are predictable."""
+    rng = np.random.default_rng(0)
+    x = rng.normal(50.0, 15.0, (2_000, 1))
+    y = (x[:, 0] < 50.0).astype(float)
+    return fit(
+        x,
+        y,
+        ["rsi_14"],
+        priors={"rsi_14": Prior(0.0, abs(coefficient))},
+        label_definition="toy",
+    )
+
+
+class TestTheModelReachesTheReplay:
+    """The reader is the seam, so a threshold set here must change trades there.
+
+    This is what stops the replay and the live strategy measuring two different
+    entries. `ModelReader` calls the same `read_features` the strategy calls, on
+    the same fitted model, so a swept threshold means the same thing in both.
+    """
+
+    def test_raising_the_threshold_reduces_trades(self) -> None:
+        closes = _cyclical(10)
+        model = _toy_model()
+        loose = replay(_series(closes), ModelReader(model=model, threshold=0.20), _SHORT_WARMUP)
+        strict = replay(_series(closes), ModelReader(model=model, threshold=0.95), _SHORT_WARMUP)
         assert loose.trade_count > strict.trade_count
 
-    def test_the_trend_gate_reaches_the_replay(self) -> None:
-        closes = _cyclical(10)
-        permissive = replay(_series(closes), EntryRules(trend_slope_min=-1.0), _SHORT_WARMUP)
-        demanding = replay(_series(closes), EntryRules(trend_slope_min=0.05), _SHORT_WARMUP)
-        assert permissive.trade_count > demanding.trade_count
-
-    def test_every_recorded_entry_score_cleared_the_threshold(self) -> None:
-        rules = EntryRules(entry_threshold=0.65)
-        result = replay(_series(_cyclical(8)), rules, _SHORT_WARMUP)
+    def test_every_recorded_score_cleared_the_threshold(self) -> None:
+        model = _toy_model()
+        reader = ModelReader(model=model, threshold=0.45, min_atr_pct=0.0)
+        result = replay(_series(_cyclical(8)), reader, _SHORT_WARMUP)
         assert result.trade_count > 0
-        assert all(t.entry_score >= rules.entry_threshold for t in result.trades)
+        assert all(t.entry_score >= reader.threshold for t in result.trades)
+
+    def test_the_atr_floor_reaches_the_replay(self) -> None:
+        """A gate the model must not be able to overrule."""
+        closes = _cyclical(8)
+        model = _toy_model()
+        open_gate = ModelReader(model=model, threshold=0.20, min_atr_pct=0.0)
+        shut_gate = ModelReader(model=model, threshold=0.20, min_atr_pct=10.0)
+        assert replay(_series(closes), open_gate, _SHORT_WARMUP).trade_count > 0
+        assert replay(_series(closes), shut_gate, _SHORT_WARMUP).trade_count == 0
+
+    def test_every_bar_reader_admits_more_than_a_model(self) -> None:
+        """The labelling reader must be the permissive one, or the training set
+        is some model's opinion rather than an unbiased sample of outcomes."""
+        closes = _cyclical(8)
+        every = replay(_series(closes), EveryBarReader(), _SHORT_WARMUP)
+        picky = replay(
+            _series(closes), ModelReader(model=_toy_model(), threshold=0.99), _SHORT_WARMUP
+        )
+        assert every.trade_count > picky.trade_count
 
 
 class TestWarmup:
-    def test_the_default_warmup_covers_the_trend_gate(self) -> None:
-        """Below 221 bars the slope is unmeasurable and its gate reads as pass.
+    def test_the_default_warmup_covers_the_slope_feature(self) -> None:
+        """Below 221 bars `sma200_slope` is unmeasurable and imputes to its mean.
 
-        Starting earlier would replay an *ungated* strategy over the first
-        stretch and pool it with the gated one — two different strategies
-        reported as a single number.
+        Starting earlier would replay a model missing one of its features over
+        the first stretch and pool it with the complete one — two different
+        strategies reported as a single number.
         """
-        assert _RULES.preferred_bars >= 221
+        assert _READER.preferred_bars >= 221
         short = _series(_cyclical(2))  # ~74 bars, under the default warmup
-        assert replay(short, _RULES).trade_count == 0
+        assert replay(short, _READER).trade_count == 0
 
     def test_bars_replayed_is_reported(self) -> None:
-        result = replay(_series(_cyclical(8)), _RULES, _SHORT_WARMUP)
+        result = replay(_series(_cyclical(8)), _READER, _SHORT_WARMUP)
         assert result.bars_replayed > 0
 
 
 class TestPortfolio:
     def test_pooling_preserves_every_trade(self) -> None:
-        a = replay(_series(_cyclical(6)), _RULES, _SHORT_WARMUP)
-        b = replay(_series(_cyclical(8)), _RULES, _SHORT_WARMUP)
+        a = replay(_series(_cyclical(6)), _READER, _SHORT_WARMUP)
+        b = replay(_series(_cyclical(8)), _READER, _SHORT_WARMUP)
         pooled = PortfolioResult({"A": a, "B": b}).combined
         assert pooled.trade_count == a.trade_count + b.trade_count
         assert pooled.total_r == pytest.approx(a.total_r + b.total_r)

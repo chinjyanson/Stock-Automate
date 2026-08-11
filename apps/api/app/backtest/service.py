@@ -25,12 +25,12 @@ from app.backtest.engine import (
     is_continuous,
     replay,
 )
+from app.backtest.entries import EntryReader, EveryBarReader
 from app.data.store import CandleStore
 from app.indicators.series import candles_to_series
 from app.models.enums import Interval
 from app.models.instrument import Instrument
 from app.models.scanner import ScannerResult, ScannerRun, ScannerRunStatus
-from app.strategies.mean_reversion import EntryRules
 
 log = structlog.get_logger(__name__)
 
@@ -64,21 +64,21 @@ class BacktestService:
     async def run(
         self,
         instruments: list[Instrument],
-        rules: EntryRules,
+        reader: EntryReader | None = None,
         config: ReplayConfig | None = None,
         *,
         history_bars: int = DEFAULT_HISTORY_BARS,
         min_bars: int | None = None,
         require_continuous: bool = True,
     ) -> tuple[PortfolioResult, list[InstrumentRun], Skipped]:
-        """Replay `rules` over every instrument with usable stored history.
+        """Replay `reader` over every instrument with usable stored history.
 
         An instrument with too few bars is skipped rather than counted as a run
         that found nothing — the two are different facts, and conflating them
         would let a thin sample masquerade as a strategy that does not trade.
 
         **`min_bars` is what makes a sweep apples-to-apples.** Eligibility
-        otherwise derives from `rules`, so two configurations being compared
+        otherwise derives from the reader, so two configurations being compared
         could silently be measured over different instruments — and the one that
         happened to admit a few more thinly-covered names would look different
         for a reason that has nothing to do with the rule being tested. Pass the
@@ -97,8 +97,17 @@ class BacktestService:
         +2,489R against roughly -10R from 928 others.
         """
         config = config or ReplayConfig()
-        warmup = config.warmup_bars if config.warmup_bars is not None else rules.preferred_bars
-        threshold = min_bars if min_bars is not None else max(warmup, rules.required_bars) + 1
+        reader = reader if reader is not None else EveryBarReader()
+        warmup = (
+            config.warmup_bars
+            if config.warmup_bars is not None
+            else getattr(reader, "preferred_bars", 300)
+        )
+        threshold = (
+            min_bars
+            if min_bars is not None
+            else max(warmup, getattr(reader, "required_bars", 20)) + 1
+        )
 
         per_instrument: dict[str, BacktestResult] = {}
         runs: list[InstrumentRun] = []
@@ -116,7 +125,7 @@ class BacktestService:
                 discontinuous += 1
                 continue
             try:
-                result = replay(series, rules, config)
+                result = replay(series, reader, config)
             except Exception as exc:  # one bad series must not end the sweep
                 failed += 1
                 log.warning(

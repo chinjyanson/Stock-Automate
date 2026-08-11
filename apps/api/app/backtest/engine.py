@@ -1,18 +1,23 @@
-"""Historical replay of the mean-reversion strategy (§8).
+"""Historical replay: what would this entry have done? (§8)
 
-Every threshold in `strategies/mean_reversion.py` was reasoned about and none of
-them has ever been measured. This is what turns them from arguments into
-numbers: replay the strategy bar by bar over stored candles, record the trades it
-would have taken, and report whether the entry has an edge.
+Replays bar by bar over stored candles, records the trades an entry rule would
+have taken, and reports whether it has an edge.
 
 Pure and I/O-free, like `risk/stress.py` and `scanner/scoring.py`: everything it
 needs is passed in, so it is deterministic and testable without a database.
 
-**It calls `read_entry`, the same function the live strategy calls, on the same
-`EntryRules` object.** That is not a convenience. A backtest that reimplements
-the rules measures a strategy that does not trade, and the divergence is silent
-because both halves look correct in isolation — which is the single most common
-way a backtest comes to be confidently wrong.
+**Who decides the entries is a parameter.** An `EntryReader` (see
+`backtest/entries.py`) says whether a bar admits a trade and where its target
+sits; this module only walks the bars and models the fills. Two readers matter:
+`EveryBarReader` admits everything, which is how an unbiased set of outcomes is
+labelled for fitting; `ModelReader` admits on a fitted probability, which is how
+the resulting strategy is measured.
+
+**The reader shares its feature computation with the live strategy**, and that is
+not a convenience. A backtest that reimplements the entry measures a strategy
+that does not trade, and the divergence is silent because both halves look
+correct in isolation — the single most common way a backtest comes to be
+confidently wrong.
 
 Results are in **R multiples**, not currency. One R is the distance from entry to
 the initial stop, so a trade that reaches its target having risked 2.30 to make
@@ -40,19 +45,19 @@ import itertools
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from app.backtest.entries import EntryReader, EveryBarReader
 from app.indicators.series import PriceSeries
-from app.strategies.mean_reversion import EntryRules, read_entry
 
 #: Multiple of ATR the risk engine places the stop at. Mirrored here rather than
 #: read from `RiskConfiguration` so the replay stays pure; pass the live value in
 #: if it has been tuned away from the default.
 #:
 #: **Must track `RiskConfiguration.atr_stop_multiplier` and
-#: `EntryRules.atr_stop_multiplier`.** All three describe one quantity. When this
-#: was left at 2.0 while the other two moved to 5.0, the entry weighed reward
-#: against a 5x stop while the replay placed a 2x one — so the reward:risk gate
-#: filtered on a number the simulation never used, and quietly became 2.5x
-#: stricter than intended (454 trades -> 22). Pinned by
+#: `entries.DEFAULT_ATR_STOP_MULTIPLIER`.** All three describe one quantity. When
+#: this was left at 2.0 while the other two moved to 5.0, the entry weighed
+#: reward against a 5x stop while the replay placed a 2x one — so the
+#: reward:risk gate filtered on a number the simulation never used, and quietly
+#: became 2.5x stricter than intended (454 trades -> 22). Pinned by
 #: `test_the_three_stop_multipliers_agree`.
 DEFAULT_ATR_STOP_MULTIPLIER = 5.0
 
@@ -155,7 +160,7 @@ class BacktestResult:
 
     trades: tuple[BacktestTrade, ...] = ()
     bars_replayed: int = 0
-    #: Bars where the rules produced no opinion at all (too little history, a
+    #: Bars where the reader produced no opinion at all (too little history, a
     #: flat window). Reported so a run that found nothing can be told apart from
     #: a run that could not look.
     bars_unreadable: int = 0
@@ -295,7 +300,7 @@ class _OpenPosition:
 
 @dataclass(frozen=True, slots=True)
 class ReplayConfig:
-    """How the replay models execution, as distinct from the entry rules."""
+    """How the replay models execution, as distinct from who decides entries."""
 
     atr_stop_multiplier: float = DEFAULT_ATR_STOP_MULTIPLIER
     #: 0 disables the time stop, matching `RiskConfiguration.max_holding_days`.
@@ -318,7 +323,7 @@ class ReplayConfig:
     #: +0.73R against a structural ~1.3R at entry, which is most of the reason
     #: expectancy sits at zero. Freezing the target is the direct fix.
     fixed_target_r: float | None = None
-    #: Bars to skip before trading. Defaults to `EntryRules.preferred_bars`,
+    #: Bars to skip before trading. Defaults to the reader's `preferred_bars`,
     #: because below that the 200-day slope cannot be computed and its gate reads
     #: as satisfied — so an earlier start would silently replay a *different*,
     #: ungated strategy over the first stretch and pool the results.
@@ -327,10 +332,10 @@ class ReplayConfig:
 
 def replay(
     series: PriceSeries,
-    rules: EntryRules,
+    reader: EntryReader | None = None,
     config: ReplayConfig | None = None,
 ) -> BacktestResult:
-    """Walk `series` bar by bar, taking every trade the rules would have taken.
+    """Walk `series` bar by bar, taking every trade the reader admits.
 
     Execution is modelled the way the live system actually behaves, because the
     optimistic alternatives are where backtests earn their bad reputation:
@@ -348,18 +353,23 @@ def replay(
         which came first, so the replay assumes the worse one.
     """
     config = config or ReplayConfig()
-    warmup = config.warmup_bars if config.warmup_bars is not None else rules.preferred_bars
+    reader = reader if reader is not None else EveryBarReader()
+    warmup = (
+        config.warmup_bars
+        if config.warmup_bars is not None
+        else getattr(reader, "preferred_bars", 300)
+    )
     multiplier = config.atr_stop_multiplier
 
     trades: list[BacktestTrade] = []
     position: _OpenPosition | None = None
     unreadable = 0
-    start = max(warmup, rules.required_bars)
+    start = max(warmup, getattr(reader, "required_bars", 20))
     length = series.length
 
     for i in range(start, length):
         # Everything known as of this bar's close, and nothing after it.
-        reading = read_entry(series.head(i + 1), rules)
+        reading = reader(series.head(i + 1))
         if reading is None:
             unreadable += 1
 
@@ -412,7 +422,7 @@ def replay(
             target = (
                 position.entry_price + config.fixed_target_r * position.risk_distance
                 if config.fixed_target_r is not None
-                else (reading.middle if reading is not None else None)
+                else (reading.target if reading is not None else None)
             )
             if target is not None and float(series.close[i]) >= target:
                 if i + 1 < length:

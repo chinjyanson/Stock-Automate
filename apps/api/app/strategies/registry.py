@@ -14,12 +14,10 @@ from __future__ import annotations
 from app.models.enums import StrategyKind
 from app.models.strategy import StrategyConfiguration
 from app.strategies.base import Strategy
-from app.strategies.index_timing import IndexTimingStrategy
-from app.strategies.mean_reversion import MeanReversionStrategy
+from app.strategies.logistic_stock import LogisticStockStrategy
 
 _REGISTRY: dict[StrategyKind, type[Strategy]] = {
-    StrategyKind.MEAN_REVERSION: MeanReversionStrategy,
-    StrategyKind.INDEX_TIMING: IndexTimingStrategy,
+    StrategyKind.LOGISTIC_STOCK: LogisticStockStrategy,
 }
 
 

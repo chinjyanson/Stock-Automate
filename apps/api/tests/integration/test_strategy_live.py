@@ -100,7 +100,10 @@ class FakeLiveBroker(Broker):
 #: strategy exists to catch, and the only shape that produces a guaranteed
 #: entry. A *gradual* decline does not work: the bands follow a trend down, so
 #: price never breaks its own lower band.
-_STABLE_BASE = [100 + (2 if i % 2 else -2) for i in range(45)]
+#: 245 bars because `backtest.features.compute` returns nothing below 220, and
+#: a model with no features declines to have an opinion — which would leave
+#: these routing tests with no signal to route.
+_STABLE_BASE = [100 + (2 if i % 2 else -2) for i in range(245)]
 _SELLOFF = [*_STABLE_BASE, 95.0, 90.0, 86.0]
 
 
@@ -159,23 +162,57 @@ async def _set(db: object, key: str, value: bool) -> None:
     await db.flush()  # type: ignore[attr-defined]
 
 
+async def _seed_model(db: object) -> None:
+    """A model confident enough to enter, since these tests are about routing.
+
+    `sigmoid(3.0)` is 0.95, comfortably over any entry probability, so what is
+    being tested is where the resulting signal *goes* — proposal or live order —
+    rather than whether some fitted coefficient happened to like the fixture.
+    """
+    from app.models_ml.logistic import FittedModel
+    from app.services.strategy_model import StrategyModelService
+
+    names = ("discount_sma200", "rsi_14", "sma200_slope", "atr_pct")
+    n = len(names)
+    model = FittedModel(
+        feature_names=names,
+        coefficients=(0.0,) * n,
+        intercept=3.0,
+        means=(0.0,) * n,
+        sds=(1.0,) * n,
+        scale_known=(True,) * n,
+        prior_means=(0.0,) * n,
+        prior_taus=(1.0,) * n,
+        shrinkage=(1.0,) * n,
+        standard_errors=(0.1,) * n,
+        n_observations=1_000,
+        positive_rate=0.44,
+        auc=0.55,
+        brier=0.24,
+        log_loss=0.68,
+        label_definition="test fixture",
+    )
+    await StrategyModelService(db).save(StrategyKind.LOGISTIC_STOCK, model)  # type: ignore[arg-type]
+
+
 async def _entry_config(db: object, instrument: Instrument) -> StrategyConfiguration:
     db.add(RiskConfiguration(name="default", is_active=True))  # type: ignore[attr-defined]
+    await _seed_model(db)
     config = StrategyConfiguration(
-        kind=StrategyKind.MEAN_REVERSION,
-        name="meanrev",
+        kind=StrategyKind.LOGISTIC_STOCK,
+        name="logistic-stock",
         is_active=True,
         interval=Interval.D1,
         auto_execute=True,
-        # RSI is pinned at 40 rather than taken from the configured default so
-        # that retuning the strategy cannot silently stop these tests producing
-        # the entry whose *routing* is what they are about.
+        # Pinned rather than taken from the configured defaults so that retuning
+        # the strategy cannot silently stop these tests producing the entry
+        # whose *routing* is what they are about.
         params={
             "bb_period": 20,
             "bb_std": 2.0,
-            "rsi_period": 14,
             "atr_period": 14,
             "min_atr_pct": 0.02,
+            "entry_probability": 0.55,
         },
         universe={"instrument_ids": [str(instrument.id)]},
     )
