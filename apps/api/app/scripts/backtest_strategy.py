@@ -168,6 +168,48 @@ async def _run(size: int, sweep: str, warmup: int | None) -> None:
         print("Excluded:   series with an unadjusted split (see MAX_DAILY_PRICE_RATIO)")
         print("Marked *:   expectancy is more than two standard errors from zero\n")
 
+        if sweep == "shape":
+            # **Stop and target moved together**, which is the experiment none of
+            # the earlier sweeps ran.
+            #
+            # They are wildly mismatched as shipped: the stop sits 5 ATR away and
+            # the band target about 0.4 ATR away, so a trade risks roughly twelve
+            # units to make one. A 54% win rate barely holds that together, and
+            # the payoff ratio comes out at 0.77 — you win less than you lose.
+            #
+            # Sweeping either alone cannot find the fix, which is why 27 previous
+            # configurations found nothing. Tightening the stop with the band
+            # target still leaves the target tiny, so it only adds stop-outs.
+            # Widening the target against a 5-ATR stop asks for a 7.5-ATR move
+            # that never arrives. Only the pair has a chance.
+            print("Stop and target scaled together, on both folds")
+            print("  (target in R, so its distance in ATR is target x stop)\n")
+            for fold in ("fit", "confirm"):
+                half = service.split(instruments, fold=fold)
+                print(f"  {fold.upper()} fold — {len(half)} instruments")
+                for stop in (1.0, 1.5, 2.0, 3.0, 5.0):
+                    reader = ModelReader(model=model, threshold=0.55, atr_stop_multiplier=stop)
+                    for target in (None, 1.0, 1.5, 2.0):
+                        cfg = ReplayConfig(
+                            warmup_bars=warmup,
+                            atr_stop_multiplier=stop,
+                            fixed_target_r=target,
+                        )
+                        pooled, _, _ = await service.run(half, reader, cfg, min_bars=min_bars)
+                        shown = "band" if target is None else f"{target:.1f}R"
+                        _print_result(
+                            f"stop {stop:.1f}xATR, target {shown}",
+                            pooled,
+                            instruments=len(half),
+                        )
+                print()
+            print(
+                "  The pair that wins on BOTH folds is the only one worth having.\n"
+                "  A payoff ratio near or above 1.0 is what to look for — it moves\n"
+                "  the break-even win rate down to 50%, which the entry already clears."
+            )
+            return
+
         if sweep == "exits":
             print("Exit variants at the shipping probability")
             reader = ModelReader(model=model, threshold=0.55)
@@ -205,7 +247,7 @@ def main() -> None:
     parser.add_argument("--size", type=int, default=400, help="Instruments to replay.")
     parser.add_argument(
         "--sweep",
-        choices=("probability", "exits"),
+        choices=("probability", "exits", "shape"),
         default="probability",
         help="Which comparison to run.",
     )
