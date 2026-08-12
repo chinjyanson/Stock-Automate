@@ -78,7 +78,6 @@ class IndexReading:
 def read_index_features(
     series: PriceSeries,
     conditions: IndexConditions,
-    kronos: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """Point-in-time features for the last bar, plus today's option reading.
 
@@ -108,8 +107,6 @@ def read_index_features(
             if reading is not None and np.isfinite(reading):
                 out[name] = reading
 
-    if kronos:
-        out.update(kronos)
     return out
 
 
@@ -117,7 +114,6 @@ def read_index(
     series: PriceSeries,
     model: FittedModel,
     conditions: IndexConditions,
-    kronos: dict[str, float] | None = None,
 ) -> IndexReading | None:
     """Evaluate the model, or None when no opinion is possible."""
     if series.length < REQUIRED_BARS:
@@ -126,7 +122,7 @@ def read_index(
     if last <= 0:
         return None
 
-    features = read_index_features(series, conditions, kronos)
+    features = read_index_features(series, conditions)
     if not features:
         return None
     return IndexReading(
@@ -157,9 +153,7 @@ class LogisticIndexStrategy(Strategy):
             )
             if series is None:
                 continue
-            reading = read_index(
-                series, model, ctx.index_conditions, ctx.kronos_features(instrument.id)
-            )
+            reading = read_index(series, model, ctx.index_conditions)
             if reading is None:
                 continue
 

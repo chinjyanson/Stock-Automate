@@ -17,11 +17,6 @@ Read the caveats in `app.backtest.engine` before trusting a number. In short:
 this measures the *entry* on individual instruments, not the portfolio the risk
 engine would have built, and neither PEAD nor insider vetoes can fire
 historically — so the live strategy is slightly more selective than this.
-
-**Kronos is absent from a replay.** Generating a forecast at every bar of every
-instrument would take weeks, so its features impute to their training means and
-contribute nothing here. What this measures is the model's price features alone,
-which makes it a floor on live behaviour rather than an estimate of it.
 """
 
 from __future__ import annotations

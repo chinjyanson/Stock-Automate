@@ -213,7 +213,6 @@ class StrategyEngine:
             insider_sell_pressure=await self._insider_pressure(instruments),
             pead_scores=await self._pead_scores(instruments),
             index_conditions=await self._index_conditions(),
-            kronos_predictions=await self._kronos_features(instruments),
             stock_model=await self._model(config.kind),
         )
         try:
@@ -578,31 +577,6 @@ class StrategyEngine:
                     move_atr=score.move_since_filing_atr,
                 )
         return pressure
-
-    async def _kronos_features(
-        self, instruments: list[Instrument]
-    ) -> dict[uuid.UUID, dict[str, float]]:
-        """Kronos forecasts across the universe, read from the table.
-
-        Read, never generated: producing one imports torch, which does not fit
-        this box. A failure or an empty table degrades to an empty mapping, and
-        the strategy imputes the missing features to their training means — so a
-        night the local forecasting job did not run costs precision rather than
-        stopping the strategy trading.
-        """
-        from app.config import get_settings
-        from app.services.kronos import KronosService
-
-        settings = get_settings()
-        try:
-            return await KronosService(self._session).latest_for(
-                [i.id for i in instruments],
-                model_name=settings.kronos_model,
-                horizon_days=settings.kronos_horizon_days,
-            )
-        except Exception as exc:
-            log.warning("strategy.kronos_failed", error=str(exc))
-            return {}
 
     async def _model(self, kind: StrategyKind) -> FittedModel | None:
         """The fitted model this strategy serves, or None if it has none."""

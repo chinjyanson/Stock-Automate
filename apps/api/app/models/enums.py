@@ -244,7 +244,7 @@ class StrategyKind(StrEnum):
     """
 
     #: Individual stocks from the scanner's top-ranked names. A logistic model
-    #: over price features and a Kronos forecast estimates the probability that
+    #: over measured price features estimates the probability that
     #: a trade reaches its target before its stop, and that probability is the
     #: entry decision. Every feature it uses is measured, so it carries no
     #: informative priors.

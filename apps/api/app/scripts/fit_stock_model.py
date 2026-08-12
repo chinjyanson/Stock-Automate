@@ -1,7 +1,6 @@
 """Fit the stock entry model (§8).
 
     python -m app.scripts.fit_stock_model --size 400
-    python -m app.scripts.fit_stock_model --size 400 --kronos --save
 
 **The label is the outcome of an actual simulated trade**, not a forward return.
 Every readable bar is opened as a position and replayed under the real execution
@@ -28,19 +27,6 @@ within that selection and tell it nothing about what the rule was already
 refusing — which is most of the space, and exactly where a better entry would
 have to come from.
 
-**Two stages, and the reason is arithmetic.** A Kronos forecast costs ~12s at 32
-paths, so computing one at every training row would take about 260 hours. So:
-
-  1. **Deterministic fit** over the full replay sample, price features only.
-     Free to compute, and it is the *stability control*.
-  2. **Full fit** on a subsample where Kronos is also computed, ~2,000 rows and
-     about seven hours.
-
-The shipped model is stage 2. Stage 1 exists to answer one question: do the
-deterministic coefficients keep their sign and rough magnitude when refitted on
-4% of the data? If they flip, the subsample is unrepresentative and the model
-should not be trusted — so the comparison is printed rather than buried.
-
 Folds split by instrument, never by date, and the AUC that matters is the one on
 the fold the fit never saw.
 """
@@ -51,7 +37,6 @@ import argparse
 import asyncio
 import uuid
 from dataclasses import dataclass
-from datetime import date
 
 import numpy as np
 
@@ -70,9 +55,6 @@ from app.strategies.logistic_stock import PRICE_FEATURES
 
 # Imported rather than restated: one list, shared with the strategy that serves
 # the result, so a feature added here cannot fail to reach production.
-
-#: Added when --kronos is passed and forecasts exist for the sampled bars.
-KRONOS_FEATURES = ("kronos_return", "kronos_prob_up", "kronos_dispersion")
 
 LABEL_DEFINITIONS = {
     "profit": ("1 if the replayed trade closed with a positive R multiple; UNCLOSED discarded"),
@@ -137,7 +119,6 @@ async def _collect(
     instruments: list[Instrument],
     *,
     history_bars: int,
-    kronos_history: dict[tuple[uuid.UUID, date], dict[str, float]] | None,
     label_scheme: str,
 ) -> list[Sample]:
     reader = EveryBarReader()
@@ -166,7 +147,6 @@ async def _collect(
         # Through the shared splitter rather than reimplementing the hash, so
         # this fit and every sweep land the same name in the same fold.
         fold = "fit" if bool(service.split([instrument], fold="fit")) else "confirm"
-        timestamps = [c.timestamp for c in candles]
 
         for trade in result.trades:
             label = _label(trade.exit_reason, trade.r_multiple, label_scheme)
@@ -188,17 +168,6 @@ async def _collect(
                     row[name] = value
             if len(row) < len(PRICE_FEATURES):
                 continue
-            # Kronos is looked up by (instrument, **the decision date**), never
-            # per instrument. A single current forecast reused across an
-            # instrument's whole history would be a look-ahead leak — it already
-            # knows how these trades ended — and would be constant per stock, so
-            # it could only express *which stock* rather than *when to buy*.
-            # Absent for this date means absent: the feature imputes to its
-            # training mean, exactly as it does live.
-            if kronos_history and decision < len(timestamps):
-                reading = kronos_history.get((instrument.id, timestamps[decision].date()))
-                if reading:
-                    row.update(reading)
             samples.append(
                 Sample(
                     instrument_id=instrument.id,
@@ -261,9 +230,7 @@ def _report(title: str, model: FittedModel, names: tuple[str, ...]) -> None:
     print(f"  {'(intercept)':<22} {model.intercept:>+8.4f}")
 
 
-async def _run(
-    size: int, history_bars: int, use_kronos: bool, save: bool, label_scheme: str
-) -> None:
+async def _run(size: int, history_bars: int, save: bool, label_scheme: str) -> None:
     async with session_scope() as session:
         service = BacktestService(session)
         store = CandleStore(session)
@@ -273,24 +240,6 @@ async def _run(
         if not instruments:
             print("No instruments with stored history. Ingest candles first.")
             return
-
-        kronos_history = None
-        if use_kronos:
-            from app.config import get_settings
-            from app.services.kronos import KronosService
-
-            settings = get_settings()
-            kronos_history = await KronosService(session).history_for(
-                [i.id for i in instruments],
-                model_name=settings.kronos_model,
-                horizon_days=settings.kronos_horizon_days,
-            )
-            print(f"Kronos:     {len(kronos_history):,} historical forecasts available")
-            if not kronos_history:
-                print(
-                    "            none stored — generate them first with\n"
-                    "            python -m app.scripts.backfill_kronos_history"
-                )
 
         print(f"Universe:   {len(instruments)} instruments")
         print(f"Label:      {label_scheme} -- {LABEL_DEFINITIONS[label_scheme]}")
@@ -302,7 +251,6 @@ async def _run(
             store,
             instruments,
             history_bars=history_bars,
-            kronos_history=kronos_history,
             label_scheme=label_scheme,
         )
         if len(samples) < 200:
@@ -322,9 +270,6 @@ async def _run(
             )
 
         names: tuple[str, ...] = PRICE_FEATURES
-        if use_kronos and any(KRONOS_FEATURES[0] in s.features for s in samples):
-            names = PRICE_FEATURES + KRONOS_FEATURES
-
         print("\nPruning correlated features")
         x_all, _ = _matrix(samples, names)
         names = _prune(x_all, names)
@@ -383,7 +328,6 @@ async def _run(
                     f"fit_stock_model, {len(instruments)} instruments, "
                     f"{len(samples)} trades, confirm AUC {confirm_auc:.4f}, "
                     f"confirm Brier {confirm_brier:.4f}, "
-                    f"kronos={'yes' if use_kronos else 'no'}"
                 ),
             )
             print(f"\nSaved and activated model {row.id}")
@@ -395,11 +339,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Fit the stock entry model.")
     parser.add_argument("--size", type=int, default=400, help="Instruments to sample.")
     parser.add_argument("--history", type=int, default=2000, help="Bars per instrument.")
-    parser.add_argument(
-        "--kronos",
-        action="store_true",
-        help="Include Kronos features. Needs the local forecasting job to have run.",
-    )
     parser.add_argument("--save", action="store_true", help="Store and activate the fit.")
     parser.add_argument(
         "--label",
@@ -415,7 +354,6 @@ def main() -> None:
         _run(
             size=args.size,
             history_bars=args.history,
-            use_kronos=args.kronos,
             save=args.save,
             label_scheme=args.label,
         )

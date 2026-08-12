@@ -42,7 +42,6 @@ from app.models.instrument import (
     Watchlist,
     WatchlistInstrument,
 )
-from app.models.kronos import KronosPrediction
 from app.models.market_data import (
     Candle,
     CorporateAction,
@@ -113,7 +112,6 @@ __all__ = [
     "Instrument",
     "InstrumentKind",
     "Interval",
-    "KronosPrediction",
     "LifecycleState",
     "LiveArmingSession",
     "MarketDataMapping",

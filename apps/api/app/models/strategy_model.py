@@ -1,10 +1,9 @@
 """A fitted logistic model, stored so a strategy can serve it without refitting.
 
-Fitting happens offline — it needs the whole replay history, and for the stock
-model it needs Kronos, which needs torch, which does not fit on the deployment
-box. So the fit runs on a machine that has the memory and writes a row here, and
-the strategy reads it. The same store-only discipline as `kronos_predictions`
-and `index_options_snapshots`.
+Fitting happens offline — it needs the whole replay history, which is far more
+than a nightly evaluation should read. So the fit runs as a script and writes a
+row here, and the strategy reads it. The same store-only discipline as
+`index_options_snapshots`.
 
 **Three things are stored with the coefficients that might look optional and
 are not.**

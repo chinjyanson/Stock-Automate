@@ -22,11 +22,6 @@ required to hold their sign across an out-of-sample fold:
     sma200_slope      -0.076 / -0.070
     atr_pct           +0.039 / +0.054
 
-plus Kronos's forecast return, its probability of finishing up, and the spread
-across its sampled paths — the last being the model's own uncertainty, which is
-worth more than the point forecast because a confident wrong answer and an
-unsure one are otherwise identical.
-
 **What stayed a gate, and why.** The model answers "is this likely to work". It
 does not answer "should this ever be bought", and blending those lets an
 attractive enough setup buy its way past a safety rule. So two absolute gates
@@ -118,7 +113,7 @@ class StockReading:
     close: float
 
 
-def read_features(series: PriceSeries, kronos: dict[str, float] | None) -> dict[str, float]:
+def read_features(series: PriceSeries) -> dict[str, float]:
     """Point-in-time features for the last bar of `series`.
 
     Uses `backtest.features.compute` — the same function the fit ran on. That
@@ -139,15 +134,12 @@ def read_features(series: PriceSeries, kronos: dict[str, float] | None) -> dict[
         value = float(column[-1])
         if np.isfinite(value):
             out[name] = value
-    if kronos:
-        out.update(kronos)
     return out
 
 
 def read_stock(
     series: PriceSeries,
     model: FittedModel,
-    kronos: dict[str, float] | None,
     *,
     bb_period: int,
     bb_std: float,
@@ -171,7 +163,7 @@ def read_stock(
     if atr is None or last <= 0:
         return None
 
-    features = read_features(series, kronos)
+    features = read_features(series)
     # No feature computed at all is "no opinion", not "the base rate".
     #
     # `backtest.features.compute` returns nothing below MIN_BARS, so a series
@@ -231,7 +223,6 @@ class LogisticStockStrategy(Strategy):
             reading = read_stock(
                 series,
                 model,
-                ctx.kronos_features(instrument.id),
                 bb_period=bb_period,
                 bb_std=bb_std,
                 atr_period=atr_period,

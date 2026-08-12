@@ -111,12 +111,6 @@ class StrategyContext:
     #: `insider_sell_pressure`. An absent key means no live earnings event, which
     #: is the common case and reads as "no objection" rather than as bad news.
     pead_scores: dict[uuid.UUID, float] = field(default_factory=dict)
-    #: Kronos forecast features per instrument, as `kronos_return`,
-    #: `kronos_prob_up`, `kronos_dispersion`, `kronos_drawdown`. Resolved once
-    #: by the engine from the predictions table — never generated here, because
-    #: generating one imports torch. An absent key means no recent forecast,
-    #: which reads as missing information rather than as bad news.
-    kronos_predictions: dict[uuid.UUID, dict[str, float]] = field(default_factory=dict)
     #: The fitted model this strategy serves, loaded once per run. None means
     #: no model has been fitted yet, and a strategy with no model emits nothing
     #: rather than falling back to a default weighting.
@@ -130,10 +124,6 @@ class StrategyContext:
     def sell_pressure(self, instrument_id: uuid.UUID) -> InsiderPressure | None:
         """Insider selling on one instrument, or None when there is none."""
         return self.insider_sell_pressure.get(instrument_id)
-
-    def kronos_features(self, instrument_id: uuid.UUID) -> dict[str, float] | None:
-        """Kronos features for one instrument, or None when there is no forecast."""
-        return self.kronos_predictions.get(instrument_id)
 
     def pead_score(self, instrument_id: uuid.UUID) -> float | None:
         """Post-earnings drift on one instrument, or None when there is no event."""

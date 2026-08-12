@@ -138,10 +138,7 @@ class ModelReader:
     """Admits when the fitted model's probability clears `threshold`.
 
     The same features the live strategy reads, on the same fitted model, so a
-    swept threshold here is a swept threshold there. Kronos is absent from a
-    historical replay — generating a forecast at every bar would take weeks — so
-    its features impute to their training means, which is the same thing that
-    happens live on a night the forecasting job did not run.
+    swept threshold here is a swept threshold there.
 
     **Stateful, unlike `EveryBarReader`.** `prepare` computes the feature matrix
     once per instrument; see it for why that is both necessary and safe.
@@ -213,7 +210,7 @@ class ModelReader:
         # Un-prepared — a direct call rather than a replay. Correct either way;
         # only the cost differs.
         if not self._columns:
-            return read_features(series, None)
+            return read_features(series)
 
         index = series.length - 1
         out: dict[str, float] = {}

@@ -85,7 +85,7 @@ class TestTrainServeIdentity:
             series.open, series.high, series.low, series.close, series.volume
         )
         for i in (300, 350, 399):
-            served = read_features(series.head(i + 1), None)
+            served = read_features(series.head(i + 1))
             for name in PRICE_FEATURES:
                 assert served[name] == pytest.approx(float(columns[name][i]), rel=1e-12)
 
@@ -96,14 +96,14 @@ class TestTrainServeIdentity:
         reader = ModelReader(model=model, threshold=0.5, min_atr_pct=0.0)
 
         reading = reader(series)
-        live = read_stock(series, model, None, bb_period=20, bb_std=2.0, atr_period=14)
+        live = read_stock(series, model, bb_period=20, bb_std=2.0, atr_period=14)
         assert reading is not None and live is not None
         assert reading.score == pytest.approx(live.probability, rel=1e-12)
 
     def test_rewriting_the_future_cannot_change_the_present(self) -> None:
         """Point-in-time, asserted rather than assumed."""
         series = _series(400)
-        before = read_features(series.head(300), None)
+        before = read_features(series.head(300))
 
         mutated = series.close.copy()
         mutated[300:] = 1_000.0
@@ -115,7 +115,7 @@ class TestTrainServeIdentity:
             adjusted_close=np.full(mutated.size, np.nan),
             volume=series.volume,
         )
-        after = read_features(rewritten.head(300), None)
+        after = read_features(rewritten.head(300))
         assert before == pytest.approx(after)
 
 
@@ -130,42 +130,13 @@ class TestNoOpinionIsNotABaseRate:
         """
         short = _series(MIN_BARS - 20)
         model = _model(intercept=5.0)  # would say 0.99 to anything
-        assert read_stock(short, model, None, bb_period=20, bb_std=2.0, atr_period=14) is None
+        assert read_stock(short, model, bb_period=20, bb_std=2.0, atr_period=14) is None
 
     def test_a_long_enough_series_does_have_an_opinion(self) -> None:
         model = _model(intercept=5.0)
-        reading = read_stock(_series(400), model, None, bb_period=20, bb_std=2.0, atr_period=14)
+        reading = read_stock(_series(400), model, bb_period=20, bb_std=2.0, atr_period=14)
         assert reading is not None
         assert reading.probability > 0.9
-
-
-class TestMissingFeaturesAreNeutral:
-    def test_an_absent_kronos_forecast_contributes_nothing(self) -> None:
-        """A night the local forecasting job did not run costs precision, not
-        correctness — the feature imputes to its training mean."""
-        names = (*PRICE_FEATURES, "kronos_return")
-        model = _model(names)
-        series = _series(400)
-
-        without = read_stock(series, model, None, bb_period=20, bb_std=2.0, atr_period=14)
-        with_zero = read_stock(
-            series, model, {"kronos_return": 0.0}, bb_period=20, bb_std=2.0, atr_period=14
-        )
-        assert without is not None and with_zero is not None
-        # Mean is 0.0 in this fixture, so imputing and supplying the mean agree.
-        assert without.probability == pytest.approx(with_zero.probability)
-
-    def test_a_present_forecast_does_move_the_probability(self) -> None:
-        """...and the imputation is not simply ignoring the feature."""
-        names = (*PRICE_FEATURES, "kronos_return")
-        model = _model(names)
-        series = _series(400)
-        absent = read_stock(series, model, None, bb_period=20, bb_std=2.0, atr_period=14)
-        present = read_stock(
-            series, model, {"kronos_return": 2.0}, bb_period=20, bb_std=2.0, atr_period=14
-        )
-        assert absent is not None and present is not None
-        assert present.probability > absent.probability
 
 
 class TestPriorFeaturesAreBounded:
