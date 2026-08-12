@@ -14,6 +14,11 @@ predicted, feeding it `series.head(i + 1)` and nothing after. That slicing is th
 only thing standing between this and a fabricated result, so it is done in one
 place and stated here.
 
+**Forecasts are generated at the bars where trades actually open**, found by
+replaying first. An even grid of dates would be the obvious choice and would
+produce forecasts nothing can use: the fit joins Kronos to a trade by its
+decision bar, and an evenly-spaced bar almost never coincides with one.
+
 **The cost is the constraint, and it is severe.** A 32-path forecast takes about
 twelve seconds. One per bar per instrument is not remotely affordable — 6,000
 training trades would be twenty hours — so this samples `--dates` evaluation
@@ -41,7 +46,8 @@ import time
 
 import numpy as np
 
-from app.backtest.engine import is_continuous
+from app.backtest.engine import is_continuous, replay
+from app.backtest.entries import EveryBarReader
 from app.backtest.service import BacktestService
 from app.data.store import CandleStore
 from app.db import session_scope
@@ -71,6 +77,7 @@ async def _run(instruments_wanted: int, dates: int, history: int, samples: int |
     print(f"Sampling: {dates} dates x {instruments_wanted} instruments x {sample_count} paths")
     print(f"Horizon:  {horizon} trading days\n")
 
+    reader = EveryBarReader()
     started = time.perf_counter()
     written = 0
     attempted = 0
@@ -79,9 +86,14 @@ async def _run(instruments_wanted: int, dates: int, history: int, samples: int |
         service = BacktestService(session)
         store = CandleStore(session)
         kronos = KronosService(session)
-        universe = await service.top_ranked_instruments(instruments_wanted * 3)
+        # Ten candidates per wanted instrument, because most do not qualify:
+        # Kronos needs 512 bars of context plus the horizon, and roughly one
+        # scanner-ranked name in five carries that much history. A 3x multiplier
+        # silently caps the run well below what was asked for.
+        candidates = instruments_wanted * 10
+        universe = await service.top_ranked_instruments(candidates)
         if not universe:
-            universe = await service.instruments_with_history(instruments_wanted * 3)
+            universe = await service.instruments_with_history(candidates)
 
         used = 0
         for instrument in universe:
@@ -111,13 +123,31 @@ async def _run(instruments_wanted: int, dates: int, history: int, samples: int |
                 )
                 continue
 
-            # Spread across the usable window rather than clustered: a run of
-            # adjacent bars is very nearly one observation.
-            first = CONTEXT_BARS
-            last = series.length - horizon - 1
-            if last <= first:
+            # **Forecast where the trades actually are**, not on an even grid.
+            #
+            # The obvious approach — sample N dates evenly across the history —
+            # produces forecasts that no training row can use. The fit joins
+            # Kronos to a trade by its *decision bar*, and the chance that one of
+            # 22 evenly-spaced bars coincides with a decision bar out of ~700 is
+            # close to zero. Every forecast would cost twelve seconds and match
+            # nothing.
+            #
+            # So the replay runs first, purely to find where positions open, and
+            # the forecasts are generated at exactly those bars. Every one is
+            # then used by a training row.
+            decisions = sorted(
+                {t.entry_index - 1 for t in replay(series, reader).trades if t.entry_index > 0}
+            )
+            usable = [i for i in decisions if CONTEXT_BARS <= i < series.length - horizon - 1]
+            if not usable:
                 continue
-            indices = np.linspace(first, last, num=dates, dtype=int)
+            # Spread across the usable window rather than taking the first N: a
+            # run of adjacent entries is very nearly one observation.
+            if len(usable) > dates:
+                picked = np.linspace(0, len(usable) - 1, num=dates, dtype=int)
+                indices = [usable[j] for j in picked]
+            else:
+                indices = usable
 
             used += 1
             for i in indices:
