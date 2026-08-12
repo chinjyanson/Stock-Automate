@@ -48,7 +48,9 @@ def _compound(daily: np.ndarray) -> float:
     return float(np.prod(1.0 + daily))
 
 
-def _oracle_mask(close: np.ndarray, horizon: int, rng: np.random.Generator, accuracy: float):
+def _oracle_mask(
+    close: np.ndarray, horizon: int, rng: np.random.Generator, accuracy: float
+) -> np.ndarray:
     """Invested-or-not per day, from a forecaster of the given accuracy.
 
     The oracle looks `horizon` days ahead and is right `accuracy` of the time;
