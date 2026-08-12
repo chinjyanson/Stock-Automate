@@ -33,13 +33,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from datetime import datetime
 
 import numpy as np
 from sqlalchemy import select
 
 from app.data.store import CandleStore
 from app.db import session_scope
-from app.indicators.series import candles_to_series
+from app.indicators.series import PriceSeries, candles_to_series
 from app.models.enums import Interval
 from app.models.instrument import MarketDataMapping
 
@@ -92,7 +93,7 @@ def _fetch(symbols: list[str], index: object) -> dict[str, np.ndarray]:
     return out
 
 
-async def _load_spy(symbol: str):
+async def _load_spy(symbol: str) -> tuple[PriceSeries | None, list[datetime] | None]:
     async with session_scope() as session:
         mapping = (
             (
@@ -117,7 +118,7 @@ async def _run(symbol: str) -> None:
     import pandas as pd
 
     series, timestamps = await _load_spy(symbol)
-    if series is None:
+    if series is None or timestamps is None:
         print(f"{symbol}: no usable history.")
         return
 
