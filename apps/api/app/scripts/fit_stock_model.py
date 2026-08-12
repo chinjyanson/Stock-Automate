@@ -51,6 +51,7 @@ import argparse
 import asyncio
 import uuid
 from dataclasses import dataclass
+from datetime import date
 
 import numpy as np
 
@@ -136,7 +137,7 @@ async def _collect(
     instruments: list[Instrument],
     *,
     history_bars: int,
-    kronos_by_instrument: dict[uuid.UUID, dict[str, float]] | None,
+    kronos_history: dict[tuple[uuid.UUID, date], dict[str, float]] | None,
     label_scheme: str,
 ) -> list[Sample]:
     reader = EveryBarReader()
@@ -165,7 +166,7 @@ async def _collect(
         # Through the shared splitter rather than reimplementing the hash, so
         # this fit and every sweep land the same name in the same fold.
         fold = "fit" if bool(service.split([instrument], fold="fit")) else "confirm"
-        kronos = (kronos_by_instrument or {}).get(instrument.id)
+        timestamps = [c.timestamp for c in candles]
 
         for trade in result.trades:
             label = _label(trade.exit_reason, trade.r_multiple, label_scheme)
@@ -187,8 +188,17 @@ async def _collect(
                     row[name] = value
             if len(row) < len(PRICE_FEATURES):
                 continue
-            if kronos:
-                row.update(kronos)
+            # Kronos is looked up by (instrument, **the decision date**), never
+            # per instrument. A single current forecast reused across an
+            # instrument's whole history would be a look-ahead leak — it already
+            # knows how these trades ended — and would be constant per stock, so
+            # it could only express *which stock* rather than *when to buy*.
+            # Absent for this date means absent: the feature imputes to its
+            # training mean, exactly as it does live.
+            if kronos_history and decision < len(timestamps):
+                reading = kronos_history.get((instrument.id, timestamps[decision].date()))
+                if reading:
+                    row.update(reading)
             samples.append(
                 Sample(
                     instrument_id=instrument.id,
@@ -264,18 +274,23 @@ async def _run(
             print("No instruments with stored history. Ingest candles first.")
             return
 
-        kronos_by_instrument = None
+        kronos_history = None
         if use_kronos:
             from app.config import get_settings
             from app.services.kronos import KronosService
 
             settings = get_settings()
-            kronos_by_instrument = await KronosService(session).latest_for(
+            kronos_history = await KronosService(session).history_for(
                 [i.id for i in instruments],
                 model_name=settings.kronos_model,
                 horizon_days=settings.kronos_horizon_days,
             )
-            print(f"Kronos:     {len(kronos_by_instrument)} instruments carry a recent forecast")
+            print(f"Kronos:     {len(kronos_history):,} historical forecasts available")
+            if not kronos_history:
+                print(
+                    "            none stored — generate them first with\n"
+                    "            python -m app.scripts.backfill_kronos_history"
+                )
 
         print(f"Universe:   {len(instruments)} instruments")
         print(f"Label:      {label_scheme} -- {LABEL_DEFINITIONS[label_scheme]}")
@@ -287,7 +302,7 @@ async def _run(
             store,
             instruments,
             history_bars=history_bars,
-            kronos_by_instrument=kronos_by_instrument,
+            kronos_history=kronos_history,
             label_scheme=label_scheme,
         )
         if len(samples) < 200:

@@ -87,6 +87,41 @@ class KronosService:
         # per instrument survives.
         return {row.instrument_id: row.as_features() for row in rows}
 
+    async def history_for(
+        self,
+        instrument_ids: list[uuid.UUID],
+        *,
+        model_name: str,
+        horizon_days: int,
+    ) -> dict[tuple[uuid.UUID, date], dict[str, float]]:
+        """Every stored forecast, keyed by (instrument, **the date it was made**).
+
+        Distinct from `latest_for`, and the distinction is the whole point.
+        `latest_for` answers "what does the model think about this stock now",
+        which is what a live strategy wants. Training wants "what did the model
+        think *on the day of this trade*", and using the first where the second
+        is meant is a look-ahead leak: today's forecast already knows how a trade
+        from two years ago turned out. It is also constant per instrument, so it
+        could only ever express *which stock* rather than *when to buy* — which
+        is the opposite of what this feature is for.
+        """
+        if not instrument_ids:
+            return {}
+        rows = (
+            (
+                await self._session.execute(
+                    select(KronosPrediction).where(
+                        KronosPrediction.instrument_id.in_(instrument_ids),
+                        KronosPrediction.model_name == model_name,
+                        KronosPrediction.horizon_days == horizon_days,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        return {(row.instrument_id, row.as_of): row.as_features() for row in rows}
+
     async def record(
         self,
         instrument_id: uuid.UUID,
