@@ -132,16 +132,16 @@ def _run_window(
 
 async def _universe(min_bars: int, kind: InstrumentKind | None) -> list[tuple[str, np.ndarray]]:
     async with session_scope() as session:
-        rows = (
-            await session.execute(
-                select(Instrument.id, Instrument.name)
-                .join(Candle, Candle.instrument_id == Instrument.id)
-                .where(Instrument.kind == kind if kind else True)
-                .where(Candle.interval == Interval.D1)
-                .group_by(Instrument.id, Instrument.name)
-                .having(func.count(Candle.id) >= min_bars)
-            )
-        ).all()
+        query = (
+            select(Instrument.id, Instrument.name)
+            .join(Candle, Candle.instrument_id == Instrument.id)
+            .where(Candle.interval == Interval.D1)
+            .group_by(Instrument.id, Instrument.name)
+            .having(func.count(Candle.id) >= min_bars)
+        )
+        if kind is not None:
+            query = query.where(Instrument.kind == kind)
+        rows = (await session.execute(query)).all()
         store = CandleStore(session)
         out = []
         for instrument_id, name in rows:
