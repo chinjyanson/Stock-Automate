@@ -14,7 +14,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.enums import Interval
@@ -121,6 +121,24 @@ class KronosService:
             .all()
         )
         return {(row.instrument_id, row.as_of): row.as_features() for row in rows}
+
+    async def count_for(
+        self, instrument_id: uuid.UUID, *, model_name: str, horizon_days: int
+    ) -> int:
+        """How many forecasts one instrument already has, for resuming a backfill."""
+        return int(
+            (
+                await self._session.execute(
+                    select(func.count())
+                    .select_from(KronosPrediction)
+                    .where(
+                        KronosPrediction.instrument_id == instrument_id,
+                        KronosPrediction.model_name == model_name,
+                        KronosPrediction.horizon_days == horizon_days,
+                    )
+                )
+            ).scalar_one()
+        )
 
     async def record(
         self,

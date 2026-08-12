@@ -21,8 +21,16 @@ points per instrument, spread across the usable history. That buys a sample big
 enough to answer "does Kronos add anything on top of the price features?" while
 staying inside an overnight run.
 
-Idempotent: forecasts are upserted by (instrument, date, model, horizon), so an
-interrupted run can be resumed and a repeat costs nothing but time.
+**Committed per instrument, which is the difference between resumable and not.**
+`session_scope` commits once, on clean exit. A three-hour run inside one
+transaction is three hours of work that a Ctrl-C throws away — which is exactly
+what happened the first time this ran: it reported 352 forecasts written and
+left zero rows behind. Each instrument is now committed as it completes, so an
+interrupted run keeps everything up to the last finished name.
+
+Idempotent on top of that: forecasts are upserted by (instrument, date, model,
+horizon), so resuming re-does at most one instrument and a repeat run costs
+nothing but time.
 """
 
 from __future__ import annotations
@@ -89,6 +97,20 @@ async def _run(instruments_wanted: int, dates: int, history: int, samples: int |
                 continue
             timestamps = [c.timestamp for c in candles]
 
+            # Already covered on a previous run: skip rather than regenerate.
+            # The upsert would make a repeat *correct*, but it would cost the
+            # same four minutes an instrument, which makes resuming pointless.
+            existing = await kronos.count_for(
+                instrument.id, model_name=client.model_name, horizon_days=horizon
+            )
+            if existing >= dates:
+                used += 1
+                print(
+                    f"  {used:>3}/{instruments_wanted}  {instrument.name[:32]:<32} "
+                    f"already has {existing} — skipped"
+                )
+                continue
+
             # Spread across the usable window rather than clustered: a run of
             # adjacent bars is very nearly one observation.
             first = CONTEXT_BARS
@@ -115,6 +137,10 @@ async def _run(instruments_wanted: int, dates: int, history: int, samples: int |
                     continue
                 await kronos.record(instrument.id, timestamps[i].date(), forecast)
                 written += 1
+
+            # Durable before moving on. Without this the whole run is one
+            # transaction and an interrupt discards all of it.
+            await session.commit()
 
             elapsed = time.perf_counter() - started
             rate = elapsed / max(attempted, 1)
