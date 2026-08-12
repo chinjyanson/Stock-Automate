@@ -65,11 +65,10 @@ from app.models.enums import Interval, StrategyKind
 from app.models.instrument import Instrument
 from app.models_ml.logistic import FittedModel, Prior, auc, fit
 from app.services.strategy_model import StrategyModelService
+from app.strategies.logistic_stock import PRICE_FEATURES
 
-#: Price features, in the order they enter the design matrix. Chosen by measured
-#: Spearman IC against a 20-day forward return, demeaned per instrument, and
-#: required to hold their sign on an out-of-sample fold.
-PRICE_FEATURES = ("discount_sma200", "rsi_14", "sma200_slope", "atr_pct")
+# Imported rather than restated: one list, shared with the strategy that serves
+# the result, so a feature added here cannot fail to reach production.
 
 #: Added when --kronos is passed and forecasts exist for the sampled bars.
 KRONOS_FEATURES = ("kronos_return", "kronos_prob_up", "kronos_dispersion")

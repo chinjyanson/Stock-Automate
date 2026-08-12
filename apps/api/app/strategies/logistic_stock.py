@@ -62,11 +62,36 @@ from app.models.enums import Interval, OrderSide, StrategyKind
 from app.models_ml.logistic import FittedModel
 from app.strategies.base import Strategy, StrategyContext, StrategySignal
 
-#: The features the model is fitted on, in no particular order — the stored
-#: model carries its own ordering and this is only what the strategy offers it.
-#: A name here that the model does not use is ignored; one the model wants and
-#: this does not supply imputes to the training mean and contributes nothing.
-PRICE_FEATURES = ("discount_sma200", "rsi_14", "sma200_slope", "atr_pct")
+#: The features the model is fitted on. **One definition, imported by the fit
+#: script and the replay reader**, so training and serving cannot drift onto
+#: different lists — a model fitted on one set and served another produces
+#: plausible probabilities that are simply wrong. The stored model carries its
+#: own ordering; this is only what the strategy offers it. A name here the model
+#: does not use is ignored, and one it wants that is missing imputes to the
+#: training mean.
+#:
+#: Chosen by forward selection against *trade outcomes* rather than by standalone
+#: ranking — see `app.scripts.rank_trade_features`. Each was added only if it
+#: improved out-of-sample AUC on top of everything already chosen, which is what
+#: keeps four ways of saying "oversold" out of the list. `discount_sma20` scored
+#: the best of all 22 on its own (0.5590) and added +0.0002 alongside
+#: `discount_sma200`, which is the trap this ordering exists to avoid.
+#:
+#: Stopped at eight. Rounds five through eight of the selection added 0.0014 AUC
+#: between them — indistinguishable from noise, and every extra feature is
+#: another coefficient fitted on the same finite sample.
+PRICE_FEATURES = (
+    # The original four.
+    "discount_sma200",
+    "rsi_14",
+    "sma200_slope",
+    "atr_pct",
+    # Added on measurement, in the order selection chose them.
+    "down_streak",  # +0.0134 — consecutive down days, the largest single gain
+    "downside_dev_20d",  # +0.0066 — volatility of losses only, not of moves
+    "sma50_over_sma200",  # +0.0043 — medium against long trend
+    "discount_sma20",  # +0.0033 — short-horizon dislocation
+)
 
 #: Bars fetched. `sma200_slope` needs 200 plus its 21-bar fit window, which is
 #: far more than the Bollinger target asks for.
