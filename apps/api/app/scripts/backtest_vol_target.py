@@ -173,6 +173,110 @@ def _simulate(
     return np.asarray(curve), turnover, float(np.mean(exposures)) if exposures else 0.0
 
 
+def _simulate_regime(
+    daily: np.ndarray,
+    vol: np.ndarray,
+    *,
+    capital: float,
+    threshold: float,
+    rough_exposure: float,
+    cost_pct: float,
+    borrow_rate: float,
+    hysteresis: float = 0.15,
+) -> tuple[np.ndarray, int, float]:
+    """Fully invested while calm, de-risked while rough. A stepped rule.
+
+    The continuous version scales exposure every day, which means paying a
+    little financing and a little turnover even in the quiet stretches where
+    buy-and-hold was already the better answer. This does nothing at all until
+    volatility crosses a line, then de-risks — so calm markets are held whole.
+
+    **Hysteresis is not optional here.** A single threshold with volatility
+    sitting on top of it flips the position every few days and pays a spread
+    each time. Rough is entered at `threshold x 1.15` and left at
+    `threshold / 1.15`, so the rule has to mean it.
+    """
+    equity = capital
+    exposure = 1.0
+    rough = False
+    curve: list[float] = []
+    switches = 0
+    exposures: list[float] = []
+
+    upper = threshold * (1.0 + hysteresis)
+    lower = threshold / (1.0 + hysteresis)
+
+    for i in range(VOL_WINDOW + 1, daily.size):
+        current = vol[i]
+        if np.isfinite(current):
+            if not rough and current > upper:
+                rough = True
+            elif rough and current < lower:
+                rough = False
+        wanted = rough_exposure if rough else 1.0
+
+        if abs(wanted - exposure) > 1e-9:
+            equity -= equity * abs(wanted - exposure) * cost_pct / 2.0
+            exposure = wanted
+            switches += 1
+
+        equity *= 1.0 + exposure * daily[i]
+        if exposure > 1.0:
+            equity -= equity * (exposure - 1.0) * borrow_rate / TRADING_DAYS
+        curve.append(equity)
+        exposures.append(exposure)
+
+    return np.asarray(curve), switches, float(np.mean(exposures)) if exposures else 0.0
+
+
+def _regime_table(
+    title: str,
+    daily: np.ndarray,
+    vol: np.ndarray,
+    capital: float,
+    thresholds: list[float],
+    cost: float,
+    borrow_rate: float,
+) -> None:
+    if daily.size < VOL_WINDOW + 50:
+        return
+    hold_curve = capital * np.cumprod(1.0 + daily[VOL_WINDOW + 1 :])
+    hold_final = float(hold_curve[-1])
+    hold_dd = _drawdown(hold_curve)
+
+    print(f"\n{title}")
+    print(
+        f"     {'rule':<28} {'final':>10} {'return':>9} {'drawdown':>10} {'ret/dd':>8} "
+        f"{'switches':>9}"
+    )
+    print(
+        f"     {'buy and hold':<28} {hold_final:>10,.0f} {hold_final / capital - 1:>8.1%} "
+        f"{hold_dd:>9.1%} {(hold_final / capital - 1) / hold_dd if hold_dd else 0:>8.2f} "
+        f"{0:>9}"
+    )
+    for threshold in thresholds:
+        for rough in (0.5, 0.0):
+            curve, switches, _average = _simulate_regime(
+                daily,
+                vol,
+                capital=capital,
+                threshold=threshold,
+                rough_exposure=rough,
+                cost_pct=cost,
+                borrow_rate=borrow_rate,
+            )
+            if curve.size == 0:
+                continue
+            final = float(curve[-1])
+            drawdown = _drawdown(curve)
+            label = f"calm 100%, rough {rough:.0%} @ {threshold:.0%}"
+            print(
+                f"     {label:<28} {final:>10,.0f} {final / capital - 1:>8.1%} "
+                f"{drawdown:>9.1%} "
+                f"{(final / capital - 1) / drawdown if drawdown else 0:>8.2f} {switches:>9}"
+            )
+
+
 async def _load(symbol: str) -> np.ndarray | None:
     async with session_scope() as session:
         mapping = (
@@ -225,12 +329,48 @@ async def _run(
         cost,
         borrow_rate,
     )
+    regime_thresholds = [0.15, 0.20, 0.25]
+    _regime_table(
+        "3. REGIME SWITCH — buy and hold while calm, de-risk while rough",
+        daily,
+        vol,
+        capital,
+        regime_thresholds,
+        cost,
+        borrow_rate,
+    )
+
     half = daily.size // 2
     _table(
-        "3. FIRST HALF", daily[:half], vol[:half], capital, targets, max_exposure, cost, borrow_rate
+        "4. FIRST HALF (calm bull market)",
+        daily[:half],
+        vol[:half],
+        capital,
+        targets,
+        max_exposure,
+        cost,
+        borrow_rate,
+    )
+    _regime_table(
+        "6. REGIME SWITCH, FIRST HALF",
+        daily[:half],
+        vol[:half],
+        capital,
+        regime_thresholds,
+        cost,
+        borrow_rate,
+    )
+    _regime_table(
+        "7. REGIME SWITCH, SECOND HALF",
+        daily[half:],
+        vol[half:],
+        capital,
+        regime_thresholds,
+        cost,
+        borrow_rate,
     )
     _table(
-        "4. SECOND HALF",
+        "5. SECOND HALF (2020 and 2022)",
         daily[half:],
         vol[half:],
         capital,
