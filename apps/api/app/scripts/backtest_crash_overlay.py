@@ -173,6 +173,7 @@ def _run(
     path: Path,
     capital: float,
     since: str,
+    until: str | None,
     split: float,
     split_date: str | None,
     horizon: int,
@@ -190,6 +191,12 @@ def _run(
 
     frame = yf.Ticker("^GSPC").history(period="max", interval="1d")
     frame = frame[frame.index >= since]
+    if until:
+        # Cutting the *end* is what makes a fixed window — "2006 to 2025", or one
+        # named year — answerable at all. It touches nothing about the fit: the
+        # model is trained on bars before `split_date`, so removing bars after
+        # the traded period cannot leak backwards into it.
+        frame = frame[frame.index < until]
     close = frame["Close"].to_numpy(dtype=np.float64)
     index = pd.DatetimeIndex(frame.index.tz_localize(None)).normalize()
     daily = np.concatenate([[np.nan], close[1:] / close[:-1] - 1.0])
@@ -363,6 +370,11 @@ def main() -> None:
         default="2006-01-01",
         help="History start. Before 2006 the insider feature is dropped automatically.",
     )
+    parser.add_argument(
+        "--until",
+        default=None,
+        help="Stop here (exclusive), for a fixed window such as one calendar year.",
+    )
     parser.add_argument("--split", type=float, default=0.5)
     parser.add_argument(
         "--split-date",
@@ -403,6 +415,7 @@ def main() -> None:
         args.path,
         args.capital,
         args.since,
+        args.until,
         args.split,
         args.split_date,
         args.horizon,
