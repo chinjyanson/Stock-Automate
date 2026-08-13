@@ -7,6 +7,7 @@ import { type Account, type Health, type LiveStatus, api } from "@/lib/api";
 const LINKS = [
   { href: "/dashboard", label: "Dashboard" },
   { href: "/scanner", label: "Scanner" },
+  { href: "/sp500", label: "S&P 500" },
   { href: "/settings", label: "Settings" },
 ];
 

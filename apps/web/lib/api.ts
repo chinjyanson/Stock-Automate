@@ -409,6 +409,22 @@ export const haltSchema = z.object({
   cleared_at: z.string().nullable(),
 });
 
+export const crashOverlayReadingSchema = z.object({
+  as_of: z.string(),
+  index_close: z.string().nullable(),
+  probability: z.string().nullable(),
+  trigger: z.string().nullable(),
+  is_warning: z.boolean(),
+  target_exposure: z.string().nullable(),
+  days_out: z.number(),
+  reason: z.string().nullable(),
+});
+
+export const crashOverlayStatusSchema = z.object({
+  latest: crashOverlayReadingSchema.nullable(),
+  days_of_history: z.number(),
+});
+
 export const liveStatusSchema = z.object({
   live_trading_enabled_on_server: z.boolean(),
   autonomous_enabled_on_server: z.boolean().default(false),
@@ -435,6 +451,8 @@ export type RiskConfigUpdate = Partial<
 >;
 export type Halt = z.infer<typeof haltSchema>;
 export type DailySummary = z.infer<typeof dailySummarySchema>;
+export type CrashOverlayReading = z.infer<typeof crashOverlayReadingSchema>;
+export type CrashOverlayStatus = z.infer<typeof crashOverlayStatusSchema>;
 export type ScannerResult = z.infer<typeof scannerResultSchema>;
 export type ScannerResultDetail = z.infer<typeof scannerResultDetailSchema>;
 export type ScannerRun = z.infer<typeof scannerRunSchema>;
@@ -642,6 +660,12 @@ export const api = {
       body: JSON.stringify({ eod_digest_enabled: enabled }),
     }),
 
+
+  // -- Crash overlay (S&P 500 exposure) --
+  crashOverlay: () => request("/crash-overlay", crashOverlayStatusSchema),
+
+  crashOverlayHistory: (limit = 120) =>
+    request(`/crash-overlay/history?limit=${limit}`, z.array(crashOverlayReadingSchema)),
 };
 
 /** Format a decimal string for display. Never used for arithmetic. */
