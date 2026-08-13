@@ -39,6 +39,7 @@ app = Celery(
         "worker.jobs.risk",
         "worker.jobs.backfill",
         "worker.jobs.market_regime",
+        "worker.jobs.crash_overlay",
         "worker.jobs.sentiment",
     ],
 )
@@ -103,6 +104,13 @@ app.conf.beat_schedule = {
         "task": "worker.jobs.market_regime.measure_market_regime",
         "schedule": crontab(hour=21, minute=50),
         "options": {"expires": 3600},
+    },
+    # After the regime reading, and late enough that the index close is settled.
+    # Long expiry because the nightly refit walks two decades of history.
+    "measure-crash-overlay": {
+        "task": "worker.jobs.crash_overlay.measure_crash_overlay",
+        "schedule": crontab(hour=22, minute=10),
+        "options": {"expires": 7200},
     },
     # After the candle refresh, so the scan reads fresh data. The rotation caps
     # itself per §6, so this covers the universe over successive days.

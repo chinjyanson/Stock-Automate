@@ -43,16 +43,15 @@ import numpy as np
 import pandas as pd
 
 from app.models_ml.logistic import Prior, fit
-from app.scripts.backtest_crash_overlay import (
+from app.scripts.backtest_crash_overlay import _drawdown, _simulate
+from app.signals.crash_features import (
     CALIBRATION_MIN,
     CALIBRATION_WINDOW,
     FEATURES,
     INSIDER_MIN_HISTORY,
-    _build,
-    _drawdown,
-    _rows,
-    _simulate,
 )
+from app.signals.crash_features import build as _build
+from app.signals.crash_features import rows as _rows
 
 TRADING_YEAR = 252
 
@@ -217,9 +216,7 @@ def _run(
         beats_flat_d = float(np.mean(table[:, 3] < table[:, 7]))
         beats_flat_q = float(np.mean(table[:, 5] > table[:, 8]))
 
-        print(
-            f"  {reentry}, top {fraction:.2%} of alarming days — {alarms_total} alarms"
-        )
+        print(f"  {reentry}, top {fraction:.2%} of alarming days — {alarms_total} alarms")
         print(
             f"    {'measure':<22} {'buy+hold':>10} {'flat':>8} {'overlay':>8} "
             f"{'vs b+h':>8} {'vs flat':>8}"

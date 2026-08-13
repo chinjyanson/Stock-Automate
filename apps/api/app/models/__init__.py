@@ -7,6 +7,7 @@ list silently produces an empty migration.
 
 from app.models.audit import GENESIS_HASH, AuditEvent
 from app.models.base import Base, Money, Price, Quantity, Ratio
+from app.models.crash_overlay import CrashOverlayReading
 from app.models.enums import (
     ActorKind,
     AuditEventKind,
@@ -87,6 +88,7 @@ __all__ = [
     "Candle",
     "Classification",
     "CorporateAction",
+    "CrashOverlayReading",
     "DailyAccountSummary",
     "DataQualityEvent",
     "DataQualityEventKind",

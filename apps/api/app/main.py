@@ -17,6 +17,7 @@ from app.api.routes import (
     approvals,
     audit,
     auth,
+    crash_overlay,
     health,
     instruments,
     live,
@@ -278,6 +279,7 @@ app.include_router(admin.router)
 app.include_router(account.router)
 app.include_router(instruments.router)
 app.include_router(scanner.router)
+app.include_router(crash_overlay.router)
 app.include_router(approvals.router)
 app.include_router(audit.router)
 app.include_router(live.router)

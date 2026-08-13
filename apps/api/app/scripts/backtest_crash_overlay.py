@@ -31,8 +31,6 @@ actually cover. Both are reported, because the AUC alone would flatter it.
 from __future__ import annotations
 
 import argparse
-import io
-import urllib.request
 import warnings
 from pathlib import Path
 
@@ -40,135 +38,23 @@ import numpy as np
 import pandas as pd
 
 from app.models_ml.logistic import FittedModel, Prior, auc, fit
-
-TRADING_DAYS = 252
-VOL_WINDOW = 20
-INSIDER_SMOOTH = 126
-INSIDER_MIN_HISTORY = 504
-
-#: Probabilities needed before a percentile of them means anything. Two years,
-#: so the first held-out decision is ranked against a real distribution.
-CALIBRATION_MIN = 504
-
-#: How far back the trigger looks when setting its percentile. **Rolling, not
-#: expanding.** An expanding window always contains 2008, whose probabilities
-#: are so extreme that its 95th percentile is a bar no ordinary year clears —
-#: calibrate that way and the switch stays off through the whole decade it was
-#: meant to watch. A trailing window asks "alarming *lately*", which is the
-#: question a trigger actually needs answered.
-CALIBRATION_WINDOW = 504
-BORROW = 0.05
-
-FEATURES: tuple[str, ...] = (
-    "vix",
-    "vix_term_structure",
-    "credit_spread",
-    "hyg_tlt",
-    "hyg_lqd",
-    "skew",
-    "small_cap_rs",
-    "realised_vol",
-    "vol_of_vol",
-    "drawdown_from_high",
-    "insider_rank",
+from app.signals.crash_features import (
+    CALIBRATION_MIN,
+    CALIBRATION_WINDOW,
+    FEATURES,
+    INSIDER_MIN_HISTORY,
+    TRADING_DAYS,
 )
+from app.signals.crash_features import build as _build
+from app.signals.crash_features import label_fall as _label_fall
+from app.signals.crash_features import rows as _rows
 
-
-def _fred(series_id: str, index: pd.DatetimeIndex) -> np.ndarray:
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}&cosd=1990-01-01"
-    raw = urllib.request.urlopen(url, timeout=60).read().decode()
-    frame = pd.read_csv(io.StringIO(raw))
-    frame.columns = ["date", "value"]
-    frame = frame[frame["value"] != "."]
-    frame["date"] = pd.to_datetime(frame["date"])
-    values = pd.Series(frame["value"].astype(float).to_numpy(), index=frame["date"])
-    out: np.ndarray = values.reindex(index, method="ffill").to_numpy(dtype=np.float64)
-    return out
-
-
-def _yahoo(symbol: str, index: pd.DatetimeIndex) -> np.ndarray:
-    import yfinance as yf
-
-    closes = yf.Ticker(symbol).history(period="max", interval="1d")["Close"]
-    closes.index = closes.index.tz_localize(None).normalize()
-    out: np.ndarray = closes.reindex(index, method="ffill").to_numpy(dtype=np.float64)
-    return out
-
-
-def _momentum(ratio: np.ndarray, window: int = 60) -> np.ndarray:
-    out = np.full(ratio.size, np.nan)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        out[window:] = ratio[window:] / ratio[:-window] - 1.0
-    return out
-
-
-def _insider_rank(path: Path, index: pd.DatetimeIndex) -> np.ndarray:
-    frame = pd.read_csv(path, parse_dates=["date"]).set_index("date").sort_index()
-    frame = frame[~frame.index.duplicated(keep="last")]
-    officer = frame.reindex(index, method="ffill")["officer_buy_share"].to_numpy(dtype=np.float64)
-    smooth = np.full(officer.size, np.nan)
-    for i in range(INSIDER_SMOOTH, officer.size):
-        chunk = officer[i - INSIDER_SMOOTH : i]
-        chunk = chunk[np.isfinite(chunk)]
-        if chunk.size >= INSIDER_SMOOTH // 2:
-            smooth[i] = float(np.mean(chunk))
-    rank = np.full(smooth.size, np.nan)
-    for i in range(INSIDER_MIN_HISTORY, smooth.size):
-        history = smooth[:i][np.isfinite(smooth[:i])]
-        if history.size >= INSIDER_MIN_HISTORY and np.isfinite(smooth[i]):
-            rank[i] = float(np.mean(history < smooth[i]))
-    return rank
+BORROW = 0.05
 
 
 def _drawdown(curve: np.ndarray) -> float:
     peak = np.maximum.accumulate(curve)
     return float(np.max((peak - curve) / peak)) if curve.size else 0.0
-
-
-def _build(
-    path: Path, index: pd.DatetimeIndex, close: np.ndarray, daily: np.ndarray
-) -> dict[str, np.ndarray]:
-    n = close.size
-    realised = np.full(n, np.nan)
-    for i in range(VOL_WINDOW, n):
-        realised[i] = float(np.std(daily[i - VOL_WINDOW : i], ddof=1)) * np.sqrt(TRADING_DAYS)
-
-    # How unstable the instability itself is: volatility spikes tend to be
-    # preceded by volatility becoming erratic rather than merely high.
-    vol_of_vol = np.full(n, np.nan)
-    for i in range(VOL_WINDOW * 3, n):
-        window = realised[i - VOL_WINDOW * 2 : i]
-        window = window[np.isfinite(window)]
-        if window.size > 10:
-            vol_of_vol[i] = float(np.std(window, ddof=1))
-
-    # Where price sits against its own recent high. Falls beget falls, and a
-    # market already off its peak is in a different state from one making highs.
-    running_high = np.maximum.accumulate(close)
-    from_high = close / running_high - 1.0
-
-    vix, vix3m, skew = (_yahoo(s, index) for s in ("^VIX", "^VIX3M", "^SKEW"))
-    hyg, lqd, tlt, iwm = (_yahoo(s, index) for s in ("HYG", "LQD", "TLT", "IWM"))
-    with np.errstate(divide="ignore", invalid="ignore"):
-        return {
-            "vix": vix,
-            "vix_term_structure": vix3m / vix,
-            "credit_spread": _fred("DBAA", index) - _fred("DAAA", index),
-            "hyg_tlt": _momentum(hyg / tlt),
-            "hyg_lqd": _momentum(hyg / lqd),
-            "skew": skew,
-            "small_cap_rs": _momentum(iwm / close),
-            "realised_vol": realised,
-            "vol_of_vol": vol_of_vol,
-            "drawdown_from_high": from_high,
-            "insider_rank": (_insider_rank(path, index) if path.exists() else np.full(n, np.nan)),
-        }
-
-
-def _rows(
-    signals: dict[str, np.ndarray], at: np.ndarray, features: tuple[str, ...] = FEATURES
-) -> np.ndarray:
-    return np.column_stack([[float(signals[f][i]) for f in features] for i in at]).T
 
 
 def _simulate(
@@ -324,9 +210,7 @@ def _run(
     begin_at = INSIDER_MIN_HISTORY + 1 if "insider_rank" in features else CALIBRATION_MIN
 
     def label_fall(i: int) -> float:
-        """1 when the next `horizon` days contain a fall of `fall` from here."""
-        ahead = close[i : i + 1 + horizon]
-        return 1.0 if float(np.min(ahead) / close[i] - 1.0) <= -fall else 0.0
+        return _label_fall(close, i, fall=fall, horizon=horizon)
 
     # A crisis has to be *held out*, not merely present. Splitting by fraction
     # lands the cut wherever the data happens to end; splitting by date puts it
