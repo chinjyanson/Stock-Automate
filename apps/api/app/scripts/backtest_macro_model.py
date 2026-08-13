@@ -45,7 +45,6 @@ import pandas as pd
 from app.models_ml.logistic import FittedModel, Prior, auc, fit
 
 TRADING_DAYS = 252
-WEEK = 5
 VOL_WINDOW = 20
 WARMUP = 300
 BORROW = 0.05
@@ -127,15 +126,24 @@ def _rows(signals: dict[str, np.ndarray], at: np.ndarray) -> np.ndarray:
     return np.column_stack([[float(signals[f][i]) for f in FEATURES] for i in at]).T
 
 
-def _label_direction(close: np.ndarray, i: int) -> float:
-    return 1.0 if close[i + WEEK] > close[i] else 0.0
+def _label_direction(close: np.ndarray, i: int, window: int) -> float:
+    return 1.0 if close[i + window] > close[i] else 0.0
 
 
-def _label_calm(close: np.ndarray, i: int, threshold: float) -> float:
-    """1 when the coming week contains NO sharp fall — the risk question."""
-    window = close[i + 1 : i + 1 + WEEK]
-    peak = np.maximum.accumulate(window)
-    return 1.0 if float(np.max((peak - window) / peak)) < threshold else 0.0
+def _label_calm(close: np.ndarray, i: int, threshold: float, window: int) -> float:
+    """1 when the coming window contains NO sharp fall — the risk question.
+
+    **The fall is measured from today's close**, not from the highest point
+    inside the future window. Measuring only within the window degenerates at
+    `window = 1`: one price has no peak-to-trough, so every single day scored as
+    calm, the base rate came out at 100% and the AUC was undefined. It is also
+    the wrong question even where it does not degenerate — a holder cares how
+    far the price falls below *where they are now*, not how far it falls from a
+    peak it may reach next Tuesday.
+    """
+    ahead = close[i : i + 1 + window]
+    peak = np.maximum.accumulate(ahead)
+    return 1.0 if float(np.max((peak - ahead) / peak)) < threshold else 0.0
 
 
 def _simulate(
@@ -151,6 +159,7 @@ def _simulate(
     vol_target: float,
     max_exposure: float,
     cost: float,
+    window: int,
 ) -> tuple[np.ndarray, int]:
     equity = capital
     exposure = 0.0
@@ -158,8 +167,8 @@ def _simulate(
     trades = 0
 
     for i in range(start, daily.size):
-        # Decide once a week, on the previous close.
-        if (i - start) % WEEK == 0:
+        # Decide once per window, on the previous close.
+        if (i - start) % window == 0:
             prior = i - 1
             reading = {
                 f: float(signals[f][prior]) for f in FEATURES if np.isfinite(signals[f][prior])
@@ -197,7 +206,13 @@ def _simulate(
 
 
 async def _run(
-    capital: float, split: float, vol_target: float, max_exposure: float, cost: float, fall: float
+    capital: float,
+    split: float,
+    vol_target: float,
+    max_exposure: float,
+    cost: float,
+    fall: float,
+    window: int,
 ) -> None:
     warnings.filterwarnings("ignore")
     import yfinance as yf
@@ -214,11 +229,11 @@ async def _run(
 
     fitted: dict[str, FittedModel] = {}
     labellers: tuple[tuple[str, Callable[[int], float]], ...] = (
-        ("direction", lambda i: _label_direction(close, i)),
-        ("calm", lambda i: _label_calm(close, i, fall)),
+        ("direction", lambda i: _label_direction(close, i, window)),
+        ("calm", lambda i: _label_calm(close, i, fall, window)),
     )
     for name, labeller in labellers:
-        usable = [i for i in range(WARMUP, cut - WEEK - 1) if np.isfinite(daily[i])]
+        usable = [i for i in range(WARMUP, cut - window - 1) if np.isfinite(daily[i])]
         x = _rows(signals, np.array(usable))
         y = np.array([labeller(i) for i in usable])
         fitted[name] = fit(
@@ -229,7 +244,7 @@ async def _run(
             label_definition=name,
         )
 
-    held = list(range(cut, n - WEEK - 1))
+    held = list(range(cut, n - window - 1))
     x_held = _rows(signals, np.array(held))
 
     print(f"Instrument:  ^GSPC, {n:,} bars from {index[0].date()}")
@@ -238,8 +253,11 @@ async def _run(
 
     print("1. WHAT CAN THE COMBINED MODEL PREDICT, OUT OF SAMPLE?")
     reports: tuple[tuple[str, Callable[[int], float]], ...] = (
-        ("next week UP or down", lambda i: _label_direction(close, i)),
-        (f"next week calm (no {fall:.0%} fall)", lambda i: _label_calm(close, i, fall)),
+        (f"next {window}d UP or down", lambda i: _label_direction(close, i, window)),
+        (
+            f"next {window}d calm (no {fall:.0%} fall)",
+            lambda i: _label_calm(close, i, fall, window),
+        ),
     )
     for name, labeller in reports:
         y = np.array([labeller(i) for i in held])
@@ -275,6 +293,7 @@ async def _run(
             vol_target=vol_target,
             max_exposure=max_exposure,
             cost=cost,
+            window=window,
         )
         final = float(curve[-1])
         drawdown = _drawdown(curve)
@@ -298,6 +317,12 @@ def main() -> None:
     parser.add_argument("--max-exposure", type=float, default=1.5)
     parser.add_argument("--cost", type=float, default=0.0005)
     parser.add_argument("--fall", type=float, default=0.02, help="What counts as a sharp fall.")
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=5,
+        help="Trading days between decisions, and the horizon predicted.",
+    )
     args = parser.parse_args()
     asyncio.run(
         _run(
@@ -307,6 +332,7 @@ def main() -> None:
             max_exposure=args.max_exposure,
             cost=args.cost,
             fall=args.fall,
+            window=args.window,
         )
     )
 
