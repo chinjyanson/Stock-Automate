@@ -256,6 +256,8 @@ async def _run(symbol: str, horizon: int) -> None:
     forward_dd = np.full(n, np.nan)
     for i in range(n - horizon - 1):
         forward_20[i] = close[min(i + 20, n - 1)] / close[i] - 1.0
+        # Named for the default horizon; it follows --horizon, and the column
+        # header is generated from it so the two cannot disagree.
         forward_60[i] = close[i + horizon] / close[i] - 1.0
         window = close[i + 1 : i + 1 + horizon]
         peak = np.maximum.accumulate(window)
@@ -266,8 +268,9 @@ async def _run(symbol: str, horizon: int) -> None:
 
     print(f"Instrument:  {symbol}   {n:,} bars")
     print(f"Sampling:    {len(step)} non-overlapping {horizon}-day windows")
-    print("Target:      the WORST peak-to-trough fall over the next 60 days\n")
-    print(f"  {'signal':<32} {'-> drawdown':>12} {'-> 20d ret':>11} {'-> 60d ret':>11} {'n':>6}")
+    print(f"Target:      the WORST peak-to-trough fall over the next {horizon} days\n")
+    horizon_label = f"-> {horizon}d ret"
+    print(f"  {'signal':<32} {'-> drawdown':>12} {'-> 20d ret':>11} {horizon_label:>11} {'n':>6}")
 
     rows = []
     for name, values in signals.items():
