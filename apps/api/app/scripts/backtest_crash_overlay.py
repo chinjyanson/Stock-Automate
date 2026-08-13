@@ -288,6 +288,7 @@ def _run(
     capital: float,
     since: str,
     split: float,
+    split_date: str | None,
     horizon: int,
     fall: float,
     fractions: list[float],
@@ -327,7 +328,12 @@ def _run(
         ahead = close[i : i + 1 + horizon]
         return 1.0 if float(np.min(ahead) / close[i] - 1.0) <= -fall else 0.0
 
-    cut = int(n * split)
+    # A crisis has to be *held out*, not merely present. Splitting by fraction
+    # lands the cut wherever the data happens to end; splitting by date puts it
+    # deliberately before a known event, so what follows is a real forecast of
+    # that event rather than a recollection of it.
+    at_date = int(index.searchsorted(pd.Timestamp(split_date))) if split_date else 0
+    cut = at_date or int(n * split)
     begin = begin_at
     train = np.array([i for i in range(begin, cut - horizon - 1) if np.isfinite(daily[i])])
     model = fit(
@@ -394,10 +400,11 @@ def _run(
         cost=cost,
     )
     hold_final, hold_dd = float(curve[-1]), _drawdown(curve)
+    hold_curve = curve
 
     print(
         f"  {'rule':<26} {'fires':>7} {'precis':>7} {'recall':>7} {'final':>9} "
-        f"{'return':>8} {'drawdn':>8} {'ret/dd':>7} {'alarms':>7} {'held':>6}"
+        f"{'return':>8} {'drawdn':>8} {'ret/dd':>7} {'track':>7} {'held':>6}"
     )
     print(
         f"  {'buy and hold':<26} {'-':>7} {'-':>7} {'-':>7} {hold_final:>9,.0f} "
@@ -408,7 +415,7 @@ def _run(
     for fraction in fractions:
         triggers = make_triggers(fraction)
         fired = p >= triggers[held]
-        curve, alarms, average = _simulate(
+        curve, _alarms, average = _simulate(
             daily,
             close,
             signals,
@@ -427,13 +434,32 @@ def _run(
         )
         final = float(curve[-1])
         drawdown = _drawdown(curve)
+        # Tracking error against buy and hold, annualised. The goal here is not
+        # to beat the benchmark but to sit close to it and lose less in a crash,
+        # so how far the ride differs day to day is the thing to report.
+        pair = min(curve.size, hold_curve.size)
+        diff = np.diff(np.log(curve[:pair])) - np.diff(np.log(hold_curve[:pair]))
+        tracking = float(np.std(diff, ddof=1)) * np.sqrt(TRADING_DAYS) if diff.size > 1 else 0.0
+        # **The control, on the same row.** Owning less lowers drawdown by
+        # itself, so the overlay's drawdown is only interesting beside a
+        # portfolio held flat at the same average exposure all along. If the two
+        # match, the model timed nothing; if the overlay is far lower, it stepped
+        # aside at moments that actually mattered.
+        flat_curve = capital * np.cumprod(1.0 + average * np.nan_to_num(daily[cut:]))
+        flat_dd = _drawdown(flat_curve)
+        flat_ret = float(flat_curve[-1]) / capital - 1.0
         precision = y[fired].mean() if fired.any() else float("nan")
         recall = fired[y == 1].mean() if fired.any() else 0.0
         print(
             f"  {f'{reentry}, top {fraction:.2%}':<26} {fired.mean():>7.1%} "
             f"{precision:>7.1%} {recall:>7.1%} {final:>9,.0f} {final / capital - 1:>7.1%} "
             f"{drawdown:>7.1%} {(final / capital - 1) / drawdown if drawdown else 0:>7.2f} "
-            f"{alarms:>7} {average:>6.0%}"
+            f"{tracking:>7.1%} {average:>6.0%}"
+        )
+        print(
+            f"  {'    ^ flat at same exposure':<26} {'':>7} {'':>7} {'':>7} "
+            f"{capital * (1 + flat_ret):>9,.0f} {flat_ret:>7.1%} {flat_dd:>7.1%} "
+            f"{flat_ret / flat_dd if flat_dd else 0:>7.2f} {'':>7} {average:>6.0%}"
         )
 
     print(
@@ -454,6 +480,11 @@ def main() -> None:
         help="History start. Before 2006 the insider feature is dropped automatically.",
     )
     parser.add_argument("--split", type=float, default=0.5)
+    parser.add_argument(
+        "--split-date",
+        default=None,
+        help="Train up to this date and trade everything after. Overrides --split.",
+    )
     parser.add_argument("--horizon", type=int, default=1, help="Days ahead the warning covers.")
     parser.add_argument("--fall", type=float, default=0.02, help="What counts as a sharp fall.")
     parser.add_argument(
@@ -489,6 +520,7 @@ def main() -> None:
         args.capital,
         args.since,
         args.split,
+        args.split_date,
         args.horizon,
         args.fall,
         args.sell_fraction,
