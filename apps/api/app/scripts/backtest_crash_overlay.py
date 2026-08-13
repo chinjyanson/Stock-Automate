@@ -59,7 +59,7 @@ CALIBRATION_MIN = 504
 CALIBRATION_WINDOW = 504
 BORROW = 0.05
 
-FEATURES = (
+FEATURES: tuple[str, ...] = (
     "vix",
     "vix_term_structure",
     "credit_spread",
@@ -161,12 +161,14 @@ def _build(
             "realised_vol": realised,
             "vol_of_vol": vol_of_vol,
             "drawdown_from_high": from_high,
-            "insider_rank": _insider_rank(path, index),
+            "insider_rank": (_insider_rank(path, index) if path.exists() else np.full(n, np.nan)),
         }
 
 
-def _rows(signals: dict[str, np.ndarray], at: np.ndarray) -> np.ndarray:
-    return np.column_stack([[float(signals[f][i]) for f in FEATURES] for i in at]).T
+def _rows(
+    signals: dict[str, np.ndarray], at: np.ndarray, features: tuple[str, ...] = FEATURES
+) -> np.ndarray:
+    return np.column_stack([[float(signals[f][i]) for f in features] for i in at]).T
 
 
 def _simulate(
@@ -178,9 +180,11 @@ def _simulate(
     *,
     capital: float,
     mode: str,
+    features: tuple[str, ...],
     triggers: np.ndarray,
     defensive: float,
     ladder: float,
+    rebound: float,
     timeout: int,
     cost: float,
 ) -> tuple[np.ndarray, int, float]:
@@ -190,6 +194,7 @@ def _simulate(
     curve: list[float] = []
     alarms = 0
     exit_price: float | None = None
+    low_since = float("inf")
     days_out = 0
     held: list[float] = []
 
@@ -199,7 +204,7 @@ def _simulate(
             wanted = 1.0
         else:
             reading = {
-                f: float(signals[f][prior]) for f in FEATURES if np.isfinite(signals[f][prior])
+                f: float(signals[f][prior]) for f in features if np.isfinite(signals[f][prior])
             }
             probability = model.probability(reading) if (model is not None and reading) else 0.0
 
@@ -207,6 +212,7 @@ def _simulate(
                 # Fully invested: the only question is whether to step aside.
                 if probability >= triggers[prior]:
                     exit_price = float(close[prior])
+                    low_since = float(close[prior])
                     days_out = 0
                     alarms += 1
                     wanted = defensive
@@ -214,14 +220,27 @@ def _simulate(
                     wanted = 1.0
             else:
                 days_out += 1
-                fallen = 1.0 - float(close[prior]) / exit_price
+                here = float(close[prior])
+                low_since = min(low_since, here)
+                fallen = 1.0 - here / exit_price
                 # Ladder back in proportionally to how far it has fallen, so
                 # capital returns *into* the decline rather than waiting for a
                 # bottom nobody can identify.
                 recovered = float(np.clip(fallen / ladder, 0.0, 1.0))
                 wanted = defensive + (1.0 - defensive) * recovered
-                if recovered >= 1.0 or days_out >= timeout:
-                    # Either fully back in, or the feared fall never came.
+
+                # **Buy back into the bounce.** The ladder above only reacts to
+                # further falls — `fallen` clips at zero — so a market that
+                # rallies straight off the alarm leaves the position pinned at
+                # `defensive` until the timeout, standing outside the rebound.
+                # That is the wrong way round: the worst days and the best days
+                # are neighbours, so the recovery is precisely what must not be
+                # missed. A rise of `rebound` off the lowest close since the
+                # alarm is read as the fall having played out, and returns the
+                # position in full.
+                bounced = rebound > 0.0 and here / low_since - 1.0 >= rebound
+                if recovered >= 1.0 or bounced or days_out >= timeout:
+                    # Fully laddered in, bounced, or the feared fall never came.
                     exit_price = None
                     wanted = 1.0
 
@@ -239,12 +258,14 @@ def _simulate(
 def _run(
     path: Path,
     capital: float,
+    since: str,
     split: float,
     horizon: int,
     fall: float,
     fractions: list[float],
     defensive: float,
     ladder: float,
+    rebound: float,
     timeout: int,
     cost: float,
 ) -> None:
@@ -252,7 +273,7 @@ def _run(
     import yfinance as yf
 
     frame = yf.Ticker("^GSPC").history(period="max", interval="1d")
-    frame = frame[frame.index >= "2006-01-01"]
+    frame = frame[frame.index >= since]
     close = frame["Close"].to_numpy(dtype=np.float64)
     index = pd.DatetimeIndex(frame.index.tz_localize(None)).normalize()
     daily = np.concatenate([[np.nan], close[1:] / close[:-1] - 1.0])
@@ -260,18 +281,30 @@ def _run(
 
     signals = _build(path, index, close, daily)
 
+    # **The insider series begins in 2006.** Reaching further back means giving
+    # it up — and for a detector limited by how few crashes it has ever seen,
+    # sixteen extra years of history buys far more than one feature does. The
+    # trade is stated here rather than hidden, because dropping a feature
+    # silently would make two runs incomparable for no visible reason.
+    features = FEATURES
+    if since < "2006-01-01":
+        features = tuple(f for f in FEATURES if f != "insider_rank")
+        print(f"Features:    {len(features)} — insider_rank dropped, it starts in 2006")
+
+    begin_at = INSIDER_MIN_HISTORY + 1 if "insider_rank" in features else CALIBRATION_MIN
+
     def label_fall(i: int) -> float:
         """1 when the next `horizon` days contain a fall of `fall` from here."""
         ahead = close[i : i + 1 + horizon]
         return 1.0 if float(np.min(ahead) / close[i] - 1.0) <= -fall else 0.0
 
     cut = int(n * split)
-    begin = INSIDER_MIN_HISTORY + 1
+    begin = begin_at
     train = np.array([i for i in range(begin, cut - horizon - 1) if np.isfinite(daily[i])])
     model = fit(
-        _rows(signals, train),
+        _rows(signals, train, features),
         np.array([label_fall(i) for i in train]),
-        FEATURES,
+        features,
         priors={f: Prior(0.0, 1.0) for f in FEATURES},
         label_definition=f"fall of {fall:.0%} within {horizon} days",
     )
@@ -292,9 +325,9 @@ def _run(
     p_all = np.full(n, np.nan)
     p_all[every] = [
         model.probability(
-            {f: float(v) for f, v in zip(FEATURES, row, strict=True) if np.isfinite(v)}
+            {f: float(v) for f, v in zip(features, row, strict=True) if np.isfinite(v)}
         )
-        for row in _rows(signals, every)
+        for row in _rows(signals, every, features)
     ]
 
     def make_triggers(fraction: float) -> np.ndarray:
@@ -322,9 +355,11 @@ def _run(
         cut,
         capital=capital,
         mode="hold",
+        features=features,
         triggers=np.full(n, np.inf),
         defensive=defensive,
         ladder=ladder,
+        rebound=rebound,
         timeout=timeout,
         cost=cost,
     )
@@ -351,9 +386,11 @@ def _run(
             cut,
             capital=capital,
             mode="overlay",
+            features=features,
             triggers=triggers,
             defensive=defensive,
             ladder=ladder,
+            rebound=rebound,
             timeout=timeout,
             cost=cost,
         )
@@ -362,7 +399,7 @@ def _run(
         precision = y[fired].mean() if fired.any() else float("nan")
         recall = fired[y == 1].mean() if fired.any() else 0.0
         print(
-            f"  {f'overlay, top {fraction:.0%} alarming':<26} {fired.mean():>7.1%} "
+            f"  {f'overlay, top {fraction:.2%} alarming':<26} {fired.mean():>7.1%} "
             f"{precision:>7.1%} {recall:>7.1%} {final:>9,.0f} {final / capital - 1:>7.1%} "
             f"{drawdown:>7.1%} {(final / capital - 1) / drawdown if drawdown else 0:>7.2f} "
             f"{alarms:>7} {average:>6.0%}"
@@ -380,6 +417,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Asymmetric crash overlay.")
     parser.add_argument("--path", type=Path, default=Path("data/insider_index.csv"))
     parser.add_argument("--capital", type=float, default=5000.0)
+    parser.add_argument(
+        "--since",
+        default="2006-01-01",
+        help="History start. Before 2006 the insider feature is dropped automatically.",
+    )
     parser.add_argument("--split", type=float, default=0.5)
     parser.add_argument("--horizon", type=int, default=1, help="Days ahead the warning covers.")
     parser.add_argument("--fall", type=float, default=0.02, help="What counts as a sharp fall.")
@@ -392,18 +434,26 @@ def main() -> None:
     )
     parser.add_argument("--defensive", type=float, default=0.3, help="Exposure kept when out.")
     parser.add_argument("--ladder", type=float, default=0.10, help="Fall over which to buy back.")
+    parser.add_argument(
+        "--rebound",
+        type=float,
+        default=0.0,
+        help="Rise off the post-alarm low that buys back in full. 0 disables.",
+    )
     parser.add_argument("--timeout", type=int, default=20, help="Days before returning anyway.")
     parser.add_argument("--cost", type=float, default=0.0005)
     args = parser.parse_args()
     _run(
         args.path,
         args.capital,
+        args.since,
         args.split,
         args.horizon,
         args.fall,
         args.sell_fraction,
         args.defensive,
         args.ladder,
+        args.rebound,
         args.timeout,
         args.cost,
     )

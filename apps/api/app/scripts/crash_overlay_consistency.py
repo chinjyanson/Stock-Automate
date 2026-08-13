@@ -60,6 +60,7 @@ TRADING_YEAR = 252
 def _run(
     path: Path,
     capital: float,
+    since: str,
     horizon: int,
     fall: float,
     fractions: list[float],
@@ -67,6 +68,7 @@ def _run(
     step: int,
     defensive: float,
     ladder: float,
+    rebound: float,
     timeout: int,
     cost: float,
 ) -> None:
@@ -74,14 +76,23 @@ def _run(
     import yfinance as yf
 
     frame = yf.Ticker("^GSPC").history(period="max", interval="1d")
-    frame = frame[frame.index >= "2006-01-01"]
+    frame = frame[frame.index >= since]
     close = frame["Close"].to_numpy(dtype=np.float64)
     index = pd.DatetimeIndex(frame.index.tz_localize(None)).normalize()
     daily = np.concatenate([[np.nan], close[1:] / close[:-1] - 1.0])
     n = close.size
 
     signals = _build(path, index, close, daily)
+
+    # Reaching before 2006 means giving up the insider feature, which does not
+    # exist that far back. For a detector limited by how few crashes it has ever
+    # seen, the extra history is worth more than the feature.
+    features = FEATURES
     begin = INSIDER_MIN_HISTORY + 1
+    if since < "2006-01-01":
+        features = tuple(f for f in FEATURES if f != "insider_rank")
+        begin = CALIBRATION_MIN
+        print(f"Features:    {len(features)} — insider_rank dropped, it starts in 2006")
 
     def label_fall(i: int) -> float:
         ahead = close[i : i + 1 + horizon]
@@ -106,9 +117,9 @@ def _run(
             if train.size < CALIBRATION_MIN:
                 continue
             model = fit(
-                _rows(signals, train),
+                _rows(signals, train, features),
                 np.array([label_fall(i) for i in train]),
-                FEATURES,
+                features,
                 priors={f: Prior(0.0, 1.0) for f in FEATURES},
                 label_definition=f"fall of {fall:.0%} within {horizon} days",
             )
@@ -119,9 +130,9 @@ def _run(
             p_all = np.full(n, np.nan)
             p_all[every] = [
                 model.probability(
-                    {f: float(v) for f, v in zip(FEATURES, row, strict=True) if np.isfinite(v)}
+                    {f: float(v) for f, v in zip(features, row, strict=True) if np.isfinite(v)}
                 )
-                for row in _rows(signals, every)
+                for row in _rows(signals, every, features)
             ]
             triggers = np.full(n, np.inf)
             for i in range(cut, stop):
@@ -140,9 +151,11 @@ def _run(
                     cut,
                     capital=capital,
                     mode=mode,
+                    features=features,
                     triggers=triggers,
                     defensive=defensive,
                     ladder=ladder,
+                    rebound=rebound,
                     timeout=timeout,
                     cost=cost,
                 )
@@ -236,6 +249,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Consistency of the crash overlay.")
     parser.add_argument("--path", type=Path, default=Path("data/insider_index.csv"))
     parser.add_argument("--capital", type=float, default=5000.0)
+    parser.add_argument("--since", default="2006-01-01")
     parser.add_argument("--horizon", type=int, default=1)
     parser.add_argument("--fall", type=float, default=0.02)
     parser.add_argument("--sell-fraction", type=float, nargs="+", default=[0.05, 0.10, 0.15, 0.20])
@@ -248,12 +262,14 @@ def main() -> None:
     )
     parser.add_argument("--defensive", type=float, default=0.3)
     parser.add_argument("--ladder", type=float, default=0.10)
+    parser.add_argument("--rebound", type=float, default=0.0)
     parser.add_argument("--timeout", type=int, default=20)
     parser.add_argument("--cost", type=float, default=0.0005)
     args = parser.parse_args()
     _run(
         args.path,
         args.capital,
+        args.since,
         args.horizon,
         args.fall,
         args.sell_fraction,
@@ -261,6 +277,7 @@ def main() -> None:
         args.step,
         args.defensive,
         args.ladder,
+        args.rebound,
         args.timeout,
         args.cost,
     )
