@@ -48,6 +48,7 @@ import asyncio
 import io
 import urllib.request
 import warnings
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -125,7 +126,8 @@ def _yahoo(symbol: str, index: pd.DatetimeIndex) -> np.ndarray | None:
             return None
         closes = frame["Close"]
         closes.index = closes.index.tz_localize(None).normalize()
-        return closes.reindex(index, method="ffill").to_numpy(dtype=np.float64)
+        aligned: np.ndarray = closes.reindex(index, method="ffill").to_numpy(dtype=np.float64)
+        return aligned
     except Exception:
         return None
 
@@ -205,7 +207,7 @@ def _ratio_momentum(ratio: np.ndarray, window: int) -> np.ndarray:
     return out
 
 
-async def _load_spy(symbol: str) -> tuple[np.ndarray | None, list | None]:
+async def _load_spy(symbol: str) -> tuple[np.ndarray | None, list[datetime] | None]:
     async with session_scope() as session:
         mapping = (
             (
