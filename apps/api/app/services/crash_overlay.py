@@ -39,7 +39,7 @@ and one of which (COVID) it did not.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -60,6 +60,9 @@ log = structlog.get_logger(__name__)
 #: docstring: a month of staleness is immaterial for a macro model and twenty
 #: times cheaper than refitting daily.
 REFIT_EVERY = 21
+
+#: Postgres binds at most this many parameters in one statement.
+PARAMETER_LIMIT = 32_767
 
 #: A feature must be present on at least this share of the fitting window to be
 #: used at all. Below it the column is dropped rather than imputed wholesale —
@@ -250,9 +253,7 @@ class CrashOverlayService:
         return result.scalar_one_or_none()
 
     async def count(self) -> int:
-        result = await self._session.execute(
-            select(func.count()).select_from(CrashOverlayReading)
-        )
+        result = await self._session.execute(select(func.count()).select_from(CrashOverlayReading))
         return int(result.scalar_one())
 
     async def history(self, limit: int = 90) -> list[CrashOverlayReading]:
@@ -326,21 +327,46 @@ class CrashOverlayService:
         return out
 
     async def _upsert(self, payload: list[dict[str, object]], *, updates: tuple[str, ...]) -> None:
-        """Write in chunks, because Postgres binds at most 32,767 parameters."""
+        """Write in chunks, because Postgres binds a limited number of parameters.
+
+        Sized from the **table's** column count, not the payload dict's. Those
+        differ: SQLAlchemy also binds the columns filled by defaults — `id`,
+        `created_at`, `updated_at` — which never appear in the payload. Counting
+        only the keys undercounts by three per row, which is invisible on a
+        thousand rows and blows the limit on a full backfill.
+        """
         if not payload:
             return
-        per_row = len(payload[0])
-        chunk = max(1, 30_000 // max(per_row, 1))
+
+        # Sent explicitly rather than left to the column defaults. A Core insert
+        # takes nothing from the ORM, so a `server_default` the database does
+        # not actually have becomes a NOT NULL violation on the first bulk
+        # write — and `onupdate=` never fires for ON CONFLICT DO UPDATE, so
+        # without this `updated_at` would stay frozen at the backfill date
+        # however many times the nightly job rewrote the row.
+        now = datetime.now(UTC)
+        for row in payload:
+            row.setdefault("created_at", now)
+            row["updated_at"] = now
+
+        chunk = _chunk_size(len(CrashOverlayReading.__table__.columns))
         for offset in range(0, len(payload), chunk):
             batch = payload[offset : offset + chunk]
             statement = pg_insert(CrashOverlayReading).values(batch)
             await self._session.execute(
                 statement.on_conflict_do_update(
                     index_elements=[CrashOverlayReading.as_of],
-                    set_={name: getattr(statement.excluded, name) for name in updates},
+                    set_={
+                        name: getattr(statement.excluded, name) for name in (*updates, "updated_at")
+                    },
                 )
             )
         await self._session.flush()
+
+
+def _chunk_size(columns: int) -> int:
+    """Rows per statement that keep the bind count inside the limit."""
+    return max(1, PARAMETER_LIMIT // max(columns, 1))
 
 
 def _dec(value: float | None) -> Decimal | None:

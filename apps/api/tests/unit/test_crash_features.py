@@ -163,3 +163,26 @@ class TestFeatureMatrix:
         out = momentum(np.arange(1.0, 11.0), window=3)
         assert np.all(np.isnan(out[:3]))
         assert np.isfinite(out[3:]).all()
+
+
+class TestChunkSizing:
+    """Guards the bind-parameter limit that broke the first real backfill.
+
+    The bug was counting the *payload dict's* keys instead of the table's
+    columns. SQLAlchemy also binds the defaulted columns — id, created_at,
+    updated_at — so the count was three per row short: invisible on the
+    thousand-row test fixture, fatal on a twenty-year backfill.
+    """
+
+    def test_a_full_statement_stays_inside_the_limit(self) -> None:
+        from app.models.crash_overlay import CrashOverlayReading
+        from app.services.crash_overlay import PARAMETER_LIMIT, _chunk_size
+
+        columns = len(CrashOverlayReading.__table__.columns)
+        assert _chunk_size(columns) * columns <= PARAMETER_LIMIT
+
+    def test_never_returns_a_zero_chunk(self) -> None:
+        from app.services.crash_overlay import PARAMETER_LIMIT, _chunk_size
+
+        assert _chunk_size(0) >= 1
+        assert _chunk_size(PARAMETER_LIMIT * 10) == 1
