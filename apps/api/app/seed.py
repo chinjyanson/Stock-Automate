@@ -251,96 +251,6 @@ async def seed_risk_configuration() -> int:
     return created
 
 
-async def seed_strategy_configurations() -> int:
-    """Seed the mean-reversion strategy (§8), inactive, if it does not exist.
-
-    Inactive and with an empty universe by default: a fresh install must never
-    auto-trade before a human has turned it on. Parameters are the documented
-    defaults; idempotent per name.
-
-    Two strategies, one per layer, both deciding with a fitted model rather
-    than hand-chosen weights. Neither carries coefficients here: those live in
-    `strategy_models`, fitted offline and loaded at run time. What is seeded is
-    only what the model does not decide — the probability worth acting on, and
-    the absolute gates no probability may overrule.
-
-    The stock universe is not seeded and is not meant to be edited by hand: it
-    is rewritten nightly from the scanner's ranking by
-    `worker.jobs.strategy.sync_strategy_universe`. The index universe is a
-    single tracker and is set once, by hand.
-
-    Both are seeded inactive. A fresh install must never auto-trade before a
-    human has mapped a universe, fitted a model and turned it on.
-    """
-    from app.models.enums import Interval, StrategyKind
-    from app.models.strategy import StrategyConfiguration
-
-    defaults: list[dict[str, object]] = [
-        {
-            "kind": StrategyKind.LOGISTIC_STOCK,
-            "name": "Daily logistic stock model",
-            "interval": Interval.D1,
-            # No weights here any more: the model carries its own coefficients,
-            # fitted offline and loaded from `strategy_models`. What remains are
-            # the two things the model deliberately does not decide — the
-            # probability at which a signal is worth acting on, and the absolute
-            # safety gates a probability must never overrule.
-            "params": {
-                # Swept, not chosen: see `app.scripts.backtest_strategy`.
-                "entry_probability": 0.55,
-                # Tradeability, not prediction. A stock whose true range is a
-                # rounding error has no move worth trading and would get a
-                # meaningless stop from the risk engine.
-                "min_atr_pct": 0.02,
-                # A dip the market is still repricing is not a dip. Comes from
-                # the earnings table, so the price features cannot see it.
-                "pead_veto_below": 40.0,
-                # Exit tunables, unchanged from the strategy this replaces.
-                "insider_sell_veto": 0.10,
-                "insider_exit_max_drop_atr": 1.0,
-                "bb_period": 20,
-                "bb_std": 2.0,
-                "atr_period": 14,
-            },
-            "universe": {"instrument_ids": []},
-        },
-        {
-            "kind": StrategyKind.LOGISTIC_INDEX,
-            "name": "Index exposure model",
-            "interval": Interval.D1,
-            "params": {
-                # A band rather than one number. Exposure that flipped on a
-                # probability wobbling either side of a single threshold would
-                # trade the noise in the estimate rather than the market, and
-                # every flip pays a spread.
-                "entry_probability": 0.55,
-                "exit_probability": 0.45,
-                # A model that likes the market cannot overrule a risk-off
-                # regime, for the same reason the stock model cannot buy past
-                # its ATR floor.
-                "regime_floor": 0.5,
-            },
-            # Set to the S&P tracker being timed. Deliberately not populated by
-            # the nightly scanner sync, which ranks individual stocks — this
-            # strategy holds one instrument by design.
-            "universe": {"instrument_ids": []},
-        },
-    ]
-
-    created = 0
-    async with session_scope() as session:
-        for row in defaults:
-            existing = await session.execute(
-                select(StrategyConfiguration).where(StrategyConfiguration.name == row["name"])
-            )
-            if existing.scalar_one_or_none() is not None:
-                continue
-            session.add(StrategyConfiguration(is_active=False, auto_execute=True, **row))
-            created += 1
-    log.info("seed.strategy_configurations", created=created)
-    return created
-
-
 async def seed_dev_user() -> bool:
     """Create a development user if none exists.
 
@@ -391,7 +301,6 @@ async def main() -> int:
     await seed_settings()
     await seed_scanner_configuration()
     await seed_risk_configuration()
-    await seed_strategy_configurations()
     await seed_dev_user()
 
     log.info("seed.completed")

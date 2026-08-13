@@ -7,7 +7,6 @@ list silently produces an empty migration.
 
 from app.models.audit import GENESIS_HASH, AuditEvent
 from app.models.base import Base, Money, Price, Quantity, Ratio
-from app.models.earnings import EarningsEvent
 from app.models.enums import (
     ActorKind,
     AuditEventKind,
@@ -26,12 +25,8 @@ from app.models.enums import (
     PriceUnit,
     ProviderKind,
     QualityStatus,
-    StrategyDecisionOutcome,
-    StrategyKind,
-    StrategyRunStatus,
     TradeIntentStatus,
 )
-from app.models.index_options import IndexOptionsSnapshot
 from app.models.insider import InsiderTransaction
 from app.models.instrument import (
     BrokerInstrument,
@@ -72,12 +67,6 @@ from app.models.scanner import (
     TradeProposal,
 )
 from app.models.sentiment import SentimentSnapshot
-from app.models.strategy import (
-    StrategyConfiguration,
-    StrategyDecision,
-    StrategyRun,
-)
-from app.models.strategy_model import StrategyModel
 from app.models.system import (
     BrokerCredential,
     LiveArmingSession,
@@ -102,12 +91,10 @@ __all__ = [
     "DataQualityEvent",
     "DataQualityEventKind",
     "DataSeriesType",
-    "EarningsEvent",
     "Exchange",
     "FundamentalSnapshot",
     "HaltKind",
     "HaltScope",
-    "IndexOptionsSnapshot",
     "InsiderTransaction",
     "Instrument",
     "InstrumentKind",
@@ -141,13 +128,6 @@ __all__ = [
     "ScannerRun",
     "ScannerRunStatus",
     "SentimentSnapshot",
-    "StrategyConfiguration",
-    "StrategyDecision",
-    "StrategyDecisionOutcome",
-    "StrategyKind",
-    "StrategyModel",
-    "StrategyRun",
-    "StrategyRunStatus",
     "SystemSetting",
     "TradeIntent",
     "TradeIntentStatus",

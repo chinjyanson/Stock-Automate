@@ -409,50 +409,6 @@ export const haltSchema = z.object({
   cleared_at: z.string().nullable(),
 });
 
-export const strategyConfigSchema = z.object({
-  id: z.string(),
-  kind: z.string(),
-  name: z.string(),
-  is_active: z.boolean(),
-  interval: z.string(),
-  operating_mode: z.string(),
-  auto_execute: z.boolean(),
-  params: z.record(z.string(), z.unknown()).nullable(),
-  universe: z.record(z.string(), z.unknown()).nullable(),
-  account_equity: z.string().nullable(),
-  capital_allocation_pct: z.string().nullable(),
-});
-
-export const strategyDecisionSchema = z.object({
-  id: z.string(),
-  run_id: z.string(),
-  instrument_id: z.string(),
-  kind: z.string(),
-  // Null when the strategy could not evaluate the instrument at all — there was
-  // no side to take.
-  side: z.string().nullable(),
-  conviction: z.string(),
-  outcome: z.string(),
-  reason: z.string(),
-  metrics: z.record(z.string(), z.unknown()).nullable(),
-  proposal_id: z.string().nullable(),
-  created_at: z.string(),
-});
-
-export const strategyRunSchema = z.object({
-  run_id: z.string(),
-  considered: z.number(),
-  signals: z.number(),
-  proposals: z.number(),
-  executed: z.number(),
-  rejected: z.number(),
-  // Instruments with too little history to evaluate at all.
-  skipped: z.number().default(0),
-  // Instruments evaluated against bars past their freshness threshold. A quiet
-  // result with stale > 0 was computed from old prices.
-  stale: z.number().default(0),
-});
-
 export const liveStatusSchema = z.object({
   live_trading_enabled_on_server: z.boolean(),
   autonomous_enabled_on_server: z.boolean().default(false),
@@ -479,18 +435,6 @@ export type RiskConfigUpdate = Partial<
 >;
 export type Halt = z.infer<typeof haltSchema>;
 export type DailySummary = z.infer<typeof dailySummarySchema>;
-export type StrategyConfig = z.infer<typeof strategyConfigSchema>;
-export type StrategyDecision = z.infer<typeof strategyDecisionSchema>;
-export type StrategyRun = z.infer<typeof strategyRunSchema>;
-export type StrategyConfigUpdate = Partial<{
-  is_active: boolean;
-  auto_execute: boolean;
-  interval: string;
-  params: Record<string, unknown>;
-  universe: Record<string, unknown>;
-  account_equity: string | null;
-  capital_allocation_pct: string | null;
-}>;
 export type ScannerResult = z.infer<typeof scannerResultSchema>;
 export type ScannerResultDetail = z.infer<typeof scannerResultDetailSchema>;
 export type ScannerRun = z.infer<typeof scannerRunSchema>;
@@ -698,24 +642,6 @@ export const api = {
       body: JSON.stringify({ eod_digest_enabled: enabled }),
     }),
 
-  // -- Strategies (Phase 4) --
-  strategies: () => request("/strategies", z.array(strategyConfigSchema)),
-
-  strategyDecisions: (params: { strategyId?: string; limit?: number } = {}) => {
-    const query = new URLSearchParams();
-    if (params.strategyId) query.set("strategy_id", params.strategyId);
-    query.set("limit", String(params.limit ?? 50));
-    return request(`/strategies/decisions?${query}`, z.array(strategyDecisionSchema));
-  },
-
-  updateStrategy: (id: string, body: StrategyConfigUpdate) =>
-    request(`/strategies/${id}/config`, strategyConfigSchema, {
-      method: "PUT",
-      body: JSON.stringify(body),
-    }),
-
-  runStrategy: (id: string) =>
-    request(`/strategies/${id}/run`, strategyRunSchema, { method: "POST" }),
 };
 
 /** Format a decimal string for display. Never used for arithmetic. */

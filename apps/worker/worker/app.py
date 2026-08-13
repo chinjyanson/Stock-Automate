@@ -37,11 +37,8 @@ app = Celery(
         "worker.jobs.market_data",
         "worker.jobs.scanner",
         "worker.jobs.risk",
-        "worker.jobs.strategy",
         "worker.jobs.backfill",
         "worker.jobs.market_regime",
-        "worker.jobs.index_options",
-        "worker.jobs.earnings",
         "worker.jobs.sentiment",
     ],
 )
@@ -97,19 +94,9 @@ app.conf.beat_schedule = {
     # skew, at-the-money implied vol — is complete before anything sizes against
     # it. An option chain carries no history, so this row is the only record
     # there will ever be of what today was pricing.
-    "measure-index-options": {
-        "task": "worker.jobs.index_options.measure_index_options",
-        "schedule": crontab(hour=21, minute=40),
-        "options": {"expires": 3600},
-    },
     # Weekly: report dates move on a quarterly cycle, so asking daily would
     # spend a provider call per instrument to learn nothing. Sunday morning,
     # well clear of the trading week.
-    "sync-earnings-dates": {
-        "task": "worker.jobs.earnings.sync_earnings_dates",
-        "schedule": crontab(hour=6, minute=30, day_of_week=0),
-        "options": {"expires": 7200},
-    },
     # Before the scan, so the day's risk posture is measured from fresh candles
     # and is already in place when the risk engine sizes anything tonight.
     "measure-market-regime": {
@@ -167,12 +154,6 @@ app.conf.beat_schedule = {
     },
     # Intraday strategies evaluate right after their data refreshes, over the
     # same window — evaluating outside it would only re-read stale bars.
-    "evaluate-intraday-strategies": {
-        "task": "worker.jobs.strategy.evaluate_strategies",
-        "schedule": crontab(minute="2-59/15", hour="7-21"),
-        "kwargs": {"interval": "15m"},
-        "options": {"expires": 900},
-    },
     # Insider filings, hourly through the US session and a little beyond. EDGAR
     # publishes Form 4s within minutes, and the scanner reads whatever has
     # landed by 22:00 — so this only has to keep the store roughly current, not
@@ -186,18 +167,7 @@ app.conf.beat_schedule = {
     # the scanner's current top names. Order matters — ranking from a scan that
     # has not finished would hand the strategy yesterday's list, and syncing after
     # the evaluation would delay every change by a full day.
-    "sync-strategy-universe": {
-        "task": "worker.jobs.strategy.sync_strategy_universe",
-        "schedule": crontab(hour=22, minute=10),
-        "options": {"expires": 3600},
-    },
     # Daily strategies evaluate once, after the daily candle refresh and scan.
-    "evaluate-daily-strategies": {
-        "task": "worker.jobs.strategy.evaluate_strategies",
-        "schedule": crontab(hour=22, minute=30),
-        "kwargs": {"interval": "1d"},
-        "options": {"expires": 7200},
-    },
     # Live loss guard: frequent, local, and cheap — auto-disarms and halts if the
     # day's realised live loss breaches the affirmed ceiling. No-op when unarmed.
     "live-guard": {

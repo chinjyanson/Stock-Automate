@@ -22,7 +22,7 @@ it is:
      recommendations.
 
 **Why there is no momentum here.** The scanner answers "what is worth owning";
-the strategy (`app.strategies.mean_reversion`) answers "when to buy it". Fast
+a strategy would answer "when to buy it". Fast
 signals belong to the second question, and not only on grounds of tidiness: the
 scanner rotates 200-2000 names a night against a catalogue of ~20,000, so any
 given score is 10-100 days old when it is compared against a fresh one. A P/E or

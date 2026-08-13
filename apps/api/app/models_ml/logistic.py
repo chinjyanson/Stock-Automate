@@ -26,7 +26,7 @@ safeguard. `low_shrinkage_clamp` limits the summed log-odds that features below
 a decision and can never drive it. It lifts itself as those features earn their
 shrinkage.
 
-Dependency-free beyond numpy, following `signals.options_math`: scipy would be
+Dependency-free beyond numpy, as everything numeric here is: scipy would be
 the obvious home for a fitter, and is a large dependency for one Newton solve on
 a worker with a 448M ceiling.
 """
