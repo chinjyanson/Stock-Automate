@@ -101,8 +101,16 @@ def _quarter(year: int, quarter: int) -> pd.DataFrame | None:
     relationship = merged["RPTOWNER_RELATIONSHIP"].fillna("")
     merged["is_insider"] = relationship.str.contains("|".join(INSIDER_ROLES), case=False)
 
-    merged["date"] = pd.to_datetime(merged["TRANS_DATE"], errors="coerce", format="mixed")
+    # `DD-MMM-YYYY`, stated explicitly. Left to infer, pandas resolves some rows
+    # day-first and others year-first and produces transaction dates in 1983 and
+    # 2033 — neither of which the dataset contains, and both of which sail
+    # through silently because a bad date is still a date.
+    merged["date"] = pd.to_datetime(merged["TRANS_DATE"], errors="coerce", format="%d-%b-%Y")
     merged = merged.dropna(subset=["date"])
+    # A filing may legitimately report a transaction from an earlier quarter, so
+    # dates outside the file's own quarter are expected; dates outside the
+    # dataset's lifetime are not.
+    merged = merged[(merged["date"] >= "2003-01-01") & (merged["date"] <= pd.Timestamp.today())]
     merged["is_buy"] = merged["TRANS_CODE"] == BUY_CODE
     return merged[["date", "is_buy", "is_insider"]]
 
