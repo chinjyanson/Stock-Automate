@@ -74,7 +74,7 @@ def _simulate(
     reentry: str,
     timeout: int,
     cost: float,
-) -> tuple[np.ndarray, int, float]:
+) -> tuple[np.ndarray, int, np.ndarray]:
     """Invested by default; step aside on a warning; ladder back in as it falls."""
     equity = capital
     exposure = 1.0
@@ -166,7 +166,76 @@ def _simulate(
         curve.append(equity)
         held.append(exposure)
 
-    return np.asarray(curve), alarms, float(np.mean(held)) if held else 0.0
+    # The exposure *path*, not its mean. Two settings can hold the same average
+    # and earn wildly different money depending on which particular days they
+    # were out for, and the mean is exactly the statistic that hides that. The
+    # episode ledger in `_episodes` needs the path to explain such a gap.
+    return np.asarray(curve), alarms, np.asarray(held)
+
+
+def _episodes(
+    exposure: np.ndarray,
+    daily: np.ndarray,
+    index: pd.DatetimeIndex,
+    cut: int,
+    *,
+    label: str,
+    top: int,
+) -> None:
+    """Every stretch spent out of the market, and what it was worth.
+
+    A settings sweep reports one number per row and hides how it was earned. Two
+    adjacent settings can differ by thousands of pounds not because one is
+    better calibrated but because one happened to be defensive across a single
+    violent fortnight and the other was not. That is a fact about *which days*,
+    not about the threshold, and only a per-episode ledger shows it.
+
+    The money column is the honest one: it compares compounding at the exposure
+    actually held against compounding at 1.0 over the very same days, so a
+    positive number is a crash genuinely dodged and a negative one is a rally
+    genuinely missed.
+    """
+    below = exposure < 0.999
+    if not below.any():
+        print(f"\n  {label}: never stepped aside.")
+        return
+
+    edges = np.flatnonzero(np.diff(below.astype(int)))
+    starts = [0] if below[0] else []
+    ends: list[int] = []
+    for e in edges:
+        (ends if below[e] else starts).append(int(e) + 1)
+    if below[-1]:
+        ends.append(below.size)
+
+    rows: list[tuple[float, str]] = []
+    for a, b in zip(starts, ends, strict=True):
+        moves = np.nan_to_num(daily[cut + a : cut + b])
+        weights = exposure[a:b]
+        mine = float(np.prod(1.0 + weights * moves))
+        theirs = float(np.prod(1.0 + moves))
+        effect = mine / theirs - 1.0
+        rows.append(
+            (
+                effect,
+                f"  {index[cut + a].date()!s:>12} to {index[cut + b - 1].date()!s:>12}"
+                f" {b - a:>5}d {weights.min():>7.0%} {theirs - 1.0:>9.1%} {effect:>+9.1%}",
+            )
+        )
+
+    gained = sum(e for e, _ in rows if e > 0)
+    lost = sum(e for e, _ in rows if e < 0)
+    print(f"\n  {label}: {len(rows)} spells out of the market.")
+    print(f"  {'from':>12}    {'to':>12} {'days':>6} {'least':>7} {'market':>9} {'money':>9}")
+    for _, line in sorted(rows, key=lambda r: r[0])[:top]:
+        print(line)
+    print("  ...")
+    for _, line in sorted(rows, key=lambda r: r[0])[-top:]:
+        print(line)
+    print(
+        f"  Best spells added {gained:+.0%} between them; worst cost {lost:+.0%}."
+        f" 'least' is the smallest slice of the market held during the spell."
+    )
 
 
 def _run(
@@ -185,6 +254,7 @@ def _run(
     reentry: str,
     timeout: int,
     cost: float,
+    episodes: int,
 ) -> None:
     warnings.filterwarnings("ignore")
     import yfinance as yf
@@ -306,7 +376,7 @@ def _run(
     for fraction in fractions:
         triggers = make_triggers(fraction)
         fired = p >= triggers[held]
-        curve, _alarms, average = _simulate(
+        curve, _alarms, exposure = _simulate(
             daily,
             close,
             signals,
@@ -336,6 +406,7 @@ def _run(
         # portfolio held flat at the same average exposure all along. If the two
         # match, the model timed nothing; if the overlay is far lower, it stepped
         # aside at moments that actually mattered.
+        average = float(np.mean(exposure)) if exposure.size else 0.0
         flat_curve = capital * np.cumprod(1.0 + average * np.nan_to_num(daily[cut:]))
         flat_dd = _drawdown(flat_curve)
         flat_ret = float(flat_curve[-1]) / capital - 1.0
@@ -352,6 +423,15 @@ def _run(
             f"{capital * (1 + flat_ret):>9,.0f} {flat_ret:>7.1%} {flat_dd:>7.1%} "
             f"{flat_ret / flat_dd if flat_dd else 0:>7.2f} {'':>7} {average:>6.0%}"
         )
+        if episodes:
+            _episodes(
+                exposure,
+                daily,
+                index,
+                cut,
+                label=f"top {fraction:.0%}",
+                top=episodes,
+            )
 
     print(
         "\n  'precis' is how often a warning was actually followed by the fall;\n"
@@ -410,6 +490,12 @@ def main() -> None:
     )
     parser.add_argument("--timeout", type=int, default=20, help="Days before returning anyway.")
     parser.add_argument("--cost", type=float, default=0.0005)
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=0,
+        help="Show this many best and worst spells out of the market, per setting.",
+    )
     args = parser.parse_args()
     _run(
         args.path,
@@ -427,6 +513,7 @@ def main() -> None:
         args.reentry,
         args.timeout,
         args.cost,
+        args.episodes,
     )
 
 
