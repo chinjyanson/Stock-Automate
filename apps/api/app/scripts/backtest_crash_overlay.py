@@ -185,6 +185,7 @@ def _simulate(
     defensive: float,
     ladder: float,
     rebound: float,
+    reentry: str,
     timeout: int,
     cost: float,
 ) -> tuple[np.ndarray, int, float]:
@@ -227,20 +228,47 @@ def _simulate(
                 # capital returns *into* the decline rather than waiting for a
                 # bottom nobody can identify.
                 recovered = float(np.clip(fallen / ladder, 0.0, 1.0))
-                wanted = defensive + (1.0 - defensive) * recovered
+                still_warning = probability >= triggers[prior]
 
-                # **Buy back into the bounce.** The ladder above only reacts to
-                # further falls — `fallen` clips at zero — so a market that
-                # rallies straight off the alarm leaves the position pinned at
-                # `defensive` until the timeout, standing outside the rebound.
-                # That is the wrong way round: the worst days and the best days
-                # are neighbours, so the recovery is precisely what must not be
-                # missed. A rise of `rebound` off the lowest close since the
-                # alarm is read as the fall having played out, and returns the
-                # position in full.
-                bounced = rebound > 0.0 and here / low_since - 1.0 >= rebound
-                if recovered >= 1.0 or bounced or days_out >= timeout:
-                    # Fully laddered in, bounced, or the feared fall never came.
+                if reentry == "price":
+                    wanted = defensive + (1.0 - defensive) * recovered
+
+                    # **Buy back into the bounce.** The ladder only reacts to
+                    # further falls — `fallen` clips at zero — so a market that
+                    # rallies straight off the alarm leaves the position pinned
+                    # at `defensive` until the timeout, standing outside the
+                    # rebound. That is the wrong way round: the worst days and
+                    # the best days are neighbours, so the recovery is precisely
+                    # what must not be missed. A rise of `rebound` off the lowest
+                    # close since the alarm returns the position in full.
+                    bounced = rebound > 0.0 and here / low_since - 1.0 >= rebound
+                    if recovered >= 1.0 or bounced or days_out >= timeout:
+                        exit_price = None
+                        wanted = 1.0
+
+                # **Model-driven re-entry.** The two rules below re-read the
+                # detector every day instead of waiting on price, which is what
+                # makes them fast: the position returns the day *after* the
+                # warning clears rather than after a fixed timeout. The detector
+                # is already being computed daily; not consulting it while out
+                # was the waste.
+                elif not still_warning:
+                    # All clear. Whatever the price has done, the reason for
+                    # standing aside has gone, so step fully back in.
+                    exit_price = None
+                    wanted = 1.0
+                elif reentry == "on-warning":
+                    # Still warning, and this rule reads that as a reason to
+                    # accumulate: another fall means a lower price to buy, so
+                    # capital returns in proportion to how far it has already
+                    # fallen. Deliberately buying into a predicted decline —
+                    # which is either the ladder's logic taken seriously or a
+                    # way to lose money faster, and only measurement decides.
+                    wanted = defensive + (1.0 - defensive) * recovered
+                else:  # "all-clear" — stay aside while the warning stands
+                    wanted = defensive
+
+                if reentry != "price" and days_out >= timeout:
                     exit_price = None
                     wanted = 1.0
 
@@ -266,6 +294,7 @@ def _run(
     defensive: float,
     ladder: float,
     rebound: float,
+    reentry: str,
     timeout: int,
     cost: float,
 ) -> None:
@@ -360,6 +389,7 @@ def _run(
         defensive=defensive,
         ladder=ladder,
         rebound=rebound,
+        reentry=reentry,
         timeout=timeout,
         cost=cost,
     )
@@ -391,6 +421,7 @@ def _run(
             defensive=defensive,
             ladder=ladder,
             rebound=rebound,
+            reentry=reentry,
             timeout=timeout,
             cost=cost,
         )
@@ -399,7 +430,7 @@ def _run(
         precision = y[fired].mean() if fired.any() else float("nan")
         recall = fired[y == 1].mean() if fired.any() else 0.0
         print(
-            f"  {f'overlay, top {fraction:.2%} alarming':<26} {fired.mean():>7.1%} "
+            f"  {f'{reentry}, top {fraction:.2%}':<26} {fired.mean():>7.1%} "
             f"{precision:>7.1%} {recall:>7.1%} {final:>9,.0f} {final / capital - 1:>7.1%} "
             f"{drawdown:>7.1%} {(final / capital - 1) / drawdown if drawdown else 0:>7.2f} "
             f"{alarms:>7} {average:>6.0%}"
@@ -435,6 +466,16 @@ def main() -> None:
     parser.add_argument("--defensive", type=float, default=0.3, help="Exposure kept when out.")
     parser.add_argument("--ladder", type=float, default=0.10, help="Fall over which to buy back.")
     parser.add_argument(
+        "--reentry",
+        choices=("price", "all-clear", "on-warning"),
+        default="price",
+        help=(
+            "How to come back. 'price' ladders on further falls plus --rebound; "
+            "'all-clear' returns in full the day the warning clears; 'on-warning' "
+            "also accumulates while the warning still stands."
+        ),
+    )
+    parser.add_argument(
         "--rebound",
         type=float,
         default=0.0,
@@ -454,6 +495,7 @@ def main() -> None:
         args.defensive,
         args.ladder,
         args.rebound,
+        args.reentry,
         args.timeout,
         args.cost,
     )

@@ -69,6 +69,7 @@ def _run(
     defensive: float,
     ladder: float,
     rebound: float,
+    reentry: str,
     timeout: int,
     cost: float,
 ) -> None:
@@ -156,6 +157,7 @@ def _run(
                     defensive=defensive,
                     ladder=ladder,
                     rebound=rebound,
+                    reentry=reentry,
                     timeout=timeout,
                     cost=cost,
                 )
@@ -215,7 +217,9 @@ def _run(
         beats_flat_d = float(np.mean(table[:, 3] < table[:, 7]))
         beats_flat_q = float(np.mean(table[:, 5] > table[:, 8]))
 
-        print(f"  Firing on the top {fraction:.0%} of alarming days — {alarms_total} alarms total")
+        print(
+            f"  {reentry}, top {fraction:.2%} of alarming days — {alarms_total} alarms"
+        )
         print(
             f"    {'measure':<22} {'buy+hold':>10} {'flat':>8} {'overlay':>8} "
             f"{'vs b+h':>8} {'vs flat':>8}"
@@ -263,6 +267,7 @@ def main() -> None:
     parser.add_argument("--defensive", type=float, default=0.3)
     parser.add_argument("--ladder", type=float, default=0.10)
     parser.add_argument("--rebound", type=float, default=0.0)
+    parser.add_argument("--reentry", choices=("price", "all-clear", "on-warning"), default="price")
     parser.add_argument("--timeout", type=int, default=20)
     parser.add_argument("--cost", type=float, default=0.0005)
     args = parser.parse_args()
@@ -278,6 +283,7 @@ def main() -> None:
         args.defensive,
         args.ladder,
         args.rebound,
+        args.reentry,
         args.timeout,
         args.cost,
     )
