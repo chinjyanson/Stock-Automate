@@ -38,3 +38,8 @@ test-results/
 # Runtime artifacts
 logs/
 *.log
+
+# Cached market-data panels for the backtests. Re-fetchable in a couple of
+# minutes and tens of megabytes; the *constituent list* beside them is committed
+# because it records which universe a published result was measured on.
+apps/api/data/*.npz
