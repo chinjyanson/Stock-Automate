@@ -1,0 +1,8 @@
+# Rebuildable, and large: hidden states and sampled futures run to tens of
+# megabytes. `fetch.py` and the scripts that follow it regenerate everything.
+cache/*.npz
+
+# The per-day predictions are small and are the evidence behind the write-up, so
+# they are kept. Anything genuinely derived from them is not.
+__pycache__/
+.pytest_cache/
