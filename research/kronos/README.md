@@ -58,6 +58,54 @@ is the sharpest statement in this directory: **adding Kronos to what we have
 changes nothing measurable.** If it were right about a different set of days, the
 blend would beat both halves. It does not.
 
+### "But you averaged them with equal weights — fit the weights instead"
+
+Fair objection, answered in `stack.py`. It does not rescue anything, for three
+reasons that stack up.
+
+**There is nothing to win.** A logistic regression on two scores ranks days by a
+weighted sum, so its ranking is a point on a one-parameter family. Sweep that
+parameter and pick the best point *by reading the test answers* — cheating, and
+therefore an upper bound on every honest method. The ceiling is **+0.0013 AUC**
+over the shipped detector alone, at a weight of 0.12 on Kronos. There is no
+weighting that helps, so no way of choosing one can help.
+
+**Fitted honestly, it lands inside that noise.** Both detectors were fitted
+before 2016, so the held-out decade is out-of-sample for both and can be split
+again: fit the combiner on 2016-2020, measure on 2021-2026. It chose weights
++0.919 shipped, +0.294 Kronos, and gained **+0.005 AUC, range -0.002 to +0.011**
+on 42 falls — consistent with zero. A boosted-tree combiner on the same two
+features did worse than either alone (-0.024).
+
+**And the weight is not stable, which is the real tell.**
+
+| period | falls | shipped | Kronos | best weight on Kronos |
+|---|---|---|---|---|
+| 2016-2020 | 50 | 0.842 | 0.780 | 0.08 |
+| 2021-2026 | 42 | 0.743 | 0.755 | 0.80 |
+| both | 92 | 0.798 | 0.766 | 0.12 |
+
+Kronos does edge ahead in the second half — which is where a fitted combiner
+gets its small positive — but it is behind by more in the first, and the
+best weight swings from 0.08 to 0.80 between them. A weight that flips like that
+across adjacent five-year windows is fitting whichever detector happened to have
+the better half. The buy-back study reached the same conclusion about a
+different knob by the same route.
+
+**Why there is nothing to win.** The two rank days 0.72 alike, and they disagree
+substantially on 23% of days. On those disagreements:
+
+| | days | share that fell |
+|---|---|---|
+| Kronos the more worried one | 316 | 0.6% |
+| shipped the more worried one | 305 | 2.0% |
+| everything | 2,667 | 3.4% |
+
+A blend can only add value on days the two disagree, and on those days the
+shipped detector's extra worry is worth three times Kronos's. Kronos's
+independent opinion — the part that is *not* already in the shipped detector —
+points the wrong way.
+
 ## What did happen, that is worth keeping
 
 **Its own crash probability is worthless, and badly calibrated with it.**
@@ -139,6 +187,7 @@ single small validation window.
 | `finetune.py` | unfreeze the last blocks and actually train it |
 | `zeroshot.py` | sample futures and count the falls — no training at all |
 | `compare.py` | every detector, identical days, one table, plus the paired test |
+| `stack.py` | can a fitted combiner of the two beat the better one alone? (no) |
 | `tests/` | the label definition and the scoring, which everything else rests on |
 
 ## Running it
