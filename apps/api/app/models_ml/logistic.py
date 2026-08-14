@@ -344,3 +344,73 @@ def log_loss(labels: FloatArray, predicted: FloatArray) -> float:
         return float("nan")
     clipped = np.clip(predicted, 1e-12, 1.0 - 1e-12)
     return float(-np.mean(labels * np.log(clipped) + (1 - labels) * np.log(1 - clipped)))
+
+
+@dataclass(frozen=True, slots=True)
+class Gap:
+    """How much better one model ranks than another, and how sure we can be."""
+
+    difference: float
+    low: float
+    high: float
+    #: Share of resamples in which `left` came out ahead.
+    share: float
+
+    @property
+    def real(self) -> bool:
+        """Does the interval sit strictly to one side of zero?
+
+        Written as "excludes zero" rather than "does not straddle zero". The two
+        differ exactly when an endpoint *is* zero — including the degenerate
+        case of comparing a model against itself, where the interval collapses
+        to a single point at zero and the second phrasing calls it a real
+        difference.
+        """
+        return self.high < 0.0 or self.low > 0.0
+
+
+def auc_gap(
+    labels: FloatArray,
+    left: FloatArray,
+    right: FloatArray,
+    *,
+    resamples: int = 2000,
+    seed: int = 0,
+) -> Gap:
+    """Compare two models on the same days, by resampling the *difference*.
+
+    Reading two separate confidence intervals and checking whether they overlap
+    is the intuitive comparison and a badly underpowered one. Both intervals are
+    wide largely because the evaluation window is short — and that noise is
+    *shared*, since both models are being judged on the same days and the same
+    handful of events. Resampling the pair together cancels it.
+
+    The effect is not small. Two detectors whose separate 90% ranges overlap
+    across most of their width can still differ with the paired interval
+    entirely on one side of zero, because on any given resample the better one
+    is better almost every time.
+
+    Rare events make this matter more, not less: when a year contributes a dozen
+    positives, which dozen you happened to get drives both scores in the same
+    direction at once.
+    """
+    labels = np.asarray(labels, dtype=np.float64)
+    left = np.asarray(left, dtype=np.float64)
+    right = np.asarray(right, dtype=np.float64)
+
+    point = auc(labels, left) - auc(labels, right)
+    rng = np.random.default_rng(seed)
+    draws = np.empty(resamples, dtype=np.float64)
+    for i in range(resamples):
+        pick = rng.integers(0, labels.size, labels.size)
+        draws[i] = auc(labels[pick], left[pick]) - auc(labels[pick], right[pick])
+
+    usable = draws[np.isfinite(draws)]
+    if usable.size == 0:
+        return Gap(difference=point, low=float("nan"), high=float("nan"), share=float("nan"))
+    return Gap(
+        difference=point,
+        low=float(np.quantile(usable, 0.05)),
+        high=float(np.quantile(usable, 0.95)),
+        share=float((usable > 0.0).mean()),
+    )

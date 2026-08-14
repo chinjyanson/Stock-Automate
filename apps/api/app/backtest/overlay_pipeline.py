@@ -12,6 +12,7 @@ that lets one pipeline serve several trading rules without favouring any.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -69,16 +70,27 @@ class Pipeline:
         return out
 
 
-def load(
-    path: Path,
-    *,
-    since: str,
-    until: str | None,
-    split_date: str,
-    fall: float,
-    horizon: int,
-) -> Pipeline:
-    """Fetch, build, fit and score. The only function here that touches a network."""
+@dataclass(frozen=True, slots=True)
+class Gathered:
+    """The index and its features, before anything has been fitted to them.
+
+    Split out from `load` because fetching and building is the slow part and is
+    identical across models, while fitting is fast and is the part an ablation
+    wants to repeat. Keeping them apart means "refit without this feature" costs
+    a fit rather than a download.
+    """
+
+    index: pd.DatetimeIndex
+    close: np.ndarray
+    daily: np.ndarray
+    signals: dict[str, np.ndarray]
+    #: The features this history can support. The insider series begins in 2006,
+    #: so an earlier start silently has fewer of them available.
+    available: tuple[str, ...]
+
+
+def gather(path: Path, *, since: str, until: str | None) -> Gathered:
+    """Fetch and build. The only function here that touches a network."""
     import yfinance as yf
 
     frame = yf.Ticker("^GSPC").history(period="max", interval="1d")
@@ -88,14 +100,47 @@ def load(
     close = frame["Close"].to_numpy(dtype=np.float64)
     index = pd.DatetimeIndex(frame.index.tz_localize(None)).normalize()
     daily = np.concatenate([[np.nan], close[1:] / close[:-1] - 1.0])
+
+    available = FEATURES
+    if since < "2006-01-01":
+        available = tuple(f for f in FEATURES if f != "insider_rank")
+
+    return Gathered(
+        index=index,
+        close=close,
+        daily=daily,
+        signals=_build(path, index, close, daily),
+        available=available,
+    )
+
+
+def assemble(
+    source: Gathered,
+    *,
+    split_date: str,
+    fall: float,
+    horizon: int,
+    features: Sequence[str] | None = None,
+) -> Pipeline:
+    """Fit on data strictly before `split_date`, then score every bar.
+
+    `features` selects a subset, for asking what any one of them is worth. It is
+    intersected with what the history supports rather than trusted, so naming a
+    feature that this date range cannot produce narrows the model instead of
+    fitting it against a column of NaN.
+    """
+    index, close, daily = source.index, source.close, source.daily
+    signals = source.signals
     n = close.size
 
-    signals = _build(path, index, close, daily)
-
-    features = FEATURES
-    if since < "2006-01-01":
-        features = tuple(f for f in FEATURES if f != "insider_rank")
-    begin = INSIDER_MIN_HISTORY + 1 if "insider_rank" in features else CALIBRATION_MIN
+    chosen = tuple(f for f in (features if features is not None else source.available)
+                   if f in source.available)
+    if not chosen:
+        raise SystemExit(
+            f"no usable features: asked for {tuple(features or ())}, "
+            f"this history supports {source.available}"
+        )
+    begin = INSIDER_MIN_HISTORY + 1 if "insider_rank" in chosen else CALIBRATION_MIN
 
     cut = int(index.searchsorted(pd.Timestamp(split_date)))
     train = np.array([i for i in range(begin, cut - horizon - 1) if np.isfinite(daily[i])])
@@ -105,9 +150,9 @@ def load(
         )
 
     model = fit(
-        _rows(signals, train, features),
+        _rows(signals, train, chosen),
         np.array([_label_fall(close, i, fall=fall, horizon=horizon) for i in train]),
-        features,
+        chosen,
         priors={f: Prior(0.0, 1.0) for f in FEATURES},
         label_definition=f"fall of {fall:.0%} within {horizon} days",
     )
@@ -116,9 +161,9 @@ def load(
     probability = np.full(n, np.nan)
     probability[every] = [
         model.probability(
-            {f: float(v) for f, v in zip(features, row, strict=True) if np.isfinite(v)}
+            {f: float(v) for f, v in zip(chosen, row, strict=True) if np.isfinite(v)}
         )
-        for row in _rows(signals, every, features)
+        for row in _rows(signals, every, chosen)
     ]
 
     return Pipeline(
@@ -126,12 +171,26 @@ def load(
         close=close,
         daily=daily,
         signals=signals,
-        features=features,
+        features=chosen,
         model=model,
         probability=probability,
         cut=cut,
         begin=begin,
     )
+
+
+def load(
+    path: Path,
+    *,
+    since: str,
+    until: str | None,
+    split_date: str,
+    fall: float,
+    horizon: int,
+) -> Pipeline:
+    """Fetch, build, fit and score, with every feature the history supports."""
+    source = gather(path, since=since, until=until)
+    return assemble(source, split_date=split_date, fall=fall, horizon=horizon)
 
 
 def rsi_series(close: np.ndarray, period: int = 14) -> np.ndarray:

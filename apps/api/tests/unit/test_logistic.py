@@ -29,6 +29,7 @@ from app.models_ml.logistic import (
     FittedModel,
     Prior,
     auc,
+    auc_gap,
     average_ranks,
     fit,
 )
@@ -230,3 +231,75 @@ class TestRankStatistics:
 
     def test_auc_is_undefined_with_one_class(self) -> None:
         assert math.isnan(auc(np.ones(4), np.array([0.1, 0.2, 0.3, 0.4])))
+
+
+class TestPairedComparison:
+    """`auc_gap` exists because the unpaired comparison is underpowered.
+
+    The point is not that it gives a different number — the point estimate is
+    the same subtraction either way. It is that resampling the two models
+    *together* removes the noise they share, which on a short window with few
+    events is most of the noise there is.
+    """
+
+    def test_the_difference_is_the_difference(self) -> None:
+        rng = np.random.default_rng(3)
+        labels = (rng.random(500) < 0.2).astype(float)
+        left = labels + rng.normal(0, 0.8, 500)
+        right = rng.normal(0, 1.0, 500)
+        gap = auc_gap(labels, left, right, resamples=400)
+        assert gap.difference == pytest.approx(auc(labels, left) - auc(labels, right))
+
+    def test_a_model_against_itself_is_exactly_zero(self) -> None:
+        rng = np.random.default_rng(4)
+        labels = (rng.random(300) < 0.1).astype(float)
+        scores = rng.normal(size=300)
+        gap = auc_gap(labels, scores, scores, resamples=200)
+        assert gap.difference == pytest.approx(0.0)
+        assert gap.low == pytest.approx(0.0)
+        assert gap.high == pytest.approx(0.0)
+        assert not gap.real
+
+    def test_it_is_antisymmetric(self) -> None:
+        rng = np.random.default_rng(5)
+        labels = (rng.random(400) < 0.15).astype(float)
+        left = labels + rng.normal(0, 0.9, 400)
+        right = labels + rng.normal(0, 1.4, 400)
+        forward = auc_gap(labels, left, right, resamples=400)
+        backward = auc_gap(labels, right, left, resamples=400)
+        assert forward.difference == pytest.approx(-backward.difference)
+        assert forward.share == pytest.approx(1.0 - backward.share, abs=0.05)
+
+    def test_pairing_is_sharper_than_two_separate_intervals(self) -> None:
+        """The reason this function exists, pinned as a property.
+
+        Two models built from the same signal plus different noise are ranked
+        the same way on almost every resample, so the paired interval is far
+        narrower than either model's own interval. If a refactor lost the
+        pairing — by resampling the two independently — this is what would
+        catch it.
+        """
+        rng = np.random.default_rng(6)
+        labels = (rng.random(600) < 0.1).astype(float)
+        shared = labels + rng.normal(0, 1.0, 600)
+        left = shared + rng.normal(0, 0.05, 600)
+        right = shared
+
+        paired = auc_gap(labels, left, right, resamples=600)
+        spread = paired.high - paired.low
+
+        # The same comparison done the naive way: each model resampled on its
+        # own days, so the shared noise never cancels.
+        rng = np.random.default_rng(7)
+        draws = np.empty(600)
+        for i in range(600):
+            a = rng.integers(0, labels.size, labels.size)
+            b = rng.integers(0, labels.size, labels.size)
+            draws[i] = auc(labels[a], left[a]) - auc(labels[b], right[b])
+        unpaired = float(np.quantile(draws, 0.95) - np.quantile(draws, 0.05))
+
+        assert spread < unpaired / 3.0
+
+    def test_it_survives_a_window_with_no_events(self) -> None:
+        gap = auc_gap(np.zeros(50), np.random.default_rng(8).normal(size=50), np.zeros(50))
+        assert math.isnan(gap.low) or math.isnan(gap.difference)
