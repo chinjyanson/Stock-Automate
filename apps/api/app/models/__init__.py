@@ -28,6 +28,7 @@ from app.models.enums import (
     QualityStatus,
     TradeIntentStatus,
 )
+from app.models.index_options import IndexOptionsSnapshot
 from app.models.insider import InsiderTransaction
 from app.models.instrument import (
     BrokerInstrument,
@@ -97,6 +98,7 @@ __all__ = [
     "FundamentalSnapshot",
     "HaltKind",
     "HaltScope",
+    "IndexOptionsSnapshot",
     "InsiderTransaction",
     "Instrument",
     "InstrumentKind",

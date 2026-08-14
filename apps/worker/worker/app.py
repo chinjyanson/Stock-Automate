@@ -40,6 +40,7 @@ app = Celery(
         "worker.jobs.backfill",
         "worker.jobs.market_regime",
         "worker.jobs.crash_overlay",
+        "worker.jobs.index_options",
         "worker.jobs.sentiment",
     ],
 )
@@ -92,12 +93,20 @@ app.conf.beat_schedule = {
         "options": {"expires": 5400},
     },
     # Before the regime measurement, so the day's index picture — dealer gamma,
-    # skew, at-the-money implied vol — is complete before anything sizes against
-    # it. An option chain carries no history, so this row is the only record
-    # there will ever be of what today was pricing.
-    # Weekly: report dates move on a quarterly cycle, so asking daily would
-    # spend a provider call per instrument to learn nothing. Sunday morning,
-    # well clear of the trading week.
+    # skew, at-the-money implied vol — is complete before anything reads it.
+    #
+    # This is the one job in the schedule whose missed runs are unrecoverable.
+    # An option chain is published for today and per-strike open interest is
+    # gone once the day passes, so there is no backfill: a night this does not
+    # run is a permanent hole in the series. Everything else here is idempotent
+    # and self-healing; this is a recorder, and the only thing it can do is not
+    # miss. Run before the close-dependent jobs so a late failure downstream
+    # cannot take it with them.
+    "measure-index-options": {
+        "task": "worker.jobs.index_options.measure_index_options",
+        "schedule": crontab(hour=21, minute=40),
+        "options": {"expires": 3600},
+    },
     # Before the scan, so the day's risk posture is measured from fresh candles
     # and is already in place when the risk engine sizes anything tonight.
     "measure-market-regime": {
