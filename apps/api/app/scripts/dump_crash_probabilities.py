@@ -2,16 +2,20 @@
 
     python -m app.scripts.dump_crash_probabilities --split-date 2016-01-01
 
-The Kronos experiment lives in `research/kronos/` and runs in a different
-virtualenv — it needs torch, which has no business anywhere near the deployed
-API image. So the two halves of the comparison cannot import each other, and
-this script is the seam between them: it runs the production pipeline and
-writes one row per bar.
+One row per bar: the date, the close, what the detector thought, and what
+actually happened. It exists so that anything wanting to be compared against
+the shipped detector can be, without having to import it or reconstruct it.
 
-Writing the label out beside the probability is deliberate. It means the
-research side never has to reconstruct what counts as a 2% fall, and any
-disagreement about the target shows up as a mismatched column rather than as a
-quiet few-tenths difference in someone's accuracy figure.
+Its current caller is `test_gex_theory.py --detector`, which needs the
+detector's own scores to ask whether dealer gamma adds anything to them. It was
+written for a comparison against a foundation model that ran in a separate
+virtualenv and could not import the API at all; that experiment is finished and
+gone, and the seam turned out to be worth keeping on its own.
+
+Writing the label out beside the probability is deliberate. It means the reader
+never has to reconstruct what counts as a 2% fall, and any disagreement about
+the target shows up as a mismatched column rather than as a quiet few-tenths
+difference in someone's accuracy figure.
 """
 
 from __future__ import annotations
