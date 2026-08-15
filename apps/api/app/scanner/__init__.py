@@ -11,25 +11,27 @@ from app.scanner.rotation import select_instruments
 from app.scanner.scoring import (
     DEFAULT_THRESHOLDS,
     DEFAULT_WEIGHTS,
+    GROUP_NAMES,
+    GroupScore,
     ScoreResult,
-    ValueResult,
     classify,
+    combine_score,
     score_series,
-    score_value,
 )
 
 __all__ = [
     "DEFAULT_THRESHOLDS",
     "DEFAULT_WEIGHTS",
+    "GROUP_NAMES",
+    "GroupScore",
     "ProposalError",
     "ProposalInputs",
     "ProposalService",
     "ScanSummary",
     "ScannerEngine",
     "ScoreResult",
-    "ValueResult",
     "classify",
+    "combine_score",
     "score_series",
-    "score_value",
     "select_instruments",
 ]

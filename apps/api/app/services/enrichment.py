@@ -49,6 +49,14 @@ SECTOR_ETFS: dict[str, str] = {
     "XLC": "Communication Services Select Sector SPDR Fund",
 }
 
+#: Rate-sensitivity proxy for the scanner's risk category. A bond *price* series,
+#: deliberately not a yield index — see `scanner.engine.RATES_PROXY_SYMBOL`.
+RATES_PROXY_ETFS: dict[str, str] = {"IEF": "iShares 7-10 Year Treasury Bond ETF"}
+
+#: Every ETF seeded as a shared reference series for scoring. None is ever a
+#: trade candidate; they exist so the daily refresh keeps them fresh.
+REFERENCE_ETFS: dict[str, str] = {**SECTOR_ETFS, **RATES_PROXY_ETFS}
+
 _ETF_BACKFILL_DAYS = 500
 _UNCLASSIFIED = "Unclassified"
 
@@ -59,6 +67,11 @@ class EnrichResult:
     classified: int = 0  # got a real sector
     unclassified: int = 0  # attempted, yfinance had no classification
     with_fundamentals: int = 0  # got at least one fundamental (P/E, P/B, …)
+    #: Got the cash-flow / balance-sheet items a DCF would need. Counted
+    #: separately from `with_fundamentals` because deciding whether a DCF is
+    #: worth building is precisely a question about this number, and it would be
+    #: invisible folded into the other one.
+    with_statements: int = 0
 
 
 class EnrichmentService:
@@ -111,6 +124,12 @@ class EnrichmentService:
             )
             if has_any:
                 result.with_fundamentals += 1
+            # Free cash flow and a share count are the two a DCF cannot proceed
+            # without, so they are what "we have statements for this" means.
+            if fundamentals.free_cash_flow is not None and (
+                fundamentals.shares_outstanding is not None
+            ):
+                result.with_statements += 1
             # Always write a snapshot (even if sparse) to mark the attempt.
             self._session.add(
                 FundamentalSnapshot(
@@ -126,6 +145,16 @@ class EnrichmentService:
                     earnings_growth=fundamentals.earnings_growth,
                     profit_margin=fundamentals.profit_margin,
                     debt_to_equity=fundamentals.debt_to_equity,
+                    free_cash_flow=fundamentals.free_cash_flow,
+                    operating_cash_flow=fundamentals.operating_cash_flow,
+                    total_debt=fundamentals.total_debt,
+                    total_cash=fundamentals.total_cash,
+                    shares_outstanding=fundamentals.shares_outstanding,
+                    ebitda=fundamentals.ebitda,
+                    enterprise_value=fundamentals.enterprise_value,
+                    book_value_per_share=fundamentals.book_value_per_share,
+                    return_on_equity=fundamentals.return_on_equity,
+                    current_ratio=fundamentals.current_ratio,
                     retrieved_at=datetime.now(UTC),
                 )
             )
@@ -133,10 +162,14 @@ class EnrichmentService:
         return result
 
     async def ensure_sector_etfs(self, provider: YFinanceProvider) -> dict[str, int]:
-        """Create + candle-backfill the 11 sector ETFs. Idempotent."""
+        """Create + candle-backfill the reference ETFs. Idempotent.
+
+        The 11 SPDR sector proxies plus the rates proxy — every series the
+        scanner correlates an instrument against, other than the SPY benchmark.
+        """
         created = 0
         candles = 0
-        for symbol, name in SECTOR_ETFS.items():
+        for symbol, name in REFERENCE_ETFS.items():
             instrument = (
                 (
                     await self._session.execute(

@@ -36,6 +36,7 @@ from app.models.scanner import (
 )
 from app.scanner import scoring
 from app.services.insider import InsiderIngestionService
+from app.services.sentiment import SentimentService
 
 log = structlog.get_logger(__name__)
 
@@ -60,6 +61,12 @@ _SECTOR_ETF: dict[str, str] = {
     "Utilities": "XLU",
     "Communication Services": "XLC",
 }
+
+#: Rate-sensitivity proxy: a 7-10 year Treasury *price* series. Deliberately an
+#: ETF and not a yield index like ^TNX — yields move inversely to bond prices, so
+#: a yield series would silently flip the sign of every correlation without
+#: erroring. Loaded once per run and shared by every instrument, like SPY.
+RATES_PROXY_SYMBOL = "IEF"
 
 
 @dataclass
@@ -123,6 +130,9 @@ class ScannerEngine:
             if run_config.benchmark_symbol
             else None
         )
+        # One load per run, shared by every instrument — the rate-sensitivity
+        # signal is a correlation against a series that is the same for all of them.
+        rates_series = await self._load_benchmark(RATES_PROXY_SYMBOL)
         # Each sector ETF is loaded at most once per run and reused across every
         # instrument in that sector (≤11 loads, not one per stock).
         sector_cache: dict[str, PriceSeries | None] = {}
@@ -130,7 +140,7 @@ class ScannerEngine:
         for instrument in instruments:
             try:
                 scored = await self._score_one(
-                    run, instrument, run_config, benchmark_series, sector_cache
+                    run, instrument, run_config, benchmark_series, rates_series, sector_cache
                 )
             except Exception as exc:
                 log.exception("scanner.instrument_failed", instrument_id=str(instrument.id))
@@ -191,6 +201,7 @@ class ScannerEngine:
         instrument: Instrument,
         run_config: RunConfig,
         benchmark: PriceSeries | None,
+        rates: PriceSeries | None,
         sector_cache: dict[str, PriceSeries | None],
     ) -> Classification | None:
         candles = await self._store.get_candles(
@@ -205,82 +216,47 @@ class ScannerEngine:
         fundamentals = await self._load_fundamentals(instrument.id)
         sector_series = await self._resolve_sector_series(instrument, sector_cache)
 
+        # Insider activity is looked up rather than derived from the series, so
+        # it is resolved here and passed in. None for anything without recent
+        # Form 4 filings, which is most of the catalogue — the blend drops a
+        # scoreless group along with its weight, so absence is neutral.
+        insider, insider_sell_penalty = await self._insider_factor(instrument.id)
+
         result = scoring.score_series(
             series,
             weights=run_config.weights,
             thresholds=run_config.thresholds,
             benchmark=benchmark,
             sector=sector_series,
+            rates=rates,
+            sentiment=await self._sentiment_score(instrument.id),
             fundamentals=fundamentals,
-        )
-
-        # Insider activity is looked up rather than derived from the series, so
-        # it is attached after scoring and before the blend. None for anything
-        # without recent Form 4 filings, which is most of the catalogue — the
-        # blend drops missing factors and renormalises, so absence is neutral.
-        result.insider, result.insider_sell_penalty = await self._insider_factor(instrument.id)
-
-        # The primary (final) score is an absolute, fundamentals-first blend of
-        # six factors — intrinsic value + P/E lead, with cheapness, reversal,
-        # quality and sector in support. Absolute so it is comparable batch to
-        # batch; see scoring.combine_final_score.
-        primary_score = scoring.combine_final_score(
-            result,
-            weights=run_config.factor_weights,
+            insider=insider,
+            insider_sell_penalty=insider_sell_penalty,
             fundamentals_penalty=run_config.fundamentals_penalty,
         )
-        primary_classification = scoring.classify(primary_score, run_config.thresholds)
 
         freshness_days = None
         if candles:
             age = datetime.now(UTC) - candles[-1].timestamp
             freshness_days = Decimal(str(round(age.total_seconds() / 86400, 2)))
 
+        # The five group scores are persisted alongside the blend they produce,
+        # all on the same 0-100 scale, so a reader can see *why* a stock ranked
+        # where it did without re-running anything.
         self._session.add(
             ScannerResult(
                 run_id=run.id,
                 instrument_id=instrument.id,
-                primary_score=Decimal(str(round(primary_score, 2))),
-                core_score=Decimal(str(result.core_score)),
-                trend_score=Decimal(str(round(result.categories["trend"].points, 2))),
-                momentum_score=Decimal(str(round(result.categories["momentum"].points, 2))),
-                risk_score=Decimal(str(round(result.categories["risk"].points, 2))),
-                liquidity_score=Decimal(str(round(result.categories["liquidity"].points, 2))),
-                positioning_score=Decimal(str(round(result.categories["positioning"].points, 2))),
-                sector_score=Decimal(str(round(result.categories["sector"].points, 2))),
-                reversal_score=(
-                    Decimal(str(result.reversal)) if result.reversal is not None else None
-                ),
-                quality_score=(
-                    Decimal(str(result.quality)) if result.quality is not None else None
-                ),
-                insider_score=(
-                    Decimal(str(result.insider)) if result.insider is not None else None
-                ),
+                primary_score=Decimal(str(result.score)),
+                fundamental_value_score=_group_decimal(result, "value"),
+                price_value_score=_group_decimal(result, "cheapness"),
+                insider_score=_group_decimal(result, "insider"),
+                quality_score=_group_decimal(result, "quality"),
+                sector_score=_group_decimal(result, "sector"),
                 insider_sell_penalty=Decimal(str(round(result.insider_sell_penalty, 4))),
-                fundamental_score=(
-                    Decimal(str(result.fundamental_score))
-                    if result.fundamental_score is not None
-                    else None
-                ),
-                value_score=(Decimal(str(result.value.value_score)) if result.value else None),
-                price_value_score=(
-                    Decimal(str(result.value.price_value_score)) if result.value else None
-                ),
-                fundamental_value_score=(
-                    Decimal(str(result.value.fundamental_value_score))
-                    if result.value and result.value.fundamental_value_score is not None
-                    else None
-                ),
-                value_signals=(
-                    {
-                        "positive": result.value.positive_signals,
-                        "negative": result.value.negative_signals,
-                    }
-                    if result.value
-                    else None
-                ),
-                classification=primary_classification,
+                value_signals=_value_signals(result),
+                classification=result.classification,
                 data_completeness=Decimal(str(result.data_completeness)),
                 data_freshness_days=freshness_days,
                 confidence=Decimal(str(result.confidence)),
@@ -294,7 +270,7 @@ class ScannerEngine:
             )
         )
         await self._session.flush()
-        return primary_classification
+        return result.classification
 
     async def _resolve_sector_series(
         self, instrument: Instrument, cache: dict[str, PriceSeries | None]
@@ -354,6 +330,24 @@ class ScannerEngine:
             return None, 0.0
         return score.score, score.sell_penalty
 
+    async def _sentiment_score(self, instrument_id: uuid.UUID) -> float | None:
+        """News tone as a polarity in [-1, +1], or None when there is none.
+
+        Reads the stored snapshot only — the sweep that calls Finnhub is a
+        separate job, so a scan never depends on a news feed being reachable.
+        Wrapped for the same reason as `_insider_factor` and `_pead_score`: an
+        optional signal covering a minority of the catalogue must never take
+        down the scoring of an instrument whose other signals are fine.
+        """
+        try:
+            score = await SentimentService(self._session).score_instrument(instrument_id)
+        except Exception as exc:
+            log.warning(
+                "scanner.sentiment_failed", instrument_id=str(instrument_id), error=str(exc)
+            )
+            return None
+        return score.polarity if score is not None else None
+
     async def _load_fundamentals(
         self, instrument_id: uuid.UUID
     ) -> dict[str, Decimal | None] | None:
@@ -404,19 +398,11 @@ def ind_year_plus() -> int:
 
 @dataclass(frozen=True)
 class RunConfig:
+    #: Weights of the five scoring groups (see scoring.DEFAULT_WEIGHTS).
     weights: dict[str, float]
     thresholds: dict[str, float]
     benchmark_symbol: str | None
-    momentum_weight: float
-    value_weight: float
-    #: Weights of the five final-score factors, and the missing-fundamentals
-    #: penalty (see scoring.combine_final_score).
-    factor_weights: dict[str, float]
     fundamentals_penalty: float
-
-    @property
-    def is_value_primary(self) -> bool:
-        return self.value_weight > self.momentum_weight
 
 
 def _config_values(config: ScannerConfiguration | None) -> RunConfig:
@@ -425,9 +411,6 @@ def _config_values(config: ScannerConfiguration | None) -> RunConfig:
             weights=scoring.DEFAULT_WEIGHTS,
             thresholds=scoring.DEFAULT_THRESHOLDS,
             benchmark_symbol="SPY",
-            momentum_weight=1.0,
-            value_weight=0.0,
-            factor_weights=scoring.DEFAULT_FACTOR_WEIGHTS,
             fundamentals_penalty=scoring.DEFAULT_FUNDAMENTALS_PENALTY,
         )
     penalty = getattr(config, "fundamentals_penalty", None)
@@ -435,14 +418,33 @@ def _config_values(config: ScannerConfiguration | None) -> RunConfig:
         weights=_floatify(config.weights) or scoring.DEFAULT_WEIGHTS,
         thresholds=_floatify(config.thresholds) or scoring.DEFAULT_THRESHOLDS,
         benchmark_symbol=config.benchmark_symbol,
-        momentum_weight=float(config.momentum_weight),
-        value_weight=float(config.value_weight),
-        factor_weights=_floatify(getattr(config, "factor_weights", None))
-        or scoring.DEFAULT_FACTOR_WEIGHTS,
         fundamentals_penalty=float(penalty)
         if penalty is not None
         else scoring.DEFAULT_FUNDAMENTALS_PENALTY,
     )
+
+
+def _group_decimal(result: scoring.ScoreResult, name: str) -> Decimal | None:
+    """One group's 0-100 score as a Decimal, or None when it did not score.
+
+    None is the honest answer for a group nothing could be measured for, and it
+    is what `combine_score` acted on — persisting a 0 or a 50 instead would make
+    the stored breakdown disagree with the score it is supposed to explain.
+    """
+    score = result.group_score(name)
+    return Decimal(str(round(score, 2))) if score is not None else None
+
+
+def _value_signals(result: scoring.ScoreResult) -> dict[str, list[str]] | None:
+    """The explanations behind the two valuation groups, for the detail panel."""
+    signals = [*result.groups["value"].signals, *result.groups["cheapness"].signals]
+    available = [s for s in signals if s.available and s.explanation]
+    if not available:
+        return None
+    return {
+        "positive": [s.explanation for s in available if s.positive],
+        "negative": [s.explanation for s in available if not s.positive],
+    }
 
 
 def _floatify(raw: dict[str, object] | None) -> dict[str, float] | None:

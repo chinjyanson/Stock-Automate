@@ -198,7 +198,6 @@ async def seed_scanner_configuration() -> int:
     """
     from app.models.scanner import ScannerConfiguration
     from app.scanner.scoring import (
-        DEFAULT_FACTOR_WEIGHTS,
         DEFAULT_FUNDAMENTALS_PENALTY,
         DEFAULT_THRESHOLDS,
         DEFAULT_WEIGHTS,
@@ -218,14 +217,11 @@ async def seed_scanner_configuration() -> int:
                     include_etfs=True,
                     trading212_only=True,
                     max_instruments_per_scan=2000,
+                    # Fundamentals-first: intrinsic value and price cheapness
+                    # lead, with insider buying, soundness and sector in support.
                     weights=dict(DEFAULT_WEIGHTS),
                     thresholds=dict(DEFAULT_THRESHOLDS),
                     benchmark_symbol="SPY",
-                    momentum_weight=Decimal("0.3"),
-                    value_weight=Decimal("0.7"),
-                    # Fundamentals-first final score: intrinsic value + P/E lead,
-                    # with cheapness, reversal, quality and sector in support.
-                    factor_weights=dict(DEFAULT_FACTOR_WEIGHTS),
                     fundamentals_penalty=Decimal(str(DEFAULT_FUNDAMENTALS_PENALTY)),
                 )
             )
@@ -252,53 +248,6 @@ async def seed_risk_configuration() -> int:
             session.add(RiskConfiguration(name="default", is_active=True))
             created = 1
     log.info("seed.risk_configuration", created=created)
-    return created
-
-
-async def seed_strategy_configurations() -> int:
-    """Seed the mean-reversion strategy (§8), inactive, if it does not exist.
-
-    Inactive and with an empty universe by default: a fresh install must never
-    auto-trade before a human has turned it on. Parameters are the documented
-    defaults; idempotent per name.
-
-    One strategy, because that is what the product runs. The universe is not
-    seeded and is not meant to be edited by hand — it is rewritten nightly from
-    the scanner's ranking by `worker.jobs.strategy.sync_strategy_universe`.
-    """
-    from app.models.enums import Interval, StrategyKind
-    from app.models.strategy import StrategyConfiguration
-
-    defaults: list[dict[str, object]] = [
-        {
-            "kind": StrategyKind.MEAN_REVERSION,
-            "name": "Daily mean reversion",
-            "interval": Interval.D1,
-            "params": {
-                "bb_period": 20,
-                "bb_std": 2.0,
-                "rsi_period": 14,
-                "rsi_oversold": 35.0,
-                "atr_period": 14,
-                "min_atr_pct": 0.02,
-            },
-            # Populated nightly from the scanner ranking by
-            # `worker.jobs.strategy.sync_strategy_universe`.
-            "universe": {"instrument_ids": []},
-        },
-    ]
-
-    created = 0
-    async with session_scope() as session:
-        for row in defaults:
-            existing = await session.execute(
-                select(StrategyConfiguration).where(StrategyConfiguration.name == row["name"])
-            )
-            if existing.scalar_one_or_none() is not None:
-                continue
-            session.add(StrategyConfiguration(is_active=False, auto_execute=True, **row))
-            created += 1
-    log.info("seed.strategy_configurations", created=created)
     return created
 
 
@@ -352,7 +301,6 @@ async def main() -> int:
     await seed_settings()
     await seed_scanner_configuration()
     await seed_risk_configuration()
-    await seed_strategy_configurations()
     await seed_dev_user()
 
     log.info("seed.completed")

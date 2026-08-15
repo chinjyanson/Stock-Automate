@@ -107,28 +107,15 @@ class ScannerConfiguration(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     trading212_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     # -- Scoring (§6) -------------------------------------------------------
-    #: Category weights, summing to 100. Trend 25 / Momentum 20 / Risk 20 /
-    #: Liquidity 20 / Positioning 15 by default.
+    #: Weights of the five scoring groups, summing to 100 — value 30 /
+    #: cheapness 24 / insider 15 / quality 21 / sector 10 by default. See
+    #: scoring.DEFAULT_WEIGHTS.
     weights: Mapped[dict[str, Any] | None] = mapped_column()
     #: Band thresholds, e.g. {"screening": 75, "watchlist": 60}.
     thresholds: Mapped[dict[str, Any] | None] = mapped_column()
     benchmark_symbol: Mapped[str | None] = mapped_column(String(32), default="SPY")
-
-    #: How much the momentum core score vs the value score drive the *primary*
-    #: score that classification and ranking use. Default is momentum-primary
-    #: (1.0 / 0.0). A "buy low" configuration sets value_weight high and
-    #: momentum_weight low — value becomes the lead metric, momentum a secondary
-    #: one that still shows on every result. Both scores are always computed and
-    #: stored regardless; these only decide which leads.
-    momentum_weight: Mapped[Any] = mapped_column(Ratio, nullable=False, default=1)
-    value_weight: Mapped[Any] = mapped_column(Ratio, nullable=False, default=0)
-
-    #: Weights of the five factors the *final* score blends — fundamental_value,
-    #: price_cheapness, reversal, quality, sector (see scoring.DEFAULT_FACTOR_WEIGHTS).
-    #: Fundamentals-first by default. Supersedes momentum_weight/value_weight.
-    factor_weights: Mapped[dict[str, Any] | None] = mapped_column()
-    #: Fraction of the final score a stock loses when it has no fundamentals at
-    #: all — a mild, deliberate disadvantage. 0 disables it.
+    #: Fraction of the score a stock loses when it has no fundamentals at all —
+    #: a mild, deliberate disadvantage. 0 disables it.
     fundamentals_penalty: Mapped[Any] = mapped_column(Ratio, nullable=False, default=0.1)
 
     runs: Mapped[list[ScannerRun]] = relationship(back_populates="configuration")
@@ -182,7 +169,7 @@ class ScannerResult(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     __tablename__ = "scanner_results"
     __table_args__ = (
-        Index("ix_scanner_results_run_score", "run_id", "core_score"),
+        Index("ix_scanner_results_run_score", "run_id", "primary_score"),
         #: "The newest result for each instrument" — asked by the results listing
         #: and by the rotation's top-ranked tier, both on every use. Composite and
         #: descending so the window's partition/order is satisfied by the index
@@ -199,45 +186,41 @@ class ScannerResult(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("instruments.id", ondelete="CASCADE"), nullable=False
     )
 
-    #: The score that drives this result's classification and default ranking —
-    #: a weighted blend of the momentum core and the value score per the run's
-    #: configuration. In a momentum-primary run this equals core_score; in a
-    #: value-primary ("buy low") run it is value-led.
+    #: The absolute 0-100 score: a weighted blend of the five groups below, over
+    #: whichever of them could be measured. Drives classification, ranking, the
+    #: rotation's top tier and the strategy universe. The only score there is.
     primary_score: Mapped[Any] = mapped_column(Ratio, nullable=False, default=0)
 
-    #: The 100-point momentum core score and its per-category breakdown.
-    core_score: Mapped[Any] = mapped_column(Ratio, nullable=False)
-    trend_score: Mapped[Any] = mapped_column(Ratio, nullable=False)
-    momentum_score: Mapped[Any] = mapped_column(Ratio, nullable=False)
-    risk_score: Mapped[Any] = mapped_column(Ratio, nullable=False)
-    liquidity_score: Mapped[Any] = mapped_column(Ratio, nullable=False)
-    positioning_score: Mapped[Any] = mapped_column(Ratio, nullable=False)
-    #: Health of the instrument's own sector (via its sector-ETF proxy). Nullable
-    #: for rows written before the sector category existed.
-    sector_score: Mapped[Any | None] = mapped_column(Ratio)
-    #: Two of the five factors the *final* (primary) score blends: how strongly
-    #: the instrument is turning up, and how sound the business is. The other
-    #: three reuse fundamental_value_score / price_value_score / sector_score.
-    reversal_score: Mapped[Any | None] = mapped_column(Ratio)
-    quality_score: Mapped[Any | None] = mapped_column(Ratio)
-    #: Insider (SEC Form 4) activity, 0-100 with 50 neutral. Null when the
+    # -- The five groups behind that score, each 0-100 ----------------------
+    #
+    # NULL means the group could not be measured at all, and is materially
+    # different from 0: `combine_score` drops a null group *together with its
+    # weight*, so absence is neutral. Storing 0 or a "neutral" 50 here would make
+    # the breakdown disagree with the score it exists to explain.
+
+    #: Intrinsic value — Graham margin of safety, earnings yield, P/B, PEG,
+    #: dividend yield. Null for anything with no fundamentals.
+    fundamental_value_score: Mapped[Any | None] = mapped_column(Ratio)
+    #: Price cheapness against the instrument's own year — pullback from the
+    #: high, position in range, discount to the 200-day average.
+    price_value_score: Mapped[Any | None] = mapped_column(Ratio)
+    #: Insider (SEC Form 4) buying, 0-100 with 50 neutral. Null when the
     #: instrument had no qualifying filings in the window — the common case, and
     #: distinct from 50, which would mean "filings exist and they net to nothing".
     insider_score: Mapped[Any | None] = mapped_column(Ratio)
-    #: Fraction of the final score removed for insider selling (0..0.30). Stored
-    #: so a mark-down is explainable rather than an unexplained drop in rank.
+    #: Business and market soundness — margins, growth and leverage, blended
+    #: with the risk and liquidity readings.
+    quality_score: Mapped[Any | None] = mapped_column(Ratio)
+    #: Health of the instrument's own sector, via its sector-ETF proxy. Null when
+    #: the instrument is untagged or its sector has no proxy series.
+    sector_score: Mapped[Any | None] = mapped_column(Ratio)
+
+    #: Fraction of the score removed for insider selling (0..0.40). A penalty
+    #: rather than a group, so it only ever subtracts. Stored so a mark-down is
+    #: explainable rather than an unexplained drop in rank.
     insider_sell_penalty: Mapped[Any | None] = mapped_column(Ratio)
 
-    #: Separate, optional. Never gates the core score (§6, acceptance 7).
-    fundamental_score: Mapped[Any | None] = mapped_column(Ratio)
-
-    #: The valuation lens (0-100): how *cheap* the instrument looks, computed
-    #: alongside the momentum core and never folded into it. High = potentially
-    #: undervalued (pulled back, low in range, below its average, oversold, and
-    #: where fundamentals exist, cheap on earnings/book/yield).
-    value_score: Mapped[Any | None] = mapped_column(Ratio)
-    price_value_score: Mapped[Any | None] = mapped_column(Ratio)
-    fundamental_value_score: Mapped[Any | None] = mapped_column(Ratio)
+    #: The explanations behind the two valuation groups, for the detail panel.
     value_signals: Mapped[dict[str, Any] | None] = mapped_column()
 
     # Indexed via the explicit Index in __table_args__; no column-level

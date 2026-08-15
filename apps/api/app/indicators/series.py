@@ -40,6 +40,23 @@ class PriceSeries:
     def has_at_least(self, bars: int) -> bool:
         return self.length >= bars
 
+    def head(self, bars: int) -> PriceSeries:
+        """The first `bars` bars — everything known as of that point in time.
+
+        Exists for the backtest, and it is the single mechanism that keeps it
+        honest: a decision taken at bar *i* is computed from `head(i + 1)`, so
+        no indicator can see a price that had not happened yet. Slicing numpy
+        views is free, so replaying a 400-bar series costs no copying.
+        """
+        return PriceSeries(
+            open=self.open[:bars],
+            high=self.high[:bars],
+            low=self.low[:bars],
+            close=self.close[:bars],
+            adjusted_close=self.adjusted_close[:bars],
+            volume=self.volume[:bars],
+        )
+
     @property
     def preferred_close(self) -> FloatArray:
         """Adjusted close where every bar has one, else raw close.

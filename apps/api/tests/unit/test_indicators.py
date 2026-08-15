@@ -230,6 +230,78 @@ class TestCorrelation:
         assert ind.rolling_correlation(a, flat, 5) is None
 
 
+class TestAnchoredVWAP:
+    def test_a_constant_price_series_averages_to_that_price(self) -> None:
+        flat = np.full(10, 50.0)
+        assert ind.anchored_vwap(flat, flat, flat, np.full(10, 100.0), 0) == pytest.approx(50.0)
+
+    def test_it_weights_by_volume_not_by_bar(self) -> None:
+        # Typical price is (h+l+c)/3, so with h=l=c it is the close itself.
+        # Bars at 10 and 20, but the 20 traded four times the volume:
+        # (10*100 + 20*400) / 500 = 18, not the unweighted 15.
+        closes = np.array([10.0, 20.0])
+        volumes = np.array([100.0, 400.0])
+        assert ind.anchored_vwap(closes, closes, closes, volumes, 0) == pytest.approx(18.0)
+
+    def test_it_uses_the_typical_price_of_each_bar(self) -> None:
+        # (12 + 6 + 9) / 3 = 9.
+        highs, lows, closes = np.array([12.0]), np.array([6.0]), np.array([9.0])
+        assert ind.anchored_vwap(highs, lows, closes, np.array([100.0]), 0) == pytest.approx(9.0)
+
+    def test_the_anchor_excludes_earlier_bars(self) -> None:
+        closes = np.array([1.0, 1.0, 20.0])
+        volumes = np.full(3, 100.0)
+        assert ind.anchored_vwap(closes, closes, closes, volumes, 2) == pytest.approx(20.0)
+
+    def test_none_when_nothing_traded(self) -> None:
+        # No volume means no average price *paid*; 0.0 would be a fabrication.
+        flat = np.full(5, 50.0)
+        assert ind.anchored_vwap(flat, flat, flat, np.zeros(5), 0) is None
+
+    def test_none_when_the_anchor_is_out_of_range(self) -> None:
+        flat = np.full(5, 50.0)
+        assert ind.anchored_vwap(flat, flat, flat, np.full(5, 10.0), 9) is None
+
+
+class TestLowestCloseIndex:
+    def test_it_finds_the_trough(self) -> None:
+        assert ind.lowest_close_index(np.array([10.0, 3.0, 8.0]), 3) == 1
+
+    def test_it_indexes_the_whole_array_not_the_window(self) -> None:
+        # The global low is at 0 but outside a 3-bar window; the windowed low is
+        # the 2.0 at index 3, and the index returned must be usable directly.
+        closes = np.array([1.0, 9.0, 8.0, 2.0, 7.0])
+        assert ind.lowest_close_index(closes, 3) == 3
+
+    def test_none_on_empty_input(self) -> None:
+        assert ind.lowest_close_index(np.array([]), 10) is None
+
+
+class TestBeta:
+    def test_beta_against_itself_is_one(self) -> None:
+        a = np.array([0.01, -0.02, 0.03, -0.01, 0.02])
+        assert ind.beta(a, a, 5) == pytest.approx(1.0)
+
+    def test_beta_of_a_doubled_series_is_two(self) -> None:
+        # Same shape, twice the amplitude: correlation 1, twice the deviation.
+        b = np.array([0.01, -0.02, 0.03, -0.01, 0.02])
+        assert ind.beta(b * 2, b, 5) == pytest.approx(2.0)
+
+    def test_beta_is_negative_when_the_series_move_against_each_other(self) -> None:
+        b = np.array([0.01, -0.02, 0.03, -0.01, 0.02])
+        assert ind.beta(-b, b, 5) == pytest.approx(-1.0)
+
+    def test_beta_none_when_the_reference_is_flat(self) -> None:
+        # No benchmark variance means the regression slope is undefined — the
+        # answer is "unknown", never 0.0.
+        a = np.array([0.01, -0.02, 0.03, -0.01, 0.02])
+        assert ind.beta(a, np.zeros(5), 5) is None
+
+    def test_beta_none_when_insufficient_history(self) -> None:
+        a = np.array([0.01, -0.02, 0.03])
+        assert ind.beta(a, a, 60) is None
+
+
 class TestSlope:
     def test_rising_average_has_positive_slope(self) -> None:
         closes = np.arange(1.0, 60.0)  # steadily rising

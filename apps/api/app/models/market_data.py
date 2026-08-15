@@ -20,6 +20,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -179,6 +180,31 @@ class FundamentalSnapshot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     profit_margin: Mapped[Decimal | None] = mapped_column(Ratio)
     debt_to_equity: Mapped[Decimal | None] = mapped_column(Ratio)
     currency: Mapped[str | None] = mapped_column(String(3))
+
+    # -- Cash-flow and balance-sheet items ----------------------------------
+    # The inputs a discounted cash flow needs. Ingested and stored ahead of any
+    # DCF being built, deliberately: the free-tier coverage of these fields is
+    # the thing that decides whether a DCF is worth building at all, and the
+    # only way to know it is to accumulate the data and look.
+    #
+    # Absolute amounts are denominated in `currency` (the company's reporting
+    # currency, which for a UK listing is often not GBP). Ratios are unitless.
+    free_cash_flow: Mapped[Decimal | None] = mapped_column(Money)
+    operating_cash_flow: Mapped[Decimal | None] = mapped_column(Money)
+    total_debt: Mapped[Decimal | None] = mapped_column(Money)
+    total_cash: Mapped[Decimal | None] = mapped_column(Money)
+    #: Not `Quantity`. That is Numeric(18, 8), which holds ten digits before the
+    #: point — and a mega-cap's share count exceeds it (Apple's ~14.6bn is
+    #: 1.46e10). The overflow is a hard database error rather than a rounding, so
+    #: it would have taken out the enrichment sweep for exactly the largest and
+    #: most-wanted companies. Widened to 24 digits, keeping 8 dp for the
+    #: fractional-share convention used everywhere else.
+    shares_outstanding: Mapped[Decimal | None] = mapped_column(Numeric(24, 8))
+    ebitda: Mapped[Decimal | None] = mapped_column(Money)
+    enterprise_value: Mapped[Decimal | None] = mapped_column(Money)
+    book_value_per_share: Mapped[Decimal | None] = mapped_column(Price)
+    return_on_equity: Mapped[Decimal | None] = mapped_column(Ratio)
+    current_ratio: Mapped[Decimal | None] = mapped_column(Ratio)
 
     retrieved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 

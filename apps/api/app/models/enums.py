@@ -89,6 +89,11 @@ class ProviderKind(StrEnum):
     YFINANCE = "yfinance"
     TWELVE_DATA = "twelve_data"
     EODHD = "eodhd"
+    #: News headlines for the sentiment signal. Never a source of candles or
+    #: quotes, so it is absent from the market-data provider chains — it appears
+    #: here so its spend has a row in the credit ledger like every other
+    #: metered source.
+    FINNHUB = "finnhub"
     MOCK = "mock"
 
 
@@ -221,44 +226,6 @@ class HaltScope(StrEnum):
     GLOBAL = "global"
     INSTRUMENT = "instrument"
     STRATEGY = "strategy"
-
-
-class StrategyKind(StrEnum):
-    """The trading strategy (§8). Long-only.
-
-    One member, deliberately. Trend-following and pie-rebalancing were removed
-    once the product settled on a single approach — the scanner decides *what*
-    is worth owning and mean reversion decides *when*. Carrying two unused
-    strategies meant two sets of parameters that were never tuned, two paths
-    through the engine that were never exercised in anger, and a strategies
-    screen that implied a choice nobody was making.
-    """
-
-    #: Daily mean reversion over the scanner's top-ranked names. Renamed from
-    #: `sp500_mean_reversion`: the strategy is index-agnostic, and a kind naming
-    #: an index it must not trade is a trap for whoever reads it next.
-    MEAN_REVERSION = "mean_reversion"
-
-
-class StrategyRunStatus(StrEnum):
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
-
-
-class StrategyDecisionOutcome(StrEnum):
-    """What became of one strategy signal.
-
-    A signal is not a trade: it becomes a proposal, which the risk engine can
-    still refuse. Recording the outcome makes "the strategy wanted to, but the
-    risk engine said no" visible rather than silent.
-    """
-
-    SIGNALLED = "signalled"  # produced, no proposal yet
-    PROPOSED = "proposed"  # a proposal was created, awaiting approval
-    EXECUTED = "executed"  # proposal was executed on the paper venue
-    REJECTED_BY_RISK = "rejected_by_risk"  # the risk engine refused it
-    SKIPPED = "skipped"  # duplicate / already held / no action needed
 
 
 class AuditEventKind(StrEnum):

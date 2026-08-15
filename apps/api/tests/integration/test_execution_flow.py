@@ -15,7 +15,8 @@ import pytest
 from sqlalchemy import select
 
 from app.broker.internal_paper import InternalPaperBroker
-from app.models.enums import HaltKind, HaltScope, OrderType, TradeIntentStatus
+from app.models.audit import AuditEvent
+from app.models.enums import AuditEventKind, HaltKind, HaltScope, OrderType, TradeIntentStatus
 from app.models.instrument import Instrument
 from app.models.risk import RiskConfiguration, TradeIntent
 from app.models.scanner import ProposalStatus, ScannerResult
@@ -104,6 +105,72 @@ class TestHappyPath:
             .all()
         )
         assert len(intents) == 1
+
+
+class TestRiskEvaluationIsRecorded:
+    """The sizing verdict has to outlive the decision object.
+
+    `RiskDecision` is transient. Without a record there is no way to tune the
+    caps against evidence, and no way to answer "why was this position this
+    size?" once the numbers that produced it are gone.
+    """
+
+    async def test_an_approved_intent_carries_the_verdict(
+        self, db: object, candled_instrument: Instrument, approver: uuid.UUID
+    ) -> None:
+        await _seed_config(db)
+        proposal = await _proposal_id(db, candled_instrument, approver)
+
+        await ExecutionService(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).execute_approved(proposal, actor_user_id=approver)
+        await db.commit()  # type: ignore[attr-defined]
+
+        intent = (
+            await db.execute(  # type: ignore[attr-defined]
+                select(TradeIntent).where(TradeIntent.proposal_id == proposal.id)
+            )
+        ).scalar_one()
+        record = intent.risk_evaluation
+        assert record is not None
+        # Which cap bound it is the whole point of keeping this.
+        assert record["applied_caps"]
+        assert record["rejected"] is False
+        assert record["regime_factor"] is not None
+        for key in ("correlation", "rate_correlation", "stress_loss_pct"):
+            assert key in record
+
+    async def test_a_rejection_records_the_verdict_in_the_audit_log(
+        self, db: object, candled_instrument: Instrument, approver: uuid.UUID
+    ) -> None:
+        """A rejection writes no intent, so the audit payload is the only home."""
+        await _seed_config(db)
+        proposal = await _proposal_id(db, candled_instrument, approver)
+        await HaltService(db).activate(  # type: ignore[arg-type]
+            HaltKind.KILL_SWITCH, "stop everything", scope=HaltScope.GLOBAL, actor_user_id=approver
+        )
+        await db.commit()  # type: ignore[attr-defined]
+
+        await ExecutionService(
+            db,  # type: ignore[arg-type]
+            broker=InternalPaperBroker(db),  # type: ignore[arg-type]
+        ).execute_approved(proposal, actor_user_id=approver)
+        await db.commit()  # type: ignore[attr-defined]
+
+        event = (
+            (
+                await db.execute(  # type: ignore[attr-defined]
+                    select(AuditEvent).where(AuditEvent.kind == AuditEventKind.ORDER_REJECTED)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        assert event is not None
+        assert event.payload is not None
+        assert event.payload["rejected"] is True
+        assert event.payload["reason"]
 
 
 class TestRiskRefusal:

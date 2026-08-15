@@ -464,6 +464,7 @@ function AuditSection({ events }: { events: AuditEvent[] }) {
 
 /* -- Scanner ------------------------------------------------------------- */
 
+
 function ScannerSection({
   enabled,
   onChange,

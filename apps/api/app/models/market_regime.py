@@ -54,6 +54,12 @@ class MarketRegimeSnapshot(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     world_uptrend: Mapped[bool | None] = mapped_column(Boolean)
     #: S&P proxy's distance from its own 200-day average, as a fraction.
     sp500_vs_200dma: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    #: ICE BofA US high-yield option-adjusted spread, in percentage points.
+    #: Credit reprices ahead of equity, and on a timescale sizing can act on.
+    credit_spread: Mapped[Decimal | None] = mapped_column(Numeric(8, 3))
+    #: Annualised 20-day realised volatility of the S&P proxy, as a fraction.
+    #: VIX is what the market expects; this is what actually happened.
+    sp500_realised_vol: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
 
     # -- Context: alerted on, deliberately excluded from the risk factor ------
     #: 10-year minus 2-year Treasury yield. Negative is an inversion.

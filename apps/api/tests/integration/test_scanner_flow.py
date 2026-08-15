@@ -132,7 +132,7 @@ class TestExploreExploit:
     """The rotation guarantees the best band is re-scored, then explores."""
 
     async def _scored(
-        self, db: AsyncSession, ticker: str, primary: float, core: float, days_ago: int = 0
+        self, db: AsyncSession, ticker: str, primary: float, days_ago: int = 0
     ) -> Instrument:
         """An instrument with candles and one scanner result at a given age."""
         from app.models.scanner import ScannerResult, ScannerRun, ScannerRunStatus
@@ -179,12 +179,6 @@ class TestExploreExploit:
             run_id=run.id,
             instrument_id=inst.id,
             primary_score=Decimal(str(primary)),
-            core_score=Decimal(str(core)),
-            trend_score=Decimal("50"),
-            momentum_score=Decimal("50"),
-            risk_score=Decimal("50"),
-            liquidity_score=Decimal("50"),
-            positioning_score=Decimal("50"),
             classification=Classification.DOES_NOT_PASS,
             data_completeness=Decimal("1"),
             confidence=Decimal("1"),
@@ -196,15 +190,16 @@ class TestExploreExploit:
         await db.flush()
         return inst
 
-    async def test_ranks_by_primary_score_not_the_momentum_core(self, db: AsyncSession) -> None:
+    async def test_the_top_tier_is_ordered_by_the_score(self, db: AsyncSession) -> None:
         """The tier re-verifying "the best" must use the score that defines best.
 
-        Ordering by `core_score` — as this did — sorted the re-check tier by a
-        different number than the one deciding the ranking and the strategy's
-        universe.
+        This once ordered by `core_score`, the discarded momentum reading, so the
+        re-check tier sorted by a different number from the one deciding the
+        ranking and the strategy's universe. There is only one score now, which
+        is what makes that class of mistake unavailable rather than merely fixed.
         """
-        good = await self._scored(db, "GOODPRI", primary=90, core=10)
-        other = await self._scored(db, "HIGHCORE", primary=20, core=99)
+        good = await self._scored(db, "GOODPRI", primary=90)
+        other = await self._scored(db, "LOWSCORE", primary=20)
         await db.commit()
 
         top = await _top_ranked_ids(db, 1)
@@ -227,12 +222,6 @@ class TestExploreExploit:
             run_id=run.id,
             instrument_id=inst.id,
             primary_score=Decimal(str(primary)),
-            core_score=Decimal("50"),
-            trend_score=Decimal("50"),
-            momentum_score=Decimal("50"),
-            risk_score=Decimal("50"),
-            liquidity_score=Decimal("50"),
-            positioning_score=Decimal("50"),
             classification=Classification.DOES_NOT_PASS,
             data_completeness=Decimal("1"),
             confidence=Decimal("1"),
@@ -251,9 +240,9 @@ class TestExploreExploit:
         instrument ever had, so re-scanning it could never demote it — it would
         occupy an exploit slot forever on the strength of one good night.
         """
-        faded = await self._scored(db, "FADED", primary=95, core=50, days_ago=21)
+        faded = await self._scored(db, "FADED", primary=95, days_ago=21)
         await self._add_result(db, faded, primary=10, days_ago=0)
-        steady = await self._scored(db, "STEADY", primary=60, core=50, days_ago=0)
+        steady = await self._scored(db, "STEADY", primary=60, days_ago=0)
         await db.commit()
 
         top = await _top_ranked_ids(db, 5)
@@ -459,16 +448,24 @@ class TestSectorContext:
                 select(ScannerResult).where(ScannerResult.instrument_id == scannable_instrument.id)
             )
         ).scalar_one()
-        # The sector category was computed from the proxy (not the neutral midpoint),
-        # and the relative-strength-vs-sector signal was recorded.
+        # The sector group was computed from the proxy, on the same 0-100 scale
+        # as every other group column, and the relative-strength-vs-sector
+        # reading was recorded as an (unscored) metric.
         assert result.sector_score is not None
+        assert 0 <= float(result.sector_score) <= 100
         assert "relative_momentum_vs_sector_12m" in (result.metrics or {})
 
-    async def test_untagged_instrument_sector_is_neutral(
+    async def test_untagged_instrument_has_no_sector_score(
         self, db: AsyncSession, scannable_instrument: Instrument
     ) -> None:
-        # No sector tag and no proxy → the sector category is the neutral midpoint
-        # (half of its 20-point weight), never a penalty.
+        """No tag and no proxy → null, and null is not a low score.
+
+        The group drops out of the blend along with its weight, so the stock is
+        neither rewarded nor punished on an axis nobody could measure for it.
+        This column used to hold category *points* (max 20) and stored 10.0 here
+        — a number that read as a poor sector score beside neighbours running to
+        100, when it actually meant "no sector information at all".
+        """
         await ScannerEngine(db).run([scannable_instrument])
         await db.commit()
 
@@ -479,7 +476,7 @@ class TestSectorContext:
                 select(ScannerResult).where(ScannerResult.instrument_id == scannable_instrument.id)
             )
         ).scalar_one()
-        assert float(result.sector_score) == 10.0
+        assert result.sector_score is None
 
 
 class TestScanning:
@@ -498,12 +495,16 @@ class TestScanning:
             )
         ).scalar_one()
 
-        assert 0 <= float(result.core_score) <= 100
+        assert 0 <= float(result.primary_score) <= 100
         assert result.candles_used > 200
         # Provenance is populated, not null.
         assert result.confidence is not None
         assert result.data_completeness is not None
         assert result.positive_signals is not None
+        # Trend and momentum are still measured, just never scored — they are
+        # the results table's context, and the strategy's business.
+        assert "sma200_slope" in (result.metrics or {})
+        assert "return_12m" in (result.metrics or {})
 
     async def test_scan_updates_last_scanned_at(
         self, db: AsyncSession, scannable_instrument: Instrument

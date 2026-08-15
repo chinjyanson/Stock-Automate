@@ -37,9 +37,11 @@ app = Celery(
         "worker.jobs.market_data",
         "worker.jobs.scanner",
         "worker.jobs.risk",
-        "worker.jobs.strategy",
         "worker.jobs.backfill",
         "worker.jobs.market_regime",
+        "worker.jobs.crash_overlay",
+        "worker.jobs.index_options",
+        "worker.jobs.sentiment",
     ],
 )
 
@@ -81,12 +83,43 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=21, minute=30),
         "options": {"expires": 7200},
     },
+    # Ahead of everything else in the evening chain, because it is the slowest
+    # and the most likely to be cut short: it is rate-limited to roughly a call
+    # a second and stops when its daily budget is spent. Starting it first means
+    # a partial sweep still lands before the scan reads the table at 22:00.
+    "sweep-sentiment": {
+        "task": "worker.jobs.sentiment.sweep_sentiment",
+        "schedule": crontab(hour=20, minute=30),
+        "options": {"expires": 5400},
+    },
+    # Before the regime measurement, so the day's index picture — dealer gamma,
+    # skew, at-the-money implied vol — is complete before anything reads it.
+    #
+    # This is the one job in the schedule whose missed runs are unrecoverable.
+    # An option chain is published for today and per-strike open interest is
+    # gone once the day passes, so there is no backfill: a night this does not
+    # run is a permanent hole in the series. Everything else here is idempotent
+    # and self-healing; this is a recorder, and the only thing it can do is not
+    # miss. Run before the close-dependent jobs so a late failure downstream
+    # cannot take it with them.
+    "measure-index-options": {
+        "task": "worker.jobs.index_options.measure_index_options",
+        "schedule": crontab(hour=21, minute=40),
+        "options": {"expires": 3600},
+    },
     # Before the scan, so the day's risk posture is measured from fresh candles
     # and is already in place when the risk engine sizes anything tonight.
     "measure-market-regime": {
         "task": "worker.jobs.market_regime.measure_market_regime",
         "schedule": crontab(hour=21, minute=50),
         "options": {"expires": 3600},
+    },
+    # After the regime reading, and late enough that the index close is settled.
+    # Long expiry because the nightly refit walks two decades of history.
+    "measure-crash-overlay": {
+        "task": "worker.jobs.crash_overlay.measure_crash_overlay",
+        "schedule": crontab(hour=22, minute=10),
+        "options": {"expires": 7200},
     },
     # After the candle refresh, so the scan reads fresh data. The rotation caps
     # itself per §6, so this covers the universe over successive days.
@@ -123,27 +156,6 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=22, minute=15),
         "options": {"expires": 7200},
     },
-    # Intraday data for the 15-minute strategy. The window spans the London open
-    # (07:00 UTC) to the US close (21:00 UTC) because the intraday universe is
-    # LSE-listed: at the previous "14-21" it covered only the last ~75 minutes of
-    # the London session, so the strategy slept through the open — where
-    # mean-reversion setups most often appear. Per §13 this is still one
-    # hard-coded window rather than a per-exchange schedule; it is a union of the
-    # sessions we trade, and the union grows if a new venue is added.
-    # A no-op when no intraday provider is configured.
-    "refresh-intraday-candles": {
-        "task": "worker.jobs.market_data.refresh_intraday_candles",
-        "schedule": crontab(minute="*/15", hour="7-21"),
-        "options": {"expires": 900},
-    },
-    # Intraday strategies evaluate right after their data refreshes, over the
-    # same window — evaluating outside it would only re-read stale bars.
-    "evaluate-intraday-strategies": {
-        "task": "worker.jobs.strategy.evaluate_strategies",
-        "schedule": crontab(minute="2-59/15", hour="7-21"),
-        "kwargs": {"interval": "15m"},
-        "options": {"expires": 900},
-    },
     # Insider filings, hourly through the US session and a little beyond. EDGAR
     # publishes Form 4s within minutes, and the scanner reads whatever has
     # landed by 22:00 — so this only has to keep the store roughly current, not
@@ -157,18 +169,7 @@ app.conf.beat_schedule = {
     # the scanner's current top names. Order matters — ranking from a scan that
     # has not finished would hand the strategy yesterday's list, and syncing after
     # the evaluation would delay every change by a full day.
-    "sync-strategy-universe": {
-        "task": "worker.jobs.strategy.sync_strategy_universe",
-        "schedule": crontab(hour=22, minute=10),
-        "options": {"expires": 3600},
-    },
     # Daily strategies evaluate once, after the daily candle refresh and scan.
-    "evaluate-daily-strategies": {
-        "task": "worker.jobs.strategy.evaluate_strategies",
-        "schedule": crontab(hour=22, minute=30),
-        "kwargs": {"interval": "1d"},
-        "options": {"expires": 7200},
-    },
     # Live loss guard: frequent, local, and cheap — auto-disarms and halts if the
     # day's realised live loss breaches the affirmed ceiling. No-op when unarmed.
     "live-guard": {

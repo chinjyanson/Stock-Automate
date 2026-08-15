@@ -1,6 +1,6 @@
 """Market-wide risk posture: measure it, and turn it into one number (§9).
 
-Five inputs, split by how fast they move — which decides what each is allowed to
+Seven inputs, split by how fast they move — which decides what each is allowed to
 do:
 
   **Fast — these scale risk.**
@@ -9,6 +9,12 @@ do:
       Computed from the local candle store, so it costs one query and no
       provider call. Breadth rolls over before an index does.
     * `Index regime`, the 50/200 crossover on an S&P and a world proxy.
+    * `Realised volatility`, the annualised 20-day move of the S&P proxy. VIX is
+      what the market *expects*; this is what happened. A slow, orderly decline
+      can leave VIX untroubled while the tape plainly deteriorates.
+    * `Credit spread`, the high-yield option-adjusted spread from FRED. Credit
+      reprices ahead of equity, and unlike the yield curve below it moves on a
+      timescale a position size can actually respond to.
 
   **Context — recorded and alerted on, never gating.**
     * `Yield curve` (10y-2y, 10y-3m) from FRED. Genuine recession signal, but
@@ -39,7 +45,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.data.store import CandleStore
 from app.indicators import functions as ind
-from app.indicators.series import candles_to_series
+from app.indicators.series import PriceSeries, candles_to_series
 from app.models.enums import Interval
 from app.models.instrument import Exchange, Instrument
 from app.models.market_regime import MarketRegimeSnapshot
@@ -58,11 +64,32 @@ _WORLD_PROXIES = (("IWDA", "XLON"), ("IWDA", "XAMS"), ("VWRL", "XAMS"), ("ACWI",
 #: keep trading through a downturn, not to sit it out.
 MIN_RISK_FACTOR = 0.55
 
-#: Deductions from a starting factor of 1.0. Deliberately modest: three
-#: simultaneous risk-off signals reach the floor, any one alone barely registers.
+#: Deductions from a starting factor of 1.0. Deliberately modest: **four**
+#: simultaneous full risk-off signals reach the floor, any one alone barely
+#: registers.
+#:
+#: Four, not the original three, because there are now six signals rather than
+#: four. Adding credit spreads and realised volatility at the old cut sizes
+#: would have made the floor markedly easier to reach — two full breaches plus
+#: two mild ones would have got there — which is a quietly more defensive system
+#: than the one that was tuned and tested. The cuts were shrunk to hold the
+#: overall posture roughly where it was while giving the new inputs a real vote.
+#: A consequence worth knowing: the original four signals alone can no longer
+#: floor the factor (3 full + 1 mild = 0.42, leaving 0.58). That is intended —
+#: four of six confirming is the bar now.
 _VIX_ELEVATED, _VIX_HIGH = 20.0, 30.0
 _BREADTH_WEAK, _BREADTH_POOR = 0.45, 0.30
-_CUT_MILD, _CUT_FULL = 0.07, 0.15
+#: ICE BofA US high-yield option-adjusted spread, in percentage points. Credit
+#: reprices before equity does, and unlike the yield curve it moves on a
+#: timescale a position size can respond to.
+_CREDIT_WIDE, _CREDIT_STRESSED = 5.5, 8.0
+#: Annualised 20-day realised volatility of the S&P proxy. VIX is the market's
+#: *expectation*; this is what actually happened. They diverge exactly when it
+#: matters — a calm VIX during a grinding selloff is the case this catches.
+_RVOL_ELEVATED, _RVOL_HIGH = 0.20, 0.30
+#: Window for the realised-volatility read.
+_RVOL_WINDOW = 20
+_CUT_MILD, _CUT_FULL = 0.06, 0.12
 
 
 @dataclass(slots=True)
@@ -74,6 +101,8 @@ class RegimeReading:
     sp500_uptrend: bool | None = None
     world_uptrend: bool | None = None
     sp500_vs_200dma: float | None = None
+    credit_spread: float | None = None
+    sp500_realised_vol: float | None = None
     yield_curve_10y2y: float | None = None
     yield_curve_10y3m: float | None = None
     buffett_indicator: float | None = None
@@ -92,8 +121,15 @@ class MarketRegimeService:
 
         reading.vix = await self._vix()
         reading.breadth, reading.breadth_sample = await self._breadth()
-        reading.sp500_uptrend, reading.sp500_vs_200dma = await self._regime(_SP500_PROXIES)
-        reading.world_uptrend, _ = await self._regime(_WORLD_PROXIES)
+        # The S&P proxy series is reused for realised volatility rather than
+        # loaded twice — it is the same candles answering a second question.
+        reading.sp500_uptrend, reading.sp500_vs_200dma, sp500_series = await self._regime(
+            _SP500_PROXIES
+        )
+        reading.world_uptrend, _, _ = await self._regime(_WORLD_PROXIES)
+        if sp500_series is not None:
+            reading.sp500_realised_vol = ind.annualised_volatility(sp500_series.close, _RVOL_WINDOW)
+        reading.credit_spread = await self._fred("BAMLH0A0HYM2")
         reading.yield_curve_10y2y = await self._fred("T10Y2Y")
         reading.yield_curve_10y3m = await self._fred("T10Y3M")
         reading.buffett_indicator = await self._buffett()
@@ -107,10 +143,11 @@ class MarketRegimeService:
     def _score(reading: RegimeReading) -> None:
         """Reduce the fast signals to a risk multiplier.
 
-        Only VIX, breadth and index trend participate. The yield curve and the
-        Buffett indicator are read and alerted on but excluded on purpose: both
-        sit at extremes for years at a time, and a multiplier driven by them
-        would be permanently depressed rather than responsive.
+        VIX, breadth, index trend, realised volatility and credit spreads
+        participate. The yield curve and the Buffett indicator are read and
+        alerted on but excluded on purpose: both sit at extremes for years at a
+        time, and a multiplier driven by them would be permanently depressed
+        rather than responsive.
 
         A missing input contributes nothing rather than a penalty — a failed
         provider call must not look like a risk-off signal.
@@ -140,6 +177,22 @@ class MarketRegimeService:
         if reading.world_uptrend is False:
             factor -= _CUT_MILD
             reasons.append("world index below its 200-day average")
+
+        if reading.credit_spread is not None:
+            if reading.credit_spread >= _CREDIT_STRESSED:
+                factor -= _CUT_FULL
+                reasons.append(f"high-yield spread {reading.credit_spread:.1f}% (stressed)")
+            elif reading.credit_spread >= _CREDIT_WIDE:
+                factor -= _CUT_MILD
+                reasons.append(f"high-yield spread {reading.credit_spread:.1f}% (wide)")
+
+        if reading.sp500_realised_vol is not None:
+            if reading.sp500_realised_vol >= _RVOL_HIGH:
+                factor -= _CUT_FULL
+                reasons.append(f"realised volatility {reading.sp500_realised_vol:.0%} (high)")
+            elif reading.sp500_realised_vol >= _RVOL_ELEVATED:
+                factor -= _CUT_MILD
+                reasons.append(f"realised volatility {reading.sp500_realised_vol:.0%} (elevated)")
 
         reading.risk_factor = max(MIN_RISK_FACTOR, round(factor, 4))
         reading.reasons = reasons
@@ -196,8 +249,12 @@ class MarketRegimeService:
 
     async def _regime(
         self, proxies: tuple[tuple[str, str], ...]
-    ) -> tuple[bool | None, float | None]:
-        """50/200 crossover state for the first proxy with enough history."""
+    ) -> tuple[bool | None, float | None, PriceSeries | None]:
+        """50/200 crossover state for the first proxy with enough history.
+
+        Returns the series it used alongside the verdict, so a caller wanting a
+        second statistic from the same candles does not reload them.
+        """
         store = CandleStore(self._session)
         for ticker, mic in proxies:
             instrument = (
@@ -224,8 +281,8 @@ class MarketRegimeService:
             if ma50 is None or ma200 is None or ma200 <= 0:
                 continue
             last = float(series.close[-1])
-            return ma50 > ma200, last / ma200 - 1.0
-        return None, None
+            return ma50 > ma200, last / ma200 - 1.0, series
+        return None, None, None
 
     @staticmethod
     async def _vix() -> float | None:
@@ -291,6 +348,8 @@ class MarketRegimeService:
         snapshot.sp500_uptrend = reading.sp500_uptrend
         snapshot.world_uptrend = reading.world_uptrend
         snapshot.sp500_vs_200dma = _dec(reading.sp500_vs_200dma)
+        snapshot.credit_spread = _dec(reading.credit_spread)
+        snapshot.sp500_realised_vol = _dec(reading.sp500_realised_vol)
         snapshot.yield_curve_10y2y = _dec(reading.yield_curve_10y2y)
         snapshot.yield_curve_10y3m = _dec(reading.yield_curve_10y3m)
         snapshot.buffett_indicator = _dec(reading.buffett_indicator)

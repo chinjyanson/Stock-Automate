@@ -90,8 +90,20 @@ class ExecutionService:
         self._broker_kind: BrokerKind = self._configured_kind or BrokerKind.TRADING212_DEMO
 
     async def execute_approved(
-        self, proposal: TradeProposal, *, actor_user_id: uuid.UUID | None = None
+        self,
+        proposal: TradeProposal,
+        *,
+        actor_user_id: uuid.UUID | None = None,
+        capital_ceiling: Decimal | None = None,
     ) -> TradeProposal:
+        """Size and fill an approved proposal.
+
+        `capital_ceiling` bounds the equity this order sizes against — the
+        calling strategy's share of the account when the capital is split
+        between sleeves. It composes with the live ceiling rather than replacing
+        it: the smaller of the two wins, so a sleeve limit can never widen what
+        live trading permits.
+        """
         # Idempotency comes first: a proposal that already has a live intent has
         # been acted on (possibly reaching EXECUTED), so a retry must return what
         # exists rather than tripping the status check or submitting again.
@@ -139,7 +151,7 @@ class ExecutionService:
 
         broker = self._injected_broker or resolve_broker(self._broker_kind, session=self._session)
         try:
-            return await self._execute(proposal, instrument, broker, actor_user_id)
+            return await self._execute(proposal, instrument, broker, actor_user_id, capital_ceiling)
         finally:
             if self._injected_broker is None:
                 await broker.close()
@@ -150,6 +162,7 @@ class ExecutionService:
         instrument: Instrument,
         broker: Broker,
         actor_user_id: uuid.UUID | None,
+        capital_ceiling: Decimal | None = None,
     ) -> TradeProposal:
         # The venue's real ticker: the instrument id for paper, the broker's own
         # spelling (via BrokerInstrument) for Trading 212. A real broker will not
@@ -163,11 +176,18 @@ class ExecutionService:
             instrument.id, Interval.D1, limit=250, closed_only=True
         )
         benchmark = (
-            await self._benchmark_candles(config.correlation_benchmark_symbol) if config else None
+            await self._reference_candles(config.correlation_benchmark_symbol) if config else None
         )
+        rates = await self._reference_candles(config.rate_proxy_symbol) if config else None
 
         # For live, the affirmed capital ceiling bounds sizing for this session.
+        # A sleeve allocation bounds it further; the smaller of the two wins so
+        # neither can widen the other.
         equity_ceiling = await self._live_equity_ceiling()
+        if capital_ceiling is not None:
+            equity_ceiling = (
+                capital_ceiling if equity_ceiling is None else min(equity_ceiling, capital_ceiling)
+            )
 
         decision = await self._engine.evaluate(
             instrument=instrument,
@@ -176,6 +196,7 @@ class ExecutionService:
             positions=positions,
             candles=candles,
             benchmark_candles=benchmark,
+            rates_candles=rates,
             broker=self._broker_kind,
             equity_ceiling=equity_ceiling,
         )
@@ -188,7 +209,10 @@ class ExecutionService:
                 actor_kind=ActorKind.RISK_ENGINE,
                 subject_type="trade_proposal",
                 subject_id=str(proposal.id),
-                payload={"reason": decision.reason},
+                # The full verdict, not just the reason string. A rejection
+                # writes no TradeIntent, so the audit log is the only place the
+                # sizing evidence can survive.
+                payload=decision.as_record(),
             )
             log.info("execution.rejected_by_risk", proposal_id=str(proposal.id))
             return proposal
@@ -202,6 +226,7 @@ class ExecutionService:
             side=OrderSide.BUY,
             quantity=decision.approved_quantity,
             stop_price=decision.stop_price,
+            risk_evaluation=decision.as_record(),
         )
         self._session.add(intent)
         await self._session.flush()
@@ -359,12 +384,13 @@ class ExecutionService:
             .first()
         )
 
-    async def _benchmark_candles(self, symbol: str) -> list[Candle] | None:
-        """Best-effort benchmark candles for the correlation filter.
+    async def _reference_candles(self, symbol: str) -> list[Candle] | None:
+        """Best-effort candles for a correlation reference series.
 
-        Resolved by exchange ticker. Absent benchmark data disables the
-        correlation reduction (it cannot fabricate a correlation) but never
-        blocks the trade — the reduction only ever *tightens* sizing.
+        Used for both the market benchmark and the rates proxy. Resolved by
+        exchange ticker. Absent data disables that reduction (it cannot
+        fabricate a correlation) but never blocks the trade — the reduction only
+        ever *tightens* sizing.
         """
         instrument = (
             await self._session.execute(

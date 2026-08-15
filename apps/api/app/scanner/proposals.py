@@ -86,7 +86,7 @@ class ProposalService:
 
         top_signals = (result.positive_signals or {}).get("items", [])[:3]
         reason = (
-            f"Screening score {result.core_score} "
+            f"Screening score {result.primary_score} "
             f"({', '.join(top_signals) if top_signals else 'passes the configured screen'})"
         )
         return await self._propose_long(

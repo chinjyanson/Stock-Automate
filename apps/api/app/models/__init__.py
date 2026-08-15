@@ -7,6 +7,7 @@ list silently produces an empty migration.
 
 from app.models.audit import GENESIS_HASH, AuditEvent
 from app.models.base import Base, Money, Price, Quantity, Ratio
+from app.models.crash_overlay import CrashOverlayReading
 from app.models.enums import (
     ActorKind,
     AuditEventKind,
@@ -25,11 +26,9 @@ from app.models.enums import (
     PriceUnit,
     ProviderKind,
     QualityStatus,
-    StrategyDecisionOutcome,
-    StrategyKind,
-    StrategyRunStatus,
     TradeIntentStatus,
 )
+from app.models.index_options import IndexOptionsSnapshot
 from app.models.insider import InsiderTransaction
 from app.models.instrument import (
     BrokerInstrument,
@@ -69,11 +68,7 @@ from app.models.scanner import (
     ScannerRunStatus,
     TradeProposal,
 )
-from app.models.strategy import (
-    StrategyConfiguration,
-    StrategyDecision,
-    StrategyRun,
-)
+from app.models.sentiment import SentimentSnapshot
 from app.models.system import (
     BrokerCredential,
     LiveArmingSession,
@@ -94,6 +89,7 @@ __all__ = [
     "Candle",
     "Classification",
     "CorporateAction",
+    "CrashOverlayReading",
     "DailyAccountSummary",
     "DataQualityEvent",
     "DataQualityEventKind",
@@ -102,6 +98,7 @@ __all__ = [
     "FundamentalSnapshot",
     "HaltKind",
     "HaltScope",
+    "IndexOptionsSnapshot",
     "InsiderTransaction",
     "Instrument",
     "InstrumentKind",
@@ -134,12 +131,7 @@ __all__ = [
     "ScannerResult",
     "ScannerRun",
     "ScannerRunStatus",
-    "StrategyConfiguration",
-    "StrategyDecision",
-    "StrategyDecisionOutcome",
-    "StrategyKind",
-    "StrategyRun",
-    "StrategyRunStatus",
+    "SentimentSnapshot",
     "SystemSetting",
     "TradeIntent",
     "TradeIntentStatus",

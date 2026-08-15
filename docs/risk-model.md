@@ -9,10 +9,12 @@
 > execution exists too: a single Paper/Live toggle selects the venue, and live is
 > gated by `LIVE_TRADING_ENABLED` plus live credentials, bounded by the
 > persistent `max_live_capital` / `max_daily_loss` on `RiskConfiguration`, and
-> reverted to paper on a daily-loss breach. The correlation filter uses a
-> gross-exposure approximation
-> for portfolio S&P weight, noted in `app.risk.engine`, to refine when strategies
-> track per-position correlation (Phase 4).
+> reverted to paper on a daily-loss breach. The correlation filter measures
+> portfolio weight position-by-position (each holding's own correlation to the
+> reference), having replaced the earlier gross-exposure approximation, and runs
+> against two references: the benchmark and a rates proxy. `app.risk.stress`
+> adds the whole-book check — a historical bootstrap of the portfolio's 20-day
+> tail loss, enforcing `max_portfolio_drawdown_pct`.
 
 ## The central rule
 
@@ -49,7 +51,9 @@ so.
 - Maximum total open risk
 - Broker quantity restrictions (min size, step, fractional support)
 - Liquidity restrictions
-- Correlation adjustment
+- Correlation adjustment (benchmark and rates)
+- Whole-book stress drawdown
+- Total portfolio exposure
 - User-configured monetary cap
 
 The **smallest** cap wins. Quantities round *down* to the instrument's step —
@@ -70,6 +74,36 @@ and candidate_sp500_correlation > configured_threshold:
 change the order is decoration. Six "diversified" positions that are all really
 one S&P bet is the failure this prevents, and the adjustment is recorded in the
 decision explanation.
+
+The same gate runs a second time against a rates proxy (a bond *price* series,
+default IEF — never a yield index, whose inverse sign would silently reverse
+every correlation), bounded by `max_portfolio_rate_sensitive_pct`. There it
+compares on **magnitude**: a book that moves hard against yields is as much a
+rates bet as one that moves with them. When both gates fire the size is cut
+once, not twice — being concentrated in two ways is not twice as bad as being
+concentrated in one — though both reasons are recorded.
+
+## Whole-book stress
+
+Every cap above sizes a position against itself. `app.risk.stress` asks the
+portfolio-level question instead: with this candidate added, what does a bad
+month look like?
+
+```
+resample historical daily returns by date, with replacement, over 20 days
+→ 95th-percentile loss of the whole book
+→ if it exceeds max_portfolio_drawdown_pct, scale the candidate down
+```
+
+Resampling **dates** rather than each holding independently is the point: it
+preserves the correlation between holdings exactly, so a book of six positions
+that fall together is measured as one bet rather than six. There is no
+covariance matrix to estimate and no assumption that returns are normal, which
+in the tail this measures they observably are not.
+
+A book already past the limit takes no new position at all — shrinking the
+candidate cannot repair it. A book with too little history is reported as
+*unknown*, and an unknown never blocks a trade.
 
 ## Controls
 
