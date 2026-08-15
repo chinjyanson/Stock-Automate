@@ -70,9 +70,7 @@ def upgrade() -> None:
     op.drop_index("ix_scanner_results_run_score", table_name="scanner_results")
     for name, _ in _DROPPED_RESULT_COLUMNS:
         op.drop_column("scanner_results", name)
-    op.create_index(
-        "ix_scanner_results_run_score", "scanner_results", ["run_id", "primary_score"]
-    )
+    op.create_index("ix_scanner_results_run_score", "scanner_results", ["run_id", "primary_score"])
 
     # `sector_score` held category *points* (max 20) while every column beside
     # it held a 0-100 factor — a stock with no sector tag stored 10.0 and showed
@@ -99,7 +97,9 @@ def downgrade() -> None:
         # the schema agree. The 0 is a placeholder — the real values are gone.
         op.add_column(
             "scanner_results",
-            sa.Column(name, _RATIO, nullable=nullable, server_default="0" if not nullable else None),
+            sa.Column(
+                name, _RATIO, nullable=nullable, server_default="0" if not nullable else None
+            ),
         )
         if not nullable:
             op.alter_column("scanner_results", name, server_default=None)

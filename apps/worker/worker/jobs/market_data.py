@@ -15,18 +15,12 @@ from typing import Any
 import redis
 import structlog
 from app.config import get_settings
-from app.data.base import MarketDataProvider
 from app.data.edgar import EDGARClient
-from app.data.factory import (
-    ProviderNotConfiguredError,
-    intraday_provider_chain,
-    resolve_provider,
-)
-from app.data.types import ProviderError, ProviderQuotaExceededError
+from app.data.factory import resolve_provider
+from app.data.types import ProviderQuotaExceededError
 from app.db import session_scope
-from app.models.enums import Interval, ProviderKind
+from app.models.enums import ProviderKind
 from app.models.instrument import Instrument, MarketDataMapping
-from app.models.strategy import StrategyConfiguration
 from app.services.ingestion import IngestionService
 from app.services.insider import InsiderIngestionService
 from sqlalchemy import or_, select
@@ -85,11 +79,12 @@ async def _refresh(provider_kind: ProviderKind, limit: int) -> dict[str, Any]:
                         MarketDataMapping.retry_after <= datetime.now(UTC),
                     ),
                 )
-                # Bot Universe first, unconditionally: those are the names an
-                # active strategy will read tomorrow morning, and a strategy
-                # evaluating stale bars is the failure this ordering exists to
-                # prevent. They are few (tens), so they cost little of the batch
-                # and are refreshed every run rather than once per sweep.
+                # Bot Universe first, unconditionally: those are the names the
+                # risk engine prices open positions against, and sizing or
+                # stopping out on a stale bar is the failure this ordering
+                # exists to prevent. They are few (tens), so they cost little of
+                # the batch and are refreshed every run rather than once per
+                # sweep.
                 #
                 # Then this job's own cursor — never the scanner's. Ordering by a
                 # column this job does not write means the queue never advances;
@@ -172,123 +167,6 @@ def refresh_daily_candles(  # type: ignore[no-untyped-def]
     except Exception as exc:
         log.exception("job.refresh_daily_candles.failed", error=str(exc))
         raise self.retry(exc=exc, countdown=300 * (2**self.request.retries)) from exc
-
-
-async def _intraday_universe(session: Any) -> list[Instrument]:
-    """Instruments watched by an active intraday strategy (§8)."""
-    configs = (
-        (
-            await session.execute(
-                select(StrategyConfiguration).where(StrategyConfiguration.is_active.is_(True))
-            )
-        )
-        .scalars()
-        .all()
-    )
-    ids: set[str] = set()
-    for config in configs:
-        if not config.interval.is_intraday:
-            continue
-        universe = config.universe or {}
-        ids.update(str(i) for i in universe.get("instrument_ids", []))
-        ids.update(str(i) for i in (universe.get("weights") or {}))
-    if not ids:
-        return []
-    rows = await session.execute(select(Instrument).where(Instrument.id.in_(ids)))
-    return list(rows.scalars().all())
-
-
-async def _refresh_intraday(interval: Interval) -> dict[str, Any]:
-    """Walk the intraday chain per instrument, stopping at the first that serves it.
-
-    Falling through matters because the providers cover different listings: a
-    London line yfinance serves is invisible to Twelve Data's free tier, and a
-    "no active mapping" skip is a *return value*, not an exception — taking only
-    the head of the chain silently left such instruments with no bars at all.
-    Providers are built once and shared across instruments, and only on demand,
-    so an unreachable backup costs nothing.
-    """
-    settings = get_settings()
-    chain = intraday_provider_chain(settings)
-    providers: dict[ProviderKind, MarketDataProvider] = {}
-
-    def _provider(kind: ProviderKind) -> MarketDataProvider:
-        if kind not in providers:
-            providers[kind] = resolve_provider(kind, settings)
-        return providers[kind]
-
-    try:
-        async with session_scope() as session:
-            instruments = await _intraday_universe(session)
-            if not instruments:
-                return {"instruments": 0, "note": "no active intraday strategy universe"}
-            service = IngestionService(session)
-            written = 0
-            unserved: list[str] = []
-            for instrument in instruments:
-                reason = "no provider in the intraday chain"
-                for kind in chain:
-                    try:
-                        result = await service.ingest_intraday(
-                            instrument, _provider(kind), interval=interval
-                        )
-                    except (ProviderNotConfiguredError, ProviderError) as exc:
-                        # This provider cannot serve it (no key, quota spent,
-                        # upstream down). Try the next; an exhausted chain is
-                        # reported, never papered over.
-                        reason = f"{kind.value}: {exc}"
-                        continue
-                    if result.skipped_reason is None:
-                        written += result.candles_written
-                        break
-                    reason = f"{kind.value}: {result.skipped_reason}"
-                else:
-                    unserved.append(f"{instrument.id}: {reason}")
-
-            outcome: dict[str, Any] = {
-                "instruments": len(instruments),
-                "candles_written": written,
-                "providers": [k.value for k in chain],
-            }
-            if unserved:
-                log.warning("job.refresh_intraday_candles.unserved", instruments=unserved)
-                outcome["unserved"] = len(unserved)
-            return outcome
-    finally:
-        for provider in providers.values():
-            await provider.close()
-
-
-@app.task(bind=True, name="worker.jobs.market_data.refresh_intraday_candles", max_retries=2)
-def refresh_intraday_candles(self, interval: str = "15m") -> dict[str, Any]:  # type: ignore[no-untyped-def]
-    """Refresh intraday candles for the active strategy universe (§8).
-
-    Feeds the 15-minute mean-reversion strategy. Requires an intraday provider
-    (Twelve Data); with none configured it skips rather than failing — the
-    offline mock path is reachable only via an explicit request.
-    """
-    try:
-        parsed = Interval(interval)
-    except ValueError:
-        log.error("job.refresh_intraday_candles.unknown_interval", interval=interval)
-        raise
-
-    try:
-        with distributed_lock(_redis(), "refresh_intraday_candles", ttl_seconds=600):
-            result = run_job(_refresh_intraday(parsed))
-            log.info("job.refresh_intraday_candles.completed", **result)
-            return result
-    except LockNotAcquiredError:
-        return {"skipped": True, "reason": "another worker holds the lock"}
-    except ProviderNotConfiguredError as exc:
-        log.info("job.refresh_intraday_candles.skipped", reason=str(exc))
-        return {"skipped": True, "reason": "no intraday provider configured"}
-    except ProviderQuotaExceededError as exc:
-        log.warning("job.refresh_intraday_candles.quota_exhausted", error=str(exc))
-        return {"skipped": True, "reason": "provider budget exhausted"}
-    except Exception as exc:
-        log.exception("job.refresh_intraday_candles.failed", error=str(exc))
-        raise self.retry(exc=exc, countdown=120 * (2**self.request.retries)) from exc
 
 
 @app.task(bind=True, name="worker.jobs.market_data.ingest_insider_filings", max_retries=2)

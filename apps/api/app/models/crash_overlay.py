@@ -21,7 +21,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import Boolean, Date, Integer, Numeric, Text, UniqueConstraint
+from sqlalchemy import Boolean, Date, Integer, Numeric, Text, UniqueConstraint, false, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -62,7 +62,15 @@ class CrashOverlayReading(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     #: two years of model output exist to rank against — and a null trigger
     #: means "do not warn", never "warn".
     trigger: Mapped[Decimal | None] = mapped_column(Numeric(10, 8))
-    is_warning: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    #: `server_default` as well as `default`, and the server one is the load
+    #: bearing half. `refresh()` writes its rows through a Core bulk upsert that
+    #: sends only the close and the features, so nothing supplies this column on
+    #: a first insert and a Python-side default never fires. The schema has
+    #: carried the default since the table was created; the model simply did not
+    #: say so, which `alembic check` reads as drift.
+    is_warning: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
 
     # -- What the overlay decided --------------------------------------------
     #: Fraction of the index sleeve to hold, 0..1. Advisory: nothing in this
@@ -70,7 +78,10 @@ class CrashOverlayReading(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     target_exposure: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
     #: The close the overlay stepped aside at, while it is standing aside.
     exit_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 8))
-    days_out: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    #: Server default for the same reason as `is_warning` above.
+    days_out: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     #: Why the exposure is what it is, in words, for the operator who has to
     #: understand a decision months later.
     reason: Mapped[str | None] = mapped_column(Text)

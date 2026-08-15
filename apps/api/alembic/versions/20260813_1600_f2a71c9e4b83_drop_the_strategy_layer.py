@@ -22,9 +22,7 @@ Revises: ac4312114ea2
 
 from __future__ import annotations
 
-import sqlalchemy as sa
 from alembic import op
-from sqlalchemy.dialects import postgresql
 
 revision = "f2a71c9e4b83"
 down_revision = "ac4312114ea2"
@@ -41,96 +39,159 @@ def upgrade() -> None:
     op.drop_table("earnings_events")
 
 
+#: The six tables exactly as they stood at `ac4312114ea2`, read back from a
+#: database built by replaying the migrations up to that point rather than
+#: reconstructed by hand. The previous version of this downgrade was written
+#: by hand, was never executed, and was wrong in every table: renamed columns
+#: (`finished_at` for `completed_at`), missing columns, missing indexes,
+#: missing foreign keys and a unique constraint under the wrong name. It only
+#: has to be right for `alembic downgrade base` to reach zero, which is the
+#: one thing nobody had ever asked it to do.
+_RESTORED_SCHEMA: tuple[str, ...] = (
+    (
+        "CREATE TABLE earnings_events ( id uuid NOT NULL, instrument_id uuid NOT NULL, "
+        "report_date date NOT NULL, surprise numeric(10,6), created_at timestamp with time zone "
+        "DEFAULT now() NOT NULL, updated_at timestamp with time zone DEFAULT now() NOT NULL );"
+    ),
+    (
+        "CREATE TABLE index_options_snapshots ( id uuid NOT NULL, as_of date NOT NULL, symbol "
+        "character varying(16) NOT NULL, spot numeric(14,4), expiry_days integer, "
+        "gamma_exposure numeric(16,4), skew_25delta numeric(8,4), atm_iv numeric(8,4), "
+        "contracts_used integer, created_at timestamp with time zone DEFAULT now() NOT NULL, "
+        "updated_at timestamp with time zone DEFAULT now() NOT NULL, gamma_tilt numeric(8,6), "
+        "charm_exposure numeric(16,4), charm_tilt numeric(8,6) );"
+    ),
+    (
+        "CREATE TABLE strategy_configurations ( kind character varying(32) NOT NULL, name "
+        'character varying(120) NOT NULL, is_active boolean NOT NULL, "interval" character '
+        "varying(8) NOT NULL, operating_mode character varying(24) NOT NULL, auto_execute "
+        "boolean NOT NULL, params jsonb, universe jsonb, account_equity numeric(18,4), id uuid "
+        "NOT NULL, created_at timestamp with time zone DEFAULT now() NOT NULL, updated_at "
+        "timestamp with time zone DEFAULT now() NOT NULL, capital_allocation_pct numeric(12,6) "
+        ");"
+    ),
+    (
+        "CREATE TABLE strategy_decisions ( run_id uuid NOT NULL, configuration_id uuid, "
+        "instrument_id uuid NOT NULL, kind character varying(32) NOT NULL, side character "
+        "varying(8), conviction numeric(12,6) NOT NULL, outcome character varying(24) NOT NULL, "
+        "reason text NOT NULL, metrics jsonb, proposal_id uuid, id uuid NOT NULL, created_at "
+        "timestamp with time zone DEFAULT now() NOT NULL, updated_at timestamp with time zone "
+        "DEFAULT now() NOT NULL );"
+    ),
+    (
+        "CREATE TABLE strategy_models ( kind character varying(32) NOT NULL, feature_names "
+        "jsonb NOT NULL, coefficients jsonb NOT NULL, intercept double precision NOT NULL, "
+        "feature_means jsonb NOT NULL, feature_sds jsonb NOT NULL, scale_known jsonb NOT NULL, "
+        "prior_means jsonb NOT NULL, prior_taus jsonb NOT NULL, shrinkage jsonb NOT NULL, "
+        "standard_errors jsonb NOT NULL, low_shrinkage_clamp double precision, n_observations "
+        "integer NOT NULL, positive_rate double precision, auc double precision, brier double "
+        "precision, log_loss double precision, label_definition text NOT NULL, notes text, "
+        "fitted_at timestamp with time zone, is_active boolean NOT NULL, model_version "
+        "character varying(64), id uuid NOT NULL, created_at timestamp with time zone DEFAULT "
+        "now() NOT NULL, updated_at timestamp with time zone DEFAULT now() NOT NULL );"
+    ),
+    (
+        "CREATE TABLE strategy_runs ( configuration_id uuid, kind character varying(32) NOT "
+        "NULL, status character varying(16) NOT NULL, started_at timestamp with time zone NOT "
+        "NULL, completed_at timestamp with time zone, instruments_considered integer NOT NULL, "
+        "signals_generated integer NOT NULL, proposals_created integer NOT NULL, executed "
+        "integer NOT NULL, rejected integer NOT NULL, selection_reason character varying(200), "
+        "error text, id uuid NOT NULL, created_at timestamp with time zone DEFAULT now() NOT "
+        "NULL, updated_at timestamp with time zone DEFAULT now() NOT NULL );"
+    ),
+    "ALTER TABLE ONLY earnings_events ADD CONSTRAINT pk_earnings_events PRIMARY KEY (id);",
+    (
+        "ALTER TABLE ONLY index_options_snapshots ADD CONSTRAINT pk_index_options_snapshots "
+        "PRIMARY KEY (id);"
+    ),
+    (
+        "ALTER TABLE ONLY strategy_configurations ADD CONSTRAINT pk_strategy_configurations "
+        "PRIMARY KEY (id);"
+    ),
+    "ALTER TABLE ONLY strategy_decisions ADD CONSTRAINT pk_strategy_decisions PRIMARY KEY (id);",
+    "ALTER TABLE ONLY strategy_models ADD CONSTRAINT pk_strategy_models PRIMARY KEY (id);",
+    "ALTER TABLE ONLY strategy_runs ADD CONSTRAINT pk_strategy_runs PRIMARY KEY (id);",
+    (
+        "ALTER TABLE ONLY earnings_events ADD CONSTRAINT uq_earnings_events_instrument_date "
+        "UNIQUE (instrument_id, report_date);"
+    ),
+    (
+        "ALTER TABLE ONLY index_options_snapshots ADD CONSTRAINT "
+        "uq_index_options_snapshots_as_of_symbol UNIQUE (as_of, symbol);"
+    ),
+    (
+        "ALTER TABLE ONLY strategy_configurations ADD CONSTRAINT "
+        "uq_strategy_configurations_name UNIQUE (name);"
+    ),
+    (
+        "CREATE INDEX ix_earnings_events_instrument_id ON earnings_events USING btree "
+        "(instrument_id);"
+    ),
+    "CREATE INDEX ix_earnings_events_report_date ON earnings_events USING btree (report_date);",
+    (
+        "CREATE INDEX ix_index_options_snapshots_as_of ON index_options_snapshots USING btree "
+        "(as_of);"
+    ),
+    (
+        "CREATE INDEX ix_strategy_decisions_configuration_id ON strategy_decisions USING btree "
+        "(configuration_id);"
+    ),
+    (
+        "CREATE INDEX ix_strategy_decisions_instrument ON strategy_decisions USING btree "
+        "(instrument_id);"
+    ),
+    "CREATE INDEX ix_strategy_decisions_outcome ON strategy_decisions USING btree (outcome);",
+    "CREATE INDEX ix_strategy_decisions_run ON strategy_decisions USING btree (run_id);",
+    (
+        "CREATE INDEX ix_strategy_models_kind_active ON strategy_models USING btree (kind, "
+        "is_active);"
+    ),
+    (
+        "CREATE INDEX ix_strategy_runs_configuration_id ON strategy_runs USING btree "
+        "(configuration_id);"
+    ),
+    "CREATE INDEX ix_strategy_runs_kind_started ON strategy_runs USING btree (kind, started_at);",
+    (
+        "ALTER TABLE ONLY earnings_events ADD CONSTRAINT "
+        "fk_earnings_events_instrument_id_instruments FOREIGN KEY (instrument_id) REFERENCES "
+        "instruments(id) ON DELETE CASCADE;"
+    ),
+    (
+        "ALTER TABLE ONLY strategy_decisions ADD CONSTRAINT "
+        "fk_strategy_decisions_configuration_id_strategy_configurations FOREIGN KEY "
+        "(configuration_id) REFERENCES strategy_configurations(id) ON DELETE SET NULL;"
+    ),
+    (
+        "ALTER TABLE ONLY strategy_decisions ADD CONSTRAINT "
+        "fk_strategy_decisions_instrument_id_instruments FOREIGN KEY (instrument_id) REFERENCES "
+        "instruments(id) ON DELETE CASCADE;"
+    ),
+    (
+        "ALTER TABLE ONLY strategy_decisions ADD CONSTRAINT "
+        "fk_strategy_decisions_proposal_id_trade_proposals FOREIGN KEY (proposal_id) REFERENCES "
+        "trade_proposals(id) ON DELETE SET NULL;"
+    ),
+    (
+        "ALTER TABLE ONLY strategy_decisions ADD CONSTRAINT "
+        "fk_strategy_decisions_run_id_strategy_runs FOREIGN KEY (run_id) REFERENCES "
+        "strategy_runs(id) ON DELETE CASCADE;"
+    ),
+    (
+        "ALTER TABLE ONLY strategy_runs ADD CONSTRAINT "
+        "fk_strategy_runs_configuration_id_strategy_configurations FOREIGN KEY "
+        "(configuration_id) REFERENCES strategy_configurations(id) ON DELETE SET NULL;"
+    ),
+)
+
+
 def downgrade() -> None:
-    op.create_table(
-        "strategy_configurations",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("kind", sa.String(length=32), nullable=False),
-        sa.Column("name", sa.String(length=128), nullable=False, unique=True),
-        sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.false()),
-        sa.Column("interval", sa.String(length=8), nullable=False),
-        sa.Column("auto_execute", sa.Boolean(), nullable=False, server_default=sa.false()),
-        sa.Column("params", postgresql.JSONB(), nullable=True),
-        sa.Column("universe", postgresql.JSONB(), nullable=True),
-        sa.Column("account_equity", sa.Numeric(20, 8), nullable=True),
-        sa.Column("capital_allocation_pct", sa.Numeric(6, 4), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
-    )
-    op.create_table(
-        "strategy_runs",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column(
-            "configuration_id",
-            postgresql.UUID(as_uuid=True),
-            sa.ForeignKey("strategy_configurations.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
-        sa.Column("status", sa.String(length=16), nullable=False),
-        sa.Column("considered", sa.Integer(), nullable=False, server_default="0"),
-        sa.Column("signals", sa.Integer(), nullable=False, server_default="0"),
-        sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("error", sa.Text(), nullable=True),
-    )
-    op.create_table(
-        "strategy_decisions",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column(
-            "run_id",
-            postgresql.UUID(as_uuid=True),
-            sa.ForeignKey("strategy_runs.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
-        sa.Column("instrument_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("kind", sa.String(length=32), nullable=False),
-        sa.Column("side", sa.String(length=8), nullable=True),
-        sa.Column("conviction", sa.Numeric(6, 4), nullable=False),
-        sa.Column("outcome", sa.String(length=32), nullable=False),
-        sa.Column("reason", sa.Text(), nullable=False),
-        sa.Column("metrics", postgresql.JSONB(), nullable=True),
-        sa.Column("proposal_id", postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-    )
-    op.create_table(
-        "strategy_models",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("kind", sa.String(length=32), nullable=False),
-        sa.Column("feature_names", postgresql.JSONB(), nullable=False),
-        sa.Column("coefficients", postgresql.JSONB(), nullable=False),
-        sa.Column("intercept", sa.Numeric(20, 10), nullable=False),
-        sa.Column("feature_means", postgresql.JSONB(), nullable=False),
-        sa.Column("feature_sds", postgresql.JSONB(), nullable=False),
-        sa.Column("prior_means", postgresql.JSONB(), nullable=True),
-        sa.Column("prior_taus", postgresql.JSONB(), nullable=True),
-        sa.Column("shrinkage", postgresql.JSONB(), nullable=True),
-        sa.Column("label_definition", sa.Text(), nullable=False),
-        sa.Column("n_observations", sa.Integer(), nullable=False),
-        sa.Column("auc", sa.Numeric(6, 4), nullable=True),
-        sa.Column("brier", sa.Numeric(6, 4), nullable=True),
-        sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.false()),
-        sa.Column("fitted_at", sa.DateTime(timezone=True), nullable=False),
-    )
-    op.create_table(
-        "index_options_snapshots",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("as_of", sa.Date(), nullable=False),
-        sa.Column("symbol", sa.String(length=16), nullable=False),
-        sa.Column("spot", sa.Numeric(20, 8), nullable=True),
-        sa.Column("gamma_exposure", sa.Numeric(30, 8), nullable=True),
-        sa.Column("skew_25delta", sa.Numeric(10, 6), nullable=True),
-        sa.Column("atm_iv", sa.Numeric(10, 6), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.UniqueConstraint("as_of", "symbol", name="uq_index_options_as_of_symbol"),
-    )
-    op.create_table(
-        "earnings_events",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("instrument_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("report_date", sa.Date(), nullable=False),
-        sa.Column("eps_actual", sa.Numeric(20, 8), nullable=True),
-        sa.Column("eps_estimate", sa.Numeric(20, 8), nullable=True),
-        sa.Column("surprise_pct", sa.Numeric(10, 4), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.UniqueConstraint("instrument_id", "report_date", name="uq_earnings_instrument_date"),
-    )
+    """Rebuild the six tables, so the migrations below this one can drop them.
+
+    Not because anything will use them again — the code that gave these rows
+    meaning is gone, and the upgrade above is still a data-losing one in the
+    direction that matters. This exists so that `alembic downgrade base`
+    reaches zero, which is the check that a migration chain is a chain rather
+    than a one-way door.
+    """
+    for statement in _RESTORED_SCHEMA:
+        op.execute(statement)

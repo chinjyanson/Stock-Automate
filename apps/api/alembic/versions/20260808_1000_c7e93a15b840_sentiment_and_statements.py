@@ -92,7 +92,9 @@ def upgrade() -> None:
             "instrument_id", "as_of", name="uq_sentiment_snapshots_instrument_asof"
         ),
     )
-    op.create_index("ix_sentiment_snapshots_instrument_id", "sentiment_snapshots", ["instrument_id"])
+    op.create_index(
+        "ix_sentiment_snapshots_instrument_id", "sentiment_snapshots", ["instrument_id"]
+    )
     op.create_index("ix_sentiment_snapshots_as_of", "sentiment_snapshots", ["as_of"])
 
     # Server defaults backfill the existing rows, then are dropped: the model
@@ -113,9 +115,7 @@ def upgrade() -> None:
     )
     op.add_column(
         "risk_configurations",
-        sa.Column(
-            "sentiment_max_age_days", sa.Integer(), nullable=False, server_default="3"
-        ),
+        sa.Column("sentiment_max_age_days", sa.Integer(), nullable=False, server_default="3"),
     )
     op.alter_column("risk_configurations", "sentiment_reduction_threshold", server_default=None)
     op.alter_column("risk_configurations", "sentiment_max_age_days", server_default=None)

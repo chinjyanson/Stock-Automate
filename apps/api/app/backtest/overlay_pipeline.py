@@ -133,8 +133,9 @@ def assemble(
     signals = source.signals
     n = close.size
 
-    chosen = tuple(f for f in (features if features is not None else source.available)
-                   if f in source.available)
+    chosen = tuple(
+        f for f in (features if features is not None else source.available) if f in source.available
+    )
     if not chosen:
         raise SystemExit(
             f"no usable features: asked for {tuple(features or ())}, "
@@ -160,9 +161,7 @@ def assemble(
     every = np.array([i for i in range(begin, n) if np.isfinite(daily[i])])
     probability = np.full(n, np.nan)
     probability[every] = [
-        model.probability(
-            {f: float(v) for f, v in zip(chosen, row, strict=True) if np.isfinite(v)}
-        )
+        model.probability({f: float(v) for f, v in zip(chosen, row, strict=True) if np.isfinite(v)})
         for row in _rows(signals, every, chosen)
     ]
 

@@ -156,21 +156,6 @@ app.conf.beat_schedule = {
         "schedule": crontab(hour=22, minute=15),
         "options": {"expires": 7200},
     },
-    # Intraday data for the 15-minute strategy. The window spans the London open
-    # (07:00 UTC) to the US close (21:00 UTC) because the intraday universe is
-    # LSE-listed: at the previous "14-21" it covered only the last ~75 minutes of
-    # the London session, so the strategy slept through the open — where
-    # mean-reversion setups most often appear. Per §13 this is still one
-    # hard-coded window rather than a per-exchange schedule; it is a union of the
-    # sessions we trade, and the union grows if a new venue is added.
-    # A no-op when no intraday provider is configured.
-    "refresh-intraday-candles": {
-        "task": "worker.jobs.market_data.refresh_intraday_candles",
-        "schedule": crontab(minute="*/15", hour="7-21"),
-        "options": {"expires": 900},
-    },
-    # Intraday strategies evaluate right after their data refreshes, over the
-    # same window — evaluating outside it would only re-read stale bars.
     # Insider filings, hourly through the US session and a little beyond. EDGAR
     # publishes Form 4s within minutes, and the scanner reads whatever has
     # landed by 22:00 — so this only has to keep the store roughly current, not

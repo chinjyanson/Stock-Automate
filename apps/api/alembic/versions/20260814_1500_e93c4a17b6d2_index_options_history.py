@@ -81,13 +81,9 @@ def upgrade() -> None:
             server_default=sa.func.now(),
             nullable=False,
         ),
-        sa.UniqueConstraint(
-            "as_of", "symbol", name="uq_index_options_snapshots_as_of_symbol"
-        ),
+        sa.UniqueConstraint("as_of", "symbol", name="uq_index_options_snapshots_as_of_symbol"),
     )
-    op.create_index(
-        "ix_index_options_snapshots_as_of", "index_options_snapshots", ["as_of"]
-    )
+    op.create_index("ix_index_options_snapshots_as_of", "index_options_snapshots", ["as_of"])
 
 
 def downgrade() -> None:
