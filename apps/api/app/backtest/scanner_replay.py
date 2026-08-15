@@ -27,7 +27,9 @@ disproportionately likely to bounce the following morning.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 import numpy as np
 
@@ -164,6 +166,7 @@ def rank_at(
     *,
     tradable: tuple[str, ...],
     weights: dict[str, float] | None = None,
+    fundamentals: Callable[[str], dict[str, Decimal | None] | None] | None = None,
 ) -> list[Ranked]:
     """Score every tradable name from data ending at `cut`, best first.
 
@@ -171,6 +174,13 @@ def rank_at(
     an uncut proxy is the subtle look-ahead that a per-name backtest invites:
     the stock would be scored on Monday's information against a sector that
     already knew Friday's.
+
+    `fundamentals` supplies the other half of the score — `value` and the
+    business third of `quality`, 45 of the 100 points. It is a callable rather
+    than a mapping because the figures depend on the decision date as well as
+    the name, and the caller binds the date once per rebalance. Left out, the
+    scanner scores on price alone and `combine_score` renormalises, which is a
+    real shipping configuration but a minority of the model.
     """
     sector_cache: dict[str, PriceSeries | None] = {}
     rates = _slice(panel, panel.column(RATES), cut)
@@ -187,7 +197,13 @@ def rank_at(
             sector_cache[etf] = _slice(panel, panel.column(etf), cut)
         sector = sector_cache.get(etf)
 
-        result = scoring.score_series(series, weights=weights, sector=sector, rates=rates)
+        result = scoring.score_series(
+            series,
+            weights=weights,
+            sector=sector,
+            rates=rates,
+            fundamentals=None if fundamentals is None else fundamentals(symbol),
+        )
         ranked.append(
             Ranked(
                 symbol=symbol,
