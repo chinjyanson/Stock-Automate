@@ -21,33 +21,44 @@ built around. This script measures it.
     and bottom are indistinguishable, the ranking is noise however the top-N
     book happens to have done.
 
+## Two configurations, and which one you are reading
+
+By default this measures the **price-derived scanner**: cheapness 24, sector 10,
+and the risk/liquidity two-thirds of quality 21 — 55 of the 100 points,
+renormalised. `value` and the business third of `quality` are absent, because
+the only fundamentals the system holds are a yfinance snapshot of *today*, and
+feeding today's P/E into a 2009 decision would be look-ahead of the worst kind.
+That is a real shipping configuration — it is what production does for the ~45%
+of the live catalogue with no fundamentals — but it is a minority of the model.
+
+`--fundamentals` measures the **whole 100 points**, using
+`app.backtest.fundamentals`: figures read from SEC filings and filtered by the
+date each filing became public, so a decision only ever sees what had been
+published. That is the configuration to quote when asking whether the scanner
+works, because the fundamentals are the half the scanner is built around. It
+covers US filers only, so the handful of names EDGAR does not carry fall back to
+the price-derived score, exactly as production would.
+
 ## What is not modelled, stated rather than discovered later
 
-No dividend timing beyond adjusted closes, no slippage beyond the flat
-`--cost`, no position limits, no risk engine, no market impact, and — the big
-one — **no fundamentals**. `value` (weight 30) and the business-soundness third
-of `quality` come from a yfinance `.info` snapshot that exists only as of today;
-there is no point-in-time history for them, so feeding today's P/E into a 2009
-decision would be look-ahead of the worst kind. They are therefore *absent*, and
-`combine_score` renormalises over the remaining weight exactly as it does in
-production for the ~45% of the live catalogue that has no fundamentals either.
-
-So this measures the **price-derived scanner**: cheapness 24, sector 10, and the
-risk/liquidity two-thirds of quality 21 — 55 of the 100 points, renormalised.
-That is a real and shipping configuration, but it is not the whole model, and no
-result here should be quoted as though it were.
+No dividend timing beyond adjusted closes, no slippage beyond the flat `--cost`,
+no position limits, no risk engine, no market impact. Fundamentals are annual
+rather than trailing-twelve-month, so they lag by up to a fiscal year — a
+handicap, not an advantage; the score is behind the market, never ahead of it.
 """
 
 from __future__ import annotations
 
 import argparse
 import warnings
+from collections.abc import Callable
+from decimal import Decimal
 from pathlib import Path
 
 import numpy as np
 
+from app.backtest import fundamentals, universe
 from app.backtest import scanner_replay as replay
-from app.backtest import universe
 from app.scanner import scoring
 
 
@@ -238,6 +249,35 @@ def _deciles(rows: list[dict[str, float]], horizon: int) -> None:
         )
 
 
+def _fundamentals_at(
+    panel: universe.Panel,
+    books: dict[str, fundamentals.Company],
+    splits: dict[str, list[tuple[str, float]]],
+    cut: int,
+) -> Callable[[str], dict[str, Decimal | None] | None]:
+    """Bind a decision bar to a lookup the ranker can call per name.
+
+    The price handed to `reading` is the **adjusted** close at the decision
+    bar, which is why the split factor has to come with it: EDGAR reports per
+    share figures as filed, and the two are otherwise on different bases by
+    whatever the company has split since.
+    """
+    day = str(panel.dates[cut])
+    prices = panel.fields["adjusted_close"]
+
+    def at(symbol: str) -> dict[str, Decimal | None] | None:
+        company = books.get(symbol)
+        if company is None:
+            return None
+        price = float(prices[cut, panel.column(symbol)])
+        if not np.isfinite(price) or price <= 0:
+            return None
+        factor = fundamentals.split_factor(splits.get(symbol, []), day)
+        return fundamentals.reading(company, day, price, split_factor=factor)
+
+    return at
+
+
 def run(
     *,
     cache: Path,
@@ -247,6 +287,7 @@ def run(
     horizon: int,
     eras: int,
     refresh: bool,
+    with_fundamentals: bool = False,
 ) -> None:
     warnings.filterwarnings("ignore")
 
@@ -261,9 +302,20 @@ def run(
     print(f"  Period     {panel.dates[0]} -> {panel.dates[-1]}")
     print(f"  Decisions  {len(days)} month ends, traded at the next close, {cost:.2%} round trip")
 
+    books_of_record: dict[str, fundamentals.Company] = {}
+    splits: dict[str, list[tuple[str, float]]] = {}
+    if with_fundamentals:
+        print("\n  Fetching point-in-time fundamentals from SEC filings...", flush=True)
+        books_of_record = fundamentals.fetch(tradable, cache.parent / "sec_facts.json")
+        splits = fundamentals.splits(tradable, cache.parent / "sec_splits.json")
+        print(f"  {len(books_of_record)} of {len(tradable)} names have SEC filings")
+
     rankings: list[tuple[int, list[replay.Ranked]]] = []
     for cut in days:
-        ranked = replay.rank_at(panel, cut, tradable=tradable)
+        provider = None
+        if with_fundamentals:
+            provider = _fundamentals_at(panel, books_of_record, splits, cut)
+        ranked = replay.rank_at(panel, cut, tradable=tradable, fundamentals=provider)
         if ranked:
             rankings.append((cut, ranked))
 
@@ -307,6 +359,11 @@ def main() -> None:
     parser.add_argument("--horizon", type=int, default=21, help="bars for the decile test")
     parser.add_argument("--eras", type=int, default=3, help="equal periods to re-measure in")
     parser.add_argument("--refresh", action="store_true", help="re-download the panel")
+    parser.add_argument(
+        "--fundamentals",
+        action="store_true",
+        help="score the full 100 points using point-in-time SEC filings",
+    )
     args = parser.parse_args()
 
     run(
@@ -317,6 +374,7 @@ def main() -> None:
         horizon=args.horizon,
         eras=args.eras,
         refresh=args.refresh,
+        with_fundamentals=args.fundamentals,
     )
 
 

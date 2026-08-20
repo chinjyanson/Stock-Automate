@@ -43,3 +43,10 @@ logs/
 # minutes and tens of megabytes; the *constituent list* beside them is committed
 # because it records which universe a published result was measured on.
 apps/api/data/*.npz
+# SEC company facts and split histories, cached by app.backtest.fundamentals.
+# Nineteen megabytes distilled from about two gigabytes of EDGAR, rebuilt by
+# re-running with no cache present. The *filing dates* inside are what make a
+# result reproducible, and those come back identical from EDGAR every time.
+apps/api/data/sec_facts.json
+apps/api/data/sec_splits.json
+apps/api/data/pit_*.json

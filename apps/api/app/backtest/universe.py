@@ -21,6 +21,7 @@ distorted, and it is reported as context, not as the verdict.
 from __future__ import annotations
 
 import re
+import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -65,6 +66,21 @@ RATES = "TLT"
 EQUAL_WEIGHT = "RSP"
 
 FIELDS = ("open", "high", "low", "close", "adjusted_close", "volume")
+
+#: Tickers per download call. Large enough that the per-request overhead is
+#: irrelevant, small enough that a failure loses seconds rather than an hour.
+CHUNK = 500
+
+#: Attempts per chunk, and the base seconds between calls. yfinance answers a
+#: rate limit with an *empty frame* rather than an exception, so patience is
+#: the only available remedy and silence is not evidence of success.
+RETRIES = 4
+PAUSE = 2.0
+
+#: Below this share of symbols carrying any price at all, the download is
+#: treated as failed rather than sparse. Real coverage of a broker catalogue
+#: runs far above it; a rate-limited run lands far below.
+MIN_COVERAGE = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,17 +132,37 @@ def constituents(cache: Path) -> pd.DataFrame:
 
 
 def load(cache: Path, since: str, *, refresh: bool = False) -> Panel:
-    """Fetch (or reload) the whole panel: constituents, sector ETFs, SPY, TLT.
+    """Fetch (or reload) the whole panel: constituents, sector ETFs, SPY, TLT."""
+    members = constituents(cache.parent / "sp500_constituents.csv")
+    sectors = dict(zip(members["symbol"], members["sector"], strict=True))
+    return build(tuple(sorted(set(members["symbol"]))), sectors, cache, since, refresh=refresh)
+
+
+def build(
+    names: tuple[str, ...],
+    sectors: dict[str, str],
+    cache: Path,
+    since: str,
+    *,
+    refresh: bool = False,
+) -> Panel:
+    """Download `names` plus the proxies every score needs, and cache the lot.
+
+    Split out from `load` so that a universe other than the S&P 500 — the whole
+    broker catalogue, say — gets the identical download, alignment and caching
+    rather than a second implementation of them that drifts.
+
+    `sectors` maps a symbol to a **GICS** sector name, the keys of
+    `SECTOR_ETFS`. A symbol missing from it is scored without its sector group,
+    which `combine_score` handles by renormalising — the same thing production
+    does for a name whose sector is unknown.
 
     Cached as a single compressed `.npz`, because the alternative on this box is
     a ~300MB CSV — pyarrow is not installed and this is not worth a dependency.
     """
     cache.parent.mkdir(parents=True, exist_ok=True)
-    members = constituents(cache.parent / "sp500_constituents.csv")
-    sectors = dict(zip(members["symbol"], members["sector"], strict=True))
-
     extras = sorted({*SECTOR_ETFS.values(), BENCHMARK, RATES, EQUAL_WEIGHT})
-    symbols = tuple(sorted(set(members["symbol"])) + extras)
+    symbols = tuple(list(names) + [e for e in extras if e not in names])
 
     if cache.exists() and not refresh:
         stored = np.load(cache, allow_pickle=False)
@@ -141,20 +177,6 @@ def load(cache: Path, since: str, *, refresh: bool = False) -> Panel:
 
     import yfinance as yf
 
-    raw = yf.download(
-        list(symbols),
-        start=since,
-        interval="1d",
-        auto_adjust=False,
-        actions=False,
-        progress=False,
-        group_by="column",
-        threads=True,
-    )
-    if raw is None or raw.empty:
-        raise RuntimeError("yfinance returned nothing for the whole universe")
-
-    dates = pd.DatetimeIndex(raw.index).tz_localize(None).normalize().to_numpy("datetime64[D]")
     wanted = {
         "open": "Open",
         "high": "High",
@@ -163,12 +185,74 @@ def load(cache: Path, since: str, *, refresh: bool = False) -> Panel:
         "adjusted_close": "Adj Close",
         "volume": "Volume",
     }
+
+    # Chunked, because this is now asked for the whole broker catalogue and not
+    # just an index. One call for fifteen thousand tickers builds a multi-
+    # gigabyte frame in a single response and gives no way to tell a slow
+    # download from a hung one; five hundred at a time costs nothing and
+    # reports progress. The chunks are re-aligned on a union calendar below,
+    # so a batch whose members all happen to be closed on some holiday cannot
+    # shift another batch's rows.
+    pieces: list[pd.DataFrame] = []
+    failed: list[str] = []
+    for start in range(0, len(symbols), CHUNK):
+        batch = list(symbols[start : start + CHUNK])
+        part = None
+        for attempt in range(RETRIES):
+            part = yf.download(
+                batch,
+                start=since,
+                interval="1d",
+                auto_adjust=False,
+                actions=False,
+                progress=False,
+                group_by="column",
+                threads=True,
+            )
+            if part is not None and not part.empty:
+                break
+            # An empty frame here is almost always the rate limiter, which
+            # yfinance reports by returning nothing rather than raising. Backing
+            # off and retrying is the difference between a complete panel and a
+            # panel that is four-fifths NaN.
+            time.sleep(PAUSE * (2**attempt))
+        if part is not None and not part.empty:
+            pieces.append(part)
+        else:
+            failed.extend(batch)
+        done = min(start + CHUNK, len(symbols))
+        print(f"    downloaded {done:,}/{len(symbols):,} ({len(failed):,} unfetched)", flush=True)
+        time.sleep(PAUSE)
+
+    if not pieces:
+        raise RuntimeError("yfinance returned nothing for the whole universe")
+    raw = pd.concat(pieces, axis=1) if len(pieces) > 1 else pieces[0]
+
+    dates = pd.DatetimeIndex(raw.index).tz_localize(None).normalize().to_numpy("datetime64[D]")
     fields: dict[str, np.ndarray] = {}
     for name, column in wanted.items():
         if column not in raw.columns.get_level_values(0):
             raise RuntimeError(f"yfinance did not return {column!r}; check auto_adjust")
-        frame = raw[column].reindex(columns=list(symbols))
+        # Wrapped rather than indexed straight, because after concatenating the
+        # chunks the static type of `raw[column]` widens to Series-or-frame.
+        frame = pd.DataFrame(raw[column]).reindex(columns=list(symbols))
         fields[name] = frame.to_numpy(dtype=np.float64)
+
+    # `reindex` fills a symbol the download never returned with a column of
+    # NaN, which is indistinguishable downstream from a symbol that had not
+    # listed yet — and a whole panel of those reads as "nothing was scoreable"
+    # rather than "the download failed". It happened: thirty-one chunks fired
+    # back to back tripped the rate limiter, four fifths came back empty, and
+    # the run produced a confident, wrong, empty answer. Fail here instead.
+    covered = np.isfinite(fields["adjusted_close"]).any(axis=0)
+    share = float(covered.mean())
+    if share < MIN_COVERAGE:
+        raise RuntimeError(
+            f"only {covered.sum():,} of {len(symbols):,} symbols ({share:.0%}) came back with "
+            f"any prices, below the {MIN_COVERAGE:.0%} floor — most likely rate limiting. "
+            f"Re-run with --refresh; the partial download has not been cached."
+        )
+    print(f"    {covered.sum():,} of {len(symbols):,} symbols carry prices ({share:.0%})")
 
     arrays: dict[str, np.ndarray] = {"dates": dates, "symbols": np.array(symbols), **fields}
     np.savez_compressed(cache, **arrays)  # type: ignore[arg-type]  # numpy stubs say bool
